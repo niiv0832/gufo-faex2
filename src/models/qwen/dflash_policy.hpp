@@ -15,6 +15,10 @@ namespace gufo::speculative {
 
 enum class DFlashDraftPolicy : std::uint32_t { kFixed, kAdaptive };
 
+// Verification cost profile of the target model. Dense Q4/Q8 tables were
+// measured on Qwen3.8-27B; kMoe on Qwen3.6-35B-A3B (gfx1151, 2026-11-09).
+enum class DFlashTargetProfile : std::uint32_t { kDenseQ4, kDenseQ8, kMoe };
+
 [[nodiscard]] inline DFlashDraftPolicy ParseDFlashDraftPolicy(
     std::string_view value) {
   if (value == "fixed")
@@ -37,12 +41,22 @@ enum class DFlashDraftPolicy : std::uint32_t { kFixed, kAdaptive };
 class DFlashLengthController {
 public:
   static constexpr std::uint32_t kMaxDraftTokens = 7;
+  // A MoE target that skips its draft retries one block at positions that
+  // are multiples of this interval, so acceptance can recover (code).
+  static constexpr std::uint32_t kMoeProbeInterval = 16;
 
   DFlashLengthController(DFlashDraftPolicy policy, std::uint32_t limit,
                          bool q8_target = false)
+      : DFlashLengthController(policy, limit,
+                               q8_target ? DFlashTargetProfile::kDenseQ8
+                                         : DFlashTargetProfile::kDenseQ4) {}
+
+  DFlashLengthController(DFlashDraftPolicy policy, std::uint32_t limit,
+                         DFlashTargetProfile profile)
       : policy_(policy),
         limit_(std::clamp(limit, 1U, kMaxDraftTokens)),
-        q8_target_(q8_target) {
+        q8_target_(profile == DFlashTargetProfile::kDenseQ8),
+        profile_(profile) {
     Reset();
   }
 
@@ -52,6 +66,8 @@ public:
     const auto cap = std::min(budget, limit_);
     if (policy_ == DFlashDraftPolicy::kFixed || cap == 0)
       return cap;
+    if (profile_ == DFlashTargetProfile::kMoe)
+      return ChooseMoe(cap, position, greedy_batch_size);
     // Preserve the full-acceptance probe at C5-C8. Extrapolating attention
     // cost beyond the measured depths must not shorten a saturated block.
     if (greedy_batch_size >= 5 && greedy_batch_size <= 8 &&
@@ -217,6 +233,55 @@ public:
     return best_length;
   }
 
+  // MoE targets read only their routed experts, so the target step is cheap
+  // next to a draft cycle (15.6 vs 24.3 ms at C1) and a weak history is best
+  // served by no draft at all. Length zero is a target-only step; every
+  // kMoeProbeInterval positions the best block is drafted anyway so that
+  // acceptance (e.g. entering code) can be observed again. Position is
+  // deterministic on replay. Sampled requests arrive as C1 (see ProposeBatch).
+  [[nodiscard]] std::uint32_t ChooseMoe(std::uint32_t cap,
+                                        std::uint32_t position,
+                                        std::size_t users) const noexcept {
+    const float probability =
+        mean_ == static_cast<float>(limit_) ? 1.0F : mean_ / (mean_ + 1.0F);
+    const auto* relative_costs = &kMoeRelativeCost;
+    float context_multiplier = 1.0F;
+    float no_draft_cost = kMoeNoDraftCost[0];
+    if (users == 2) {
+      relative_costs = &kMoePairedRelativeCost;
+      context_multiplier = 1.52F;
+      no_draft_cost = kMoeNoDraftCost[1];
+    } else if (users >= 3) {
+      // At most four sessions are calibrated; wider cohorts reuse C4.
+      relative_costs = &kMoeFourRequestRelativeCost;
+      context_multiplier = 2.12F;
+      no_draft_cost = kMoeNoDraftCost[2];
+    }
+    const float attention_cost_scale =
+        static_cast<float>(position > 2048 ? position - 2048 : 0) / 30720.0F *
+        context_multiplier;
+    float survival = 1.0F;
+    float expected_tokens = 1.0F;
+    float best_score = 0.0F;
+    std::uint32_t best_length = 1;
+    for (std::uint32_t length = 1; length <= cap; ++length) {
+      survival *= probability;
+      expected_tokens += survival;
+      const float score =
+          expected_tokens / ((*relative_costs)[length - 1] +
+                             attention_cost_scale * kMoeContextCost[length - 1]);
+      if (score > best_score) {
+        best_score = score;
+        best_length = length;
+      }
+    }
+    const float skip_score =
+        1.0F / (no_draft_cost + attention_cost_scale * kMoeNoDraftContextCost);
+    if (skip_score > best_score && position % kMoeProbeInterval != 0)
+      return 0;
+    return best_length;
+  }
+
   void Observe(std::size_t accepted, std::size_t drafted) noexcept {
     if (policy_ == DFlashDraftPolicy::kFixed || drafted == 0)
       return;
@@ -304,9 +369,31 @@ private:
   // request timings and sampled proposals never enter the decision.
   static constexpr std::array<float, kMaxDraftTokens> kQ4ContextCost{
       0.11F, 0.14F, 0.21F, 0.23F, 0.25F, 0.31F, 0.35F};
+  // Qwen3.6-35B-A3B UD-Q4_K_XL + DFlash2-Q8_0, gfx1151 ECO 100 W, 2026-11-09:
+  // fixed-width complete cycles (median predicted_ms / draft_rounds over the
+  // synthetic prompts, temperature 0). C1 24/27/30/32/34/36/39 ms for 1–7.
+  static constexpr std::array<float, kMaxDraftTokens> kMoeRelativeCost{
+      1.000F, 1.123F, 1.217F, 1.310F, 1.401F, 1.492F, 1.613F};
+  // C2 32/37/42/53/60/66/71 ms; context multiplier 2 * 24.3 / 31.9 = 1.52.
+  static constexpr std::array<float, kMaxDraftTokens> kMoePairedRelativeCost{
+      1.000F, 1.155F, 1.316F, 1.666F, 1.879F, 2.067F, 2.216F};
+  // C4 46/58/64/68/72/77/81 ms; context multiplier 4 * 24.3 / 45.8 = 2.12.
+  static constexpr std::array<float, kMaxDraftTokens>
+      kMoeFourRequestRelativeCost{1.000F, 1.271F, 1.388F, 1.481F,
+                                  1.582F, 1.677F, 1.779F};
+  // C1 at ~30K tokens of history: 31/38/42/46/52/56/64 ms, as
+  // (cycle_32K - cycle_2K) / cycle(1 draft, C1).
+  static constexpr std::array<float, kMaxDraftTokens> kMoeContextCost{
+      0.264F, 0.451F, 0.492F, 0.569F, 0.737F, 0.807F, 1.021F};
+  // Target-only steps (speculative off) cost 15.6/19.8/27.2 ms at C1/C2/C4,
+  // relative to each cohort's one-draft cycle; 20.2 ms at ~30K (C1).
+  static constexpr std::array<float, 3> kMoeNoDraftCost{0.641F, 0.620F,
+                                                        0.595F};
+  static constexpr float kMoeNoDraftContextCost = 0.190F;
   DFlashDraftPolicy policy_;
   std::uint32_t limit_;
   bool q8_target_;
+  DFlashTargetProfile profile_{DFlashTargetProfile::kDenseQ4};
   float mean_{0.0F};
   std::uint32_t last_full_width_{0};
 };

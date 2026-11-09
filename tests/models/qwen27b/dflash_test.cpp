@@ -243,6 +243,54 @@ void TestLengthController() {
   }
 }
 
+// Qwen3.6-35B-A3B (MoE) profile, calibrated on gfx1151 2026-11-09: a draft
+// cycle costs far more than the cheap MoE target step, so poor acceptance
+// must fall back to no draft (length 0) with periodic probes, while full
+// acceptance still reaches the ceiling at every cohort.
+void TestMoeLengthController() {
+  using gufo::speculative::DFlashDraftPolicy;
+  using gufo::speculative::DFlashLengthController;
+  using gufo::speculative::DFlashTargetProfile;
+  constexpr auto kProbe = DFlashLengthController::kMoeProbeInterval;
+  constexpr std::uint32_t kPlain = 2048 + 1;  // not a probe position
+  DFlashLengthController fixed(DFlashDraftPolicy::kFixed, 7,
+                               DFlashTargetProfile::kMoe);
+  Expect(fixed.Choose(3, 131072, 4) == 3,
+         "a fixed MoE block obeys only its budget");
+
+  DFlashLengthController prose(DFlashDraftPolicy::kAdaptive, 7,
+                               DFlashTargetProfile::kMoe);
+  for (int round = 0; round < 32; ++round)
+    prose.Observe(round % 2, 3);  // ~35-40% acceptance, as measured on prose
+  for (const std::size_t users : {1U, 2U, 3U, 4U})
+    Expect(prose.Choose(7, kPlain, users) == 0,
+           "poor MoE acceptance skips the costly draft cycle");
+  Expect(prose.Choose(7, 2048 + kProbe, 1) >= 1 &&
+             prose.Choose(7, 2048 + kProbe, 4) >= 1,
+         "a skipped MoE draft is probed periodically");
+  Expect(prose.Choose(0, 2048 + kProbe, 1) == 0,
+         "a probe never exceeds the remaining budget");
+
+  DFlashLengthController code(DFlashDraftPolicy::kAdaptive, 7,
+                              DFlashTargetProfile::kMoe);
+  Expect(code.Choose(7, kPlain, 1) >= 1,
+         "a fresh MoE history still drafts");
+  for (int round = 0; round < 32; ++round)
+    code.Observe(7, 7);
+  for (const std::size_t users : {1U, 2U, 4U})
+    Expect(code.Choose(7, kPlain, users) == 7,
+           "full MoE acceptance reaches the block ceiling");
+
+  for (const auto profile :
+       {DFlashTargetProfile::kDenseQ4, DFlashTargetProfile::kDenseQ8}) {
+    DFlashLengthController dense(DFlashDraftPolicy::kAdaptive, 7, profile);
+    for (int round = 0; round < 32; ++round)
+      dense.Observe(0, 7);
+    Expect(dense.Choose(7, kPlain) == 1 && dense.Choose(7, kPlain, 4) >= 1,
+           "dense targets never skip their draft");
+  }
+}
+
 void TestConcurrentBlocks(
     const std::shared_ptr<const gufo::hip::QwenGpuModel>& target_model,
     const std::shared_ptr<const gufo::hip::QwenDFlashGpuModel>& draft_model) {
@@ -718,6 +766,7 @@ void CaptureAcceptanceTrace(
 int main(int argc, const char* const* argv) {
   try {
     TestLengthController();
+    TestMoeLengthController();
     const char* base_path =
         argc > 1 ? argv[1] : std::getenv("GUFO_QWEN27B_MODEL");
     const char* draft_path =

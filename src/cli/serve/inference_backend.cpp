@@ -475,6 +475,7 @@ public:
                 .max_context = max_context,
                 .max_draft_tokens = speculative_options.max_draft_tokens,
                 .policy = speculative_options.dflash_policy,
+                .moe_target = model_->GetConfig().IsMoe(),
             },
             &error);
         if (dflash_backend == nullptr) {

@@ -313,6 +313,8 @@ struct QwenDFlashGpuDraftConfig {
   std::uint32_t max_draft_tokens{7};
   speculative::DFlashDraftPolicy policy{
       speculative::DFlashDraftPolicy::kAdaptive};
+  // Mixture-of-experts target (qwen35moe): selects the MoE cost profile.
+  bool moe_target{false};
 };
 
 /// Adapts the GPU DFlash executor to the repository's IDraftBackend speculative
