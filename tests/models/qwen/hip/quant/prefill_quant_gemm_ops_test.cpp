@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <stdexcept>
 #include <vector>
 
 #if defined(ENGINE_ENABLE_HIP)
@@ -27,6 +28,110 @@
 #include "tests/models/qwen/hip/support/device.hpp"
 
 namespace {
+
+thread_local std::size_t minimum_scratch_bytes = 0;
+thread_local std::size_t scratch_allocation_count = 0;
+
+}  // namespace
+
+// Only this executable interposes hipMalloc. Reject undersized scratch before
+// the production wrapper can launch a quantizer that writes past its end.
+extern "C" hipError_t __real_hipMalloc(void** ptr, std::size_t bytes);
+extern "C" hipError_t __wrap_hipMalloc(void** ptr, std::size_t bytes) {
+  if (minimum_scratch_bytes != 0) {
+    ++scratch_allocation_count;
+    std::cout << "  wrapper scratch: requested=" << bytes
+              << " required=" << minimum_scratch_bytes << std::endl;
+    if (bytes < minimum_scratch_bytes) {
+      std::cerr << "FAIL: wrapper scratch omits activation payload or sum "
+                   "sidecar; rejected before device write\n";
+      *ptr = nullptr;
+      return hipErrorInvalidValue;
+    }
+  }
+  return __real_hipMalloc(ptr, bytes);
+}
+
+namespace {
+
+class ScratchAllocationCheck {
+public:
+  explicit ScratchAllocationCheck(std::size_t bytes) {
+    minimum_scratch_bytes = bytes;
+    scratch_allocation_count = 0;
+  }
+  ~ScratchAllocationCheck() { minimum_scratch_bytes = 0; }
+
+  void Verify() const {
+    if (scratch_allocation_count != 1) {
+      throw std::runtime_error(
+          "expected one fresh wrapper scratch allocation; interposition or "
+          "fresh-process precondition failed");
+    }
+  }
+};
+
+// Place the logical end, including the sum sidecar, exactly at an unmapped
+// device address. hipMalloc padding and neighbouring allocations must not hide
+// an activation-tile overread. Four additional mapped-region lengths are
+// reserved but never mapped, covering every missing tile in these fixtures.
+class GuardedActivationAllocation {
+public:
+  GuardedActivationAllocation() = default;
+  GuardedActivationAllocation(const GuardedActivationAllocation&) = delete;
+  GuardedActivationAllocation& operator=(const GuardedActivationAllocation&) =
+      delete;
+  ~GuardedActivationAllocation() { Release(); }
+
+  void* Allocate(std::size_t bytes) {
+    hipMemAllocationProp prop{};
+    prop.type = hipMemAllocationTypePinned;
+    prop.location.type = hipMemLocationTypeDevice;
+    HIP_CHECK(hipGetDevice(&prop.location.id));
+    std::size_t granularity = 0;
+    HIP_CHECK(hipMemGetAllocationGranularity(
+        &granularity, &prop, hipMemAllocationGranularityMinimum));
+    mapped_bytes_ = ((bytes + granularity - 1) / granularity) * granularity;
+    reserved_bytes_ = 5 * mapped_bytes_;
+    HIP_CHECK(hipMemAddressReserve(&base_, reserved_bytes_, 0, nullptr, 0));
+    HIP_CHECK(hipMemCreate(&handle_, mapped_bytes_, &prop, 0));
+    HIP_CHECK(hipMemMap(base_, mapped_bytes_, 0, handle_, 0));
+    mapped_ = true;
+    hipMemAccessDesc access{};
+    access.location = prop.location;
+    access.flags = hipMemAccessFlagsProtReadWrite;
+    HIP_CHECK(hipMemSetAccess(base_, mapped_bytes_, &access, 1));
+    auto* end = static_cast<std::uint8_t*>(base_) + mapped_bytes_;
+    std::cout << "  guarded activation: bytes=" << bytes
+              << " granularity=" << granularity
+              << " begin=" << static_cast<void*>(end - bytes)
+              << " guard_begin=" << static_cast<void*>(end)
+              << " unmapped_suffix=" << reserved_bytes_ - mapped_bytes_
+              << std::endl;
+    return end - bytes;
+  }
+
+private:
+  void Release() noexcept {
+    if (mapped_) {
+      gufo::hip::LogCleanupError(hipMemUnmap(base_, mapped_bytes_));
+    }
+    if (handle_ != nullptr) {
+      gufo::hip::LogCleanupError(hipMemRelease(handle_));
+    }
+    if (base_ != nullptr) {
+      gufo::hip::LogCleanupError(hipMemAddressFree(base_, reserved_bytes_));
+    }
+  }
+
+  void* base_ = nullptr;
+  hipMemGenericAllocationHandle_t handle_ = nullptr;
+  std::size_t mapped_bytes_ = 0;
+  std::size_t reserved_bytes_ = 0;
+  bool mapped_ = false;
+};
+
+enum class GemmMode { kPrequantized, kGuarded, kWrapperAllocation };
 
 struct HostQ8_0Block {
   std::uint16_t d;  // fp16 bits
@@ -199,9 +304,10 @@ void QuantizeReference(const std::vector<float>& x, std::size_t batch,
   }
 }
 
-void RunCase(std::size_t batch, std::size_t m, std::size_t k, bool dual) {
+void RunCase(std::size_t batch, std::size_t m, std::size_t k, bool dual,
+             GemmMode mode = GemmMode::kPrequantized) {
   std::cout << "prefill quant GEMM: batch=" << batch << " m=" << m << " k=" << k
-            << (dual ? " dual" : " single") << "\n";
+            << (dual ? " dual" : " single") << std::endl;
   const std::size_t num_blocks = k / 32;
   Rng rng(0x9E3779B9U ^
           static_cast<std::uint32_t>((batch * 131) + (m * 17) + k));
@@ -235,12 +341,18 @@ void RunCase(std::size_t batch, std::size_t m, std::size_t k, bool dual) {
   void* d_q8 = nullptr;
   float* d_y = nullptr;
   float* d_y2 = nullptr;
+  const bool guarded = mode == GemmMode::kGuarded;
+  GuardedActivationAllocation guarded_activation;
   const std::size_t q8_bytes =
-      gufo::hip::QuantizedActivationBytes(batch, k) + 4096;
+      gufo::hip::QuantizedActivationBytes(batch, k) + (guarded ? 0 : 4096);
   HIP_CHECK(hipMalloc(&d_w, h_w.size() * sizeof(HostQ8_0Block)));
   HIP_CHECK(hipMalloc(&d_w2, h_w2.size() * sizeof(HostQ8_0Block)));
   HIP_CHECK(hipMalloc(&d_x_bf16, h_x_bf16.size() * sizeof(std::uint16_t)));
-  HIP_CHECK(hipMalloc(&d_q8, q8_bytes));
+  if (guarded) {
+    d_q8 = guarded_activation.Allocate(q8_bytes);
+  } else {
+    HIP_CHECK(hipMalloc(&d_q8, q8_bytes));
+  }
   HIP_CHECK(hipMalloc(&d_y, batch * m * sizeof(float)));
   HIP_CHECK(hipMalloc(&d_y2, batch * m * sizeof(float)));
   HIP_CHECK(hipMemcpy(d_w, h_w.data(), h_w.size() * sizeof(HostQ8_0Block),
@@ -285,7 +397,15 @@ void RunCase(std::size_t batch, std::size_t m, std::size_t k, bool dual) {
     }
   }
 
-  if (dual) {
+  if (mode == GemmMode::kWrapperAllocation) {
+    // Independent layout contract: each 16-token, 32-element tile stores
+    // 512 code bytes, 64 scale bytes, and 64 activation-sum bytes.
+    const std::size_t required = ((batch + 15) / 16) * (k / 32) * 640;
+    ScratchAllocationCheck allocation_check(required);
+    gufo::hip::LaunchBatchedQuantGEMM(gufo::core::GgmlType::kQ8_0, d_w,
+                                      d_x_bf16, d_y, batch, m, k);
+    allocation_check.Verify();
+  } else if (dual) {
     gufo::hip::LaunchBatchedDualQuantGEMMPreQuantized(
         gufo::core::GgmlType::kQ8_0, d_w, d_w2, d_q8, d_y, d_y2, batch, m, k);
   } else {
@@ -307,7 +427,9 @@ void RunCase(std::size_t batch, std::size_t m, std::size_t k, bool dual) {
   HIP_CHECK(hipFree(d_w));
   HIP_CHECK(hipFree(d_w2));
   HIP_CHECK(hipFree(d_x_bf16));
-  HIP_CHECK(hipFree(d_q8));
+  if (!guarded) {
+    HIP_CHECK(hipFree(d_q8));
+  }
   HIP_CHECK(hipFree(d_y));
   HIP_CHECK(hipFree(d_y2));
 }
@@ -568,14 +690,68 @@ void RunFusedNormQuantizeCase(std::size_t batch, std::size_t dim,
 
 #endif  // defined(ENGINE_ENABLE_HIP)
 
-int main() {
+int main(int argc, char** argv) try {
 #if defined(ENGINE_ENABLE_HIP)
+  const bool full = argc == 1;
+  const bool guarded_tail =
+      argc == 2 && std::strcmp(argv[1], "--guarded-tail") == 0;
+  const bool guarded_control =
+      argc == 2 && std::strcmp(argv[1], "--guarded-control") == 0;
+  const bool wrapper_allocation =
+      argc == 2 && std::strcmp(argv[1], "--wrapper-allocation") == 0;
+  if (!full && !guarded_tail && !guarded_control && !wrapper_allocation) {
+    std::cerr << "usage: " << argv[0]
+              << " [--guarded-tail|--guarded-control|--wrapper-allocation]\n";
+    return 2;
+  }
   const int device_status =
       gufo::test::GateHipDevice(gufo::test::HipDeviceRequirement::kOptional,
                                 "Qwen prefill quant GEMM ops test");
   if (device_status != gufo::test::kHipTestSuccess) {
     return device_status;
   }
+
+  if (full || wrapper_allocation) {
+    // First and only direct-wrapper call in this process: its thread-local
+    // scratch cannot have been enlarged by an earlier shape. The aligned batch
+    // isolates sum-sidecar allocation from the missing-token-tile read.
+    RunCase(64, 512, 2048, false, GemmMode::kWrapperAllocation);
+    if (wrapper_allocation) {
+      std::cout << "Wrapper allocation regression passed.\n";
+      return 0;
+    }
+  }
+
+  int device = 0;
+  int vmm_supported = 0;
+  HIP_CHECK(hipGetDevice(&device));
+  HIP_CHECK(hipDeviceGetAttribute(
+      &vmm_supported, hipDeviceAttributeVirtualMemoryManagementSupported,
+      device));
+  if (vmm_supported == 0) {
+    std::cout << "HIP VMM unavailable; guarded activation tests not run.\n";
+    return 77;
+  }
+
+  if (full || guarded_control) {
+    RunCase(64, 512, 2048, false, GemmMode::kGuarded);
+    if (guarded_control) {
+      std::cout << "Guarded aligned control passed.\n";
+      return 0;
+    }
+  }
+  // BN=64, two CTAs in the token dimension: the second CTA has only one of
+  // four activation tiles. The VMM guard starts after payload + sum sidecar.
+  RunCase(65, 512, 2048, false, GemmMode::kGuarded);
+  if (guarded_tail) {
+    std::cout << "Guarded tail regression passed.\n";
+    return 0;
+  }
+  // Narrow BN=16 and BN=32 routes, then ragged BN=128. M < 1024 keeps the
+  // latter on the blocked W8A8 path rather than the wave64 implementation.
+  RunCase(1, 128, 128, false, GemmMode::kGuarded);
+  RunCase(1, 384, 128, false, GemmMode::kGuarded);
+  RunCase(97, 512, 2048, false, GemmMode::kGuarded);
 
   // 128-token throughput configuration, macro-tile aligned.
   RunCase(128, 256, 256, false);
@@ -610,4 +786,8 @@ int main() {
   std::cout << "HIP disabled, skipping Qwen prefill quant GEMM ops test.\n";
   return 77;
 #endif
+} catch (const std::exception& error) {
+  std::cerr << "Qwen prefill quant GEMM ops test failed: " << error.what()
+            << "\n";
+  return 1;
 }
