@@ -150,10 +150,20 @@ def file_hash(path):
     return digest.hexdigest()
 
 
+def binary_version(config):
+    if "expected_version" in config:
+        require(config.get("stage") == "C" and config["expected_version"] == "gufo version development (unknown)\n",
+                "legacy version is an explicit comparison-only exception")
+        return config["expected_version"]
+    return "gufo version development (" + config["source_sha"] + ")\n"
+
+
 def validate_config(config):
     require(isinstance(config, dict), "config must be an object")
     stage = config.get("stage")
     require(stage in ("B1", "B2", "B3", "C"), "unsupported stage")
+    if "expected_version" in config:
+        binary_version(config)
     for field, length in [("source_sha", 40), ("binary_sha256", 64), ("model_sha256", 64)]:
         require(isinstance(config.get(field), str) and
                 re.fullmatch("[0-9a-f]{" + str(length) + "}", config[field]),
@@ -178,7 +188,7 @@ def validate_config(config):
                    "library_path", "libraries", "port", "lifetime_s", "startup_timeout_s",
                    "mode", "sessions", "context", "vision", "mmproj", "mmproj_sha256", "think",
                    "reasoning_budget", "draft_tokens", "cache_ram_bytes", "cache_disk_bytes",
-                   "cache_disk", "max_request_bytes", "run_root"}
+                   "cache_disk", "max_request_bytes", "run_root", "expected_version"}
         require(not (set(config) - allowed), "unsupported advanced config fields")
         require(config.get("mode") in ("off", "mtp"), "invalid speculative mode")
         require(type(config.get("sessions")) is int and config["sessions"] in (1, 2, 4), "invalid sessions")
@@ -284,7 +294,8 @@ def probe(port, path):
 def validate_props(props, config):
     settings = profile(config)
     require(props.get("model_alias") == ALIAS and props.get("model") == ALIAS, "wrong model alias")
-    require(props.get("build_info") == "development (" + config["source_sha"] + ")", "wrong served version")
+    require(props.get("build_info") == binary_version(config).removeprefix("gufo version ").rstrip("\n"),
+            "wrong served version")
     require(props.get("model_path") == config["model"], "wrong served weights")
     require(props.get("total_slots") == settings["sessions"], "wrong slot count")
     require(props.get("modalities", {}).get("vision") is settings["vision"], "wrong vision mode")
@@ -478,7 +489,8 @@ def serve(config, output):
                 owned.append(process)
                 require(process.wait(timeout=15) == 0, "version command failed")
             require((output / "version.stdout").read_text() ==
-                    "gufo version development (" + config["source_sha"] + ")\n", "wrong binary version")
+                    binary_version(config),
+                    "wrong binary version")
             require(not (output / "version.stderr").read_bytes(), "unexpected version stderr")
             command = [config["binary"], "serve", "--host", "127.0.0.1", "--port", str(config["port"]),
                 "--sessions", str(settings["sessions"]), "--max-request-bytes", str(settings["max_request_bytes"]),

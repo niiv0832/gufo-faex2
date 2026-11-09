@@ -303,6 +303,29 @@ class AdvancedProfileTests(FakeHost):
                                   "lifetime_s": 7200}
                         self.assertEqual(faex2.validate_config(config)["context"], context)
 
+    def test_legacy_unknown_version_is_explicit_and_comparison_only(self):
+        legacy = "gufo version development (unknown)\n"
+        for stage in ["B1", "B2", "B3"]:
+            with self.subTest(stage=stage), self.assertRaises(ValueError):
+                faex2.validate_config({**self.config, "stage": stage, "expected_version": legacy})
+        for value in [None, "", "anything\n", "gufo version development (unknown)"]:
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                faex2.validate_config({**self.config, "stage": "C", "expected_version": value})
+        self.assertEqual(faex2.validate_config(
+            {**self.config, "stage": "C", "expected_version": legacy})["expected_version"], legacy)
+
+    def test_legacy_version_control_still_pins_binary_bytes(self):
+        self.binary.write_text(self.binary.read_text().replace('revision = "1" * 40', 'revision = "unknown"'))
+        self.config.update(stage="C", expected_version="gufo version development (unknown)\n",
+                           binary_sha256=hashlib.sha256(self.binary.read_bytes()).hexdigest())
+        process = self.launch(); self.ready(process); self.finish(process)
+        self.assertEqual(json.loads((self.output / "server-result.json").read_text())["status"], "STOPPED")
+        self.output = self.root / "changed-legacy-binary"
+        self.binary.write_text(self.binary.read_text() + "\n# changed bytes\n")
+        process = self.launch()
+        self.assertNotEqual(process.wait(timeout=5), 0)
+        self.assertIn("binary hash mismatch", (self.output / "server-result.json").read_text())
+
     def test_bad_advanced_config_fails_before_execution(self):
         for field, value in [("mode", "off"), ("sessions", 4), ("context", 131072),
                 ("vision", False), ("mmproj_sha256", "x"*64), ("mmproj", "relative"),
