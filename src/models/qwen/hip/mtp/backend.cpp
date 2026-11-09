@@ -1,5 +1,7 @@
 #if defined(ENGINE_ENABLE_HIP)
 #include <algorithm>
+#include <cmath>
+#include <cstdlib>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -8,7 +10,9 @@
 #include <utility>
 #include <vector>
 
+#include "src/core/sampling.hpp"
 #include "src/models/qwen/hip/mtp.hpp"
+#include "src/models/qwen/mtp_policy.hpp"
 
 namespace gufo::hip {
 
@@ -126,9 +130,9 @@ bool QwenMtpGpuDraftBackend::AppendTargetContext(
   return true;
 }
 
-speculative::DraftProposal QwenMtpGpuDraftBackend::Propose(
+void QwenMtpGpuDraftBackend::CheckProposalFrontier(
     std::span<const tokenization::TokenId> prompt_tokens,
-    std::uint32_t current_pos, std::uint32_t max_tokens) {
+    std::uint32_t current_pos) const {
   if (!primed_ || prompt_tokens.empty() || current_pos == 0) {
     throw std::logic_error("MTP GPU draft backend is not primed");
   }
@@ -138,6 +142,34 @@ speculative::DraftProposal QwenMtpGpuDraftBackend::Propose(
   if (executor_->GetNextPosition() + 1 != current_pos) {
     throw std::logic_error("MTP GPU draft position is inconsistent");
   }
+}
+
+speculative::DraftProposal QwenMtpGpuDraftBackend::Propose(
+    std::span<const tokenization::TokenId> prompt_tokens,
+    std::uint32_t current_pos, std::uint32_t max_tokens) {
+  return ProposeImpl(prompt_tokens, current_pos, max_tokens, 0.0F, nullptr);
+}
+
+speculative::DraftProposal QwenMtpGpuDraftBackend::ProposeSampled(
+    std::span<const tokenization::TokenId> prompt_tokens,
+    std::uint32_t current_pos, std::uint32_t max_tokens, float temperature,
+    std::uint64_t* rng_state) {
+  if (!std::isfinite(temperature) || temperature <= 0.0F) {
+    throw std::invalid_argument(
+        "MTP sampled proposal temperature must be finite and positive");
+  }
+  if (rng_state == nullptr) {
+    throw std::invalid_argument("MTP sampled proposal requires RNG state");
+  }
+  return ProposeImpl(prompt_tokens, current_pos, max_tokens, temperature,
+                     rng_state);
+}
+
+speculative::DraftProposal QwenMtpGpuDraftBackend::ProposeImpl(
+    std::span<const tokenization::TokenId> prompt_tokens,
+    std::uint32_t current_pos, std::uint32_t max_tokens, float temperature,
+    std::uint64_t* rng_state) {
+  CheckProposalFrontier(prompt_tokens, current_pos);
 
   speculative::DraftProposal proposal;
   proposal.start_pos = current_pos;
@@ -162,17 +194,87 @@ speculative::DraftProposal QwenMtpGpuDraftBackend::Propose(
   proposed_tokens_.clear();
   proposed_tokens_.reserve(count);
 
-  auto token = executor_->ForwardTargetHidden(proposal_input_, target_hidden_,
-                                              proposal_checkpoint_, true);
+  const bool sampled = temperature > 0.0F;
+  std::vector<tokenization::TokenId> row_ids;
+  std::vector<float> row_probs;
+  if (sampled) {
+    proposal.candidates_per_token = std::min<std::size_t>(
+        speculative::kMtpSampledTopK, executor_->ScoredVocab());
+    proposal.candidate_ids.reserve(count * proposal.candidates_per_token);
+    proposal.candidate_probabilities.reserve(count *
+                                             proposal.candidates_per_token);
+  }
+  // Each sampled row is the distribution actually drawn from, conditional on
+  // the earlier sampled tokens fed back into the MTP layer.
+  const auto choose = [&](tokenization::TokenId argmax) {
+    if (!sampled)
+      return argmax;
+    const auto logits =
+        executor_->CopyLastLogits().first(executor_->ScoredVocab());
+    speculative::MtpTopKDistribution(logits, temperature,
+                                     proposal.candidates_per_token, &row_ids,
+                                     &row_probs);
+    proposal.candidate_ids.insert(proposal.candidate_ids.end(),
+                                  row_ids.begin(), row_ids.end());
+    proposal.candidate_probabilities.insert(
+        proposal.candidate_probabilities.end(), row_probs.begin(),
+        row_probs.end());
+    return speculative::MtpSampleRow(row_ids, row_probs,
+                                     sampling::Uniform(rng_state));
+  };
+  auto token = choose(executor_->ForwardTargetHidden(
+      proposal_input_, target_hidden_, proposal_checkpoint_, true));
   proposed_tokens_.push_back(token);
   for (std::uint32_t index = 1; index < count; ++index) {
-    token =
-        executor_->ForwardFeedback(token, proposal_checkpoint_ + index, true);
+    token = choose(
+        executor_->ForwardFeedback(token, proposal_checkpoint_ + index, true));
     proposed_tokens_.push_back(token);
   }
   proposal.tokens = proposed_tokens_;
   proposal_active_ = true;
   return proposal;
+}
+
+speculative::DraftProposal QwenMtpGpuDraftBackend::SkipDraft(
+    std::span<const tokenization::TokenId> prompt_tokens,
+    std::uint32_t current_pos) {
+  CheckProposalFrontier(prompt_tokens, current_pos);
+  // A target-only step: the runner appends the committed token through
+  // AppendTargetContext, which advances the MTP cache.
+  speculative::DraftProposal proposal;
+  proposal.start_pos = current_pos;
+  return proposal;
+}
+
+std::vector<speculative::DraftProposal> QwenMtpGpuDraftBackend::ProposeBatch(
+    std::span<const speculative::DraftProposalRequest> requests) {
+  static const std::size_t kMaxCohort = [] {
+    const char* v = std::getenv("GUFO_MTP_MOE_MAX_COHORT");
+    return v != nullptr ? static_cast<std::size_t>(std::atoll(v))
+                        : std::size_t{2};
+  }();
+  if (!speculative::MtpMoeSkipsDraft(executor_->IsMoe(), requests.size(),
+                                     kMaxCohort))
+    return IDraftBackend::ProposeBatch(requests);
+  std::vector<QwenMtpGpuDraftBackend*> backends;
+  backends.reserve(requests.size());
+  for (std::size_t index = 0; index < requests.size(); ++index) {
+    auto* backend =
+        dynamic_cast<QwenMtpGpuDraftBackend*>(requests[index].backend);
+    if (backend == nullptr)
+      return IDraftBackend::ProposeBatch(requests);
+    for (std::size_t previous = 0; previous < index; ++previous) {
+      if (backends[previous] == backend)
+        throw std::invalid_argument("draft batch repeats a session");
+    }
+    backends.push_back(backend);
+  }
+  std::vector<speculative::DraftProposal> proposals;
+  proposals.reserve(requests.size());
+  for (std::size_t index = 0; index < requests.size(); ++index)
+    proposals.push_back(backends[index]->SkipDraft(requests[index].tokens,
+                                                   requests[index].position));
+  return proposals;
 }
 
 void QwenMtpGpuDraftBackend::AcceptFeedback(

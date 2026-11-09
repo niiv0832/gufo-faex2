@@ -12,6 +12,7 @@ function(add_qwen27b_test target source labels)
 endfunction()
 
 add_qwen27b_test(qwen27b_vision_test vision_test.cpp "cpu;vision;correctness")
+add_qwen27b_test(qwen_mtp_policy_test mtp_policy_test.cpp "cpu;mtp;correctness")
 
 add_qwen27b_test(qwen_mtp_reference_test mtp_reference_test.cpp
   "cpu;mtp;external-model")

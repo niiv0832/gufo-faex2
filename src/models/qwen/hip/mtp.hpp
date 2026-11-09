@@ -114,6 +114,8 @@ public:
 
   [[nodiscard]] std::span<const float> CopyLastHidden();
   [[nodiscard]] std::span<const float> CopyLastLogits();
+  /// Leading vocabulary ids whose logits the last forward pass computed.
+  [[nodiscard]] std::size_t ScoredVocab() const noexcept;
 
   [[nodiscard]] std::uint32_t GetNextPosition() const noexcept {
     return next_position_;
@@ -212,6 +214,20 @@ public:
       const speculative::DraftTargetContext& context,
       std::uint32_t position) override;
 
+  /// Samples each draft token from the MTP head at the request temperature
+  /// and reports its top-k distribution for lossless rejection sampling.
+  [[nodiscard]] speculative::DraftProposal ProposeSampled(
+      std::span<const tokenization::TokenId> prompt_tokens,
+      std::uint32_t current_pos, std::uint32_t max_tokens, float temperature,
+      std::uint64_t* rng_state) override;
+  [[nodiscard]] bool SupportsSampledProposals() const noexcept override {
+    return true;
+  }
+  /// MoE targets verify every draft row against its own experts; wide
+  /// cohorts decode without a draft (GUFO_MTP_MOE_MAX_COHORT, default 2).
+  [[nodiscard]] std::vector<speculative::DraftProposal> ProposeBatch(
+      std::span<const speculative::DraftProposalRequest> requests) override;
+
   [[nodiscard]] speculative::DraftProposal Propose(
       std::span<const tokenization::TokenId> prompt_tokens,
       std::uint32_t current_pos, std::uint32_t max_tokens) override;
@@ -259,6 +275,17 @@ private:
                          QwenMtpGpuDraftConfig config);
   [[nodiscard]] std::vector<std::uint8_t> SerializeState() const;
   void LoadSerializedState(std::span<const std::uint8_t> payload);
+  [[nodiscard]] speculative::DraftProposal ProposeImpl(
+      std::span<const tokenization::TokenId> prompt_tokens,
+      std::uint32_t current_pos, std::uint32_t max_tokens, float temperature,
+      std::uint64_t* rng_state);
+  /// Returns an empty proposal for a target-only step (the runner then
+  /// appends the committed token, advancing the MTP cache).
+  [[nodiscard]] speculative::DraftProposal SkipDraft(
+      std::span<const tokenization::TokenId> prompt_tokens,
+      std::uint32_t current_pos);
+  void CheckProposalFrontier(std::span<const tokenization::TokenId> prompt_tokens,
+                             std::uint32_t current_pos) const;
 
   std::unique_ptr<QwenMtpGpuExecutor> executor_;
   QwenMtpGpuDraftConfig config_;

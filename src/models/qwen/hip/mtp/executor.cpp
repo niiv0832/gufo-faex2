@@ -290,17 +290,7 @@ tokenization::TokenId QwenMtpGpuExecutor::Run(tokenization::TokenId input_token,
   if (!compute_logits) {
     return 0;
   }
-  // The draft only proposes: scoring the most frequent token ids (the BPE
-  // vocabulary is ordered by merge rank) reads a fraction of the output matrix.
-  static const std::size_t kDraftVocab = [] {
-    const char* v = std::getenv("GUFO_MTP_VOCAB");
-    return v != nullptr ? static_cast<std::size_t>(std::atoll(v))
-                        : std::size_t{65536};
-  }();
-  const std::size_t scored =
-      (kDraftVocab == 0 || !config.IsMoe())
-          ? static_cast<std::size_t>(config.vocab_size)
-          : std::min<std::size_t>(kDraftVocab, config.vocab_size);
+  const std::size_t scored = ScoredVocab();
   LaunchGEMV(weights.output.data, weights.output.type, d_feedback_hidden_,
              d_logits_, scored, hidden, stream_,
              models::qwen::QwenGemmMode::kHipMtp);
@@ -532,6 +522,24 @@ std::span<const float> QwenMtpGpuExecutor::CopyLastHidden() {
     throw std::runtime_error("MTP hidden synchronization failed");
   }
   return h_last_hidden_;
+}
+
+std::size_t QwenMtpGpuExecutor::ScoredVocab() const noexcept {
+  // Scoring only the most frequent token ids (the BPE vocabulary is ordered by
+  // merge rank) reads a fraction of the output matrix, but it drops most
+  // non-Latin tokens: on Russian prose Qwen3.6-35B-A3B accepted 36% of MTP
+  // drafts with 65536 ids and 70% with all of them (gfx1151, 2026-11-09).
+  // GUFO_MTP_VOCAB=N restores the truncation for MoE targets; 0 or unset
+  // scores the whole vocabulary.
+  static const std::size_t kDraftVocab = [] {
+    const char* v = std::getenv("GUFO_MTP_VOCAB");
+    return v != nullptr ? static_cast<std::size_t>(std::atoll(v))
+                        : std::size_t{0};
+  }();
+  const auto& config = model_->GetConfig();
+  return (kDraftVocab == 0 || !config.IsMoe())
+             ? static_cast<std::size_t>(config.vocab_size)
+             : std::min<std::size_t>(kDraftVocab, config.vocab_size);
 }
 
 std::span<const float> QwenMtpGpuExecutor::CopyLastLogits() {
