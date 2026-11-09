@@ -12,6 +12,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import faex2
@@ -173,7 +174,9 @@ class FakeHost(unittest.TestCase):
         while time.monotonic() < until and process.poll() is None:
             if (self.output / "ready.json").exists(): return
             time.sleep(.02)
-        self.fail("fake server did not become ready: " + process.communicate(timeout=2)[1])
+        report = self.output / "server-result.json"
+        self.fail("fake server did not become ready: " + process.communicate(timeout=2)[1] +
+                  (report.read_text() if report.exists() else ""))
 
 
 class OwnershipTests(FakeHost):
@@ -268,6 +271,219 @@ class OwnershipTests(FakeHost):
         self.assertNotEqual(process.wait(timeout=7), 0)
         self.assertLess(time.monotonic() - started, 2)
         self.assertTrue((self.output / "cache/keep").is_file())
+
+
+class AdvancedProfileTests(FakeHost):
+    def setUp(self):
+        super().setUp()
+        self.projector = self.root / "mmproj.gguf"
+        self.projector.write_bytes(b"test-only-projector")
+        self.config.update(stage="B2", mode="mtp", sessions=1, context=8192,
+            vision=True, mmproj=str(self.projector),
+            mmproj_sha256=hashlib.sha256(self.projector.read_bytes()).hexdigest(),
+            think="off", reasoning_budget=512, cache_ram_bytes=1024**3,
+            cache_disk_bytes=0, max_request_bytes=64*1024**2, run_root=str(self.root))
+
+    def test_vision_flag_cannot_replace_uploaded_projector_evidence(self):
+        base = "event=load_completed kind=text speculative=mtp draft_limit=1\nevent=defaults thinking=off\n"
+        for suffix in ("", "event=vision_prepared resident_bytes=0\n"):
+            with self.assertRaises(ValueError):
+                faex2.validate_loaded_profile(base + suffix, self.config)
+        record = faex2.validate_loaded_profile(base + "event=vision_prepared resident_bytes=8192\n", self.config)
+        self.assertEqual(record["vision_resident_bytes"], 8192)
+
+    def test_b2_and_b3_controls_accept_only_bounded_profiles(self):
+        self.assertEqual(faex2.validate_config(self.config)["stage"], "B2")
+        for stage in ["B3", "C"]:
+            for mode in ["off", "mtp"]:
+                for sessions in [1, 2, 4]:
+                    for context in [8192, 131072]:
+                        config = {**self.config, "stage": stage, "mode": mode,
+                                  "sessions": sessions, "context": context, "think": "on",
+                                  "lifetime_s": 7200}
+                        self.assertEqual(faex2.validate_config(config)["context"], context)
+
+    def test_bad_advanced_config_fails_before_execution(self):
+        for field, value in [("mode", "off"), ("sessions", 4), ("context", 131072),
+                ("vision", False), ("mmproj_sha256", "x"*64), ("mmproj", "relative"),
+                ("think", "auto"), ("reasoning_budget", 513), ("draft_tokens", 2),
+                ("cache_ram_bytes", 0), ("cache_ram_bytes", 17*1024**3),
+                ("cache_disk_bytes", 1), ("max_request_bytes", 64*1024**2+1),
+                ("lifetime_s", 1801), ("startup_timeout_s", 241),
+                ("run_root", "relative"), ("env", {"GUFO_NPU_DIR": "/unsafe"}),
+                ("argv", ["--speculative", "dflash2"]), ("mode", True)]:
+            with self.subTest(field=field, value=value), self.assertRaises(ValueError):
+                faex2.validate_config({**self.config, field: value})
+        for field in ["mmproj", "mmproj_sha256", "cache_ram_bytes", "run_root", "reasoning_budget"]:
+            broken = {k: v for k, v in self.config.items() if k != field}
+            with self.subTest(missing=field), self.assertRaises(ValueError):
+                faex2.validate_config(broken)
+
+    def test_advanced_ready_proves_mode_draft_vision_and_thinking(self):
+        process = self.launch(); self.ready(process)
+        record = json.loads((self.output / "ready.json").read_text())
+        self.assertEqual(record["loaded_mode"], "mtp")
+        self.assertEqual(record["loaded_draft_limit"], 1)
+        self.assertEqual(record["loaded_thinking"], "off")
+        self.assertIs(record["props"]["modalities"]["vision"], True)
+        command = record["command"]
+        self.assertIn("--mtp-model", command)
+        self.assertEqual(command[command.index("--mtp-model") + 1], "embedded")
+        self.assertEqual(command[command.index("--mmproj") + 1], str(self.projector))
+        self.assertEqual(command[command.index("--reasoning-budget") + 1], "512")
+        self.assertEqual(record["environment"]["GUFO_MTP_VOCAB"], "0")
+        self.assertEqual(record["environment"]["GUFO_MTP_MOE_MAX_COHORT"], "2")
+        self.assertNotIn("GUFO_NPU_DIR", record["environment"])
+        self.assertNotIn("GUFO_VISION_ATTENTION", record["environment"])
+        self.finish(process)
+        self.assertTrue((self.output / "monitor.jsonl").read_text().strip())
+
+    def test_wrong_loaded_profile_or_projector_hash_cannot_be_ready(self):
+        for behavior in ["wrong-mode", "wrong-draft", "wrong-vision", "wrong-thinking", "wrong-budget"]:
+            with self.subTest(behavior=behavior):
+                self.output = self.root / behavior
+                process = self.launch(behavior)
+                self.assertNotEqual(process.wait(timeout=5), 0)
+                self.assertFalse((self.output / "ready.json").exists())
+        self.output = self.root / "bad-projector"
+        self.projector.write_bytes(b"changed")
+        process = self.launch()
+        self.assertNotEqual(process.wait(timeout=5), 0)
+        self.assertIn("mmproj hash", (self.output / "server-result.json").read_text())
+
+    def test_disk_cache_restart_preserves_own_directory(self):
+        cache = self.root / "disk"
+        self.config.update(stage="B3", sessions=4, context=131072, think="on",
+            cache_ram_bytes=16*1024**3, cache_disk_bytes=64*1024**3, cache_disk=str(cache))
+        for name in ["first", "restart"]:
+            self.output = self.root / name
+            process = self.launch(); self.ready(process)
+            command = json.loads((self.output / "ready.json").read_text())["command"]
+            for flag, value in [("--cache-disk", str(cache)), ("--cache-ram-bytes", "17179869184"),
+                                ("--cache-disk-bytes", "68719476736"), ("--context", "131072"),
+                                ("--sessions", "4"), ("--think", "on")]:
+                self.assertEqual(command[command.index(flag)+1], value)
+            if name == "first": (cache / "preserved").write_text("evidence")
+            self.finish(process)
+        self.assertEqual((cache / "preserved").read_text(), "evidence")
+
+    def test_off_control_is_loaded_without_draft_coverage_claim(self):
+        self.config.update(stage="C", mode="off", sessions=2)
+        process = self.launch(); self.ready(process)
+        record = json.loads((self.output / "ready.json").read_text())
+        self.assertEqual(record["loaded_mode"], "off")
+        self.assertEqual(record["props"]["total_slots"], 2)
+        self.assertEqual(record["draft_coverage"], "NOT_YET_MEASURED")
+        self.assertNotIn("--mtp-model", record["command"])
+
+    def test_disk_cache_must_be_separate_from_attempt_output(self):
+        self.config.update(stage="B3", cache_disk_bytes=1024**3)
+        for cache in [self.output, self.output / "nested", self.root / "parent"]:
+            if cache.name == "parent": self.output = cache / "attempt"
+            self.config["cache_disk"] = str(cache)
+            process = self.launch()
+            try: exit_code = process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                self.finish(process)
+                self.fail("server accepted a cache overlapping its attempt output")
+            self.assertNotEqual(exit_code, 0)
+            self.assertFalse(self.output.exists())
+
+    def test_cache_and_output_cannot_escape_run_root_or_follow_links(self):
+        self.config.update(stage="B3", cache_disk_bytes=1024**3)
+        with tempfile.TemporaryDirectory() as elsewhere:
+            external = Path(elsewhere)
+            (self.root / "link").symlink_to(external, target_is_directory=True)
+            cache = self.root / "cache-existing"; cache.mkdir()
+            (cache / "nested-link").symlink_to(external, target_is_directory=True)
+            for unsafe in [external, self.root / "link/cache", cache,
+                           self.root / ".." / external.name]:
+                with self.subTest(path=unsafe), self.assertRaises(ValueError):
+                    faex2.validate_config({**self.config, "cache_disk": str(unsafe)})
+            self.config["cache_disk"] = str(self.root / "safe-cache")
+            self.output = external / "output"
+            process = self.launch()
+            self.assertNotEqual(process.wait(timeout=4), 0)
+            self.assertFalse(self.output.exists())
+
+
+class MonitorTests(unittest.TestCase):
+    def test_monitor_write_failure_still_stops_owned_process(self):
+        with tempfile.TemporaryDirectory() as directory:
+            owned = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(15)"],
+                start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            try:
+                # A directory cannot be opened as a JSONL file, including in the error path.
+                monitor = faex2.ResourceMonitor(owned, Path(directory))
+                with patch("threading.excepthook"):
+                    monitor.start()
+                    try: owned.wait(timeout=1)
+                    except subprocess.TimeoutExpired:
+                        self.fail("monitor output failure left its process running")
+                    finally: monitor.close()
+                self.assertTrue(monitor.error)
+            finally:
+                if owned.poll() is None: owned.terminate()
+                owned.wait(timeout=3)
+
+    def test_linux_snapshot_reads_process_memory_gtt_and_temperature(self):
+        self.assertTrue(callable(getattr(faex2, "memory_snapshot", None)))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); proc = root / "proc"; sysroot = root / "sys"
+            (proc / "123").mkdir(parents=True)
+            (proc / "123/status").write_text("Name:\tgufo\nVmRSS:\t1048576 kB\n")
+            (proc / "meminfo").write_text("MemAvailable: 16777216 kB\n")
+            device = sysroot / "class/drm/card0/device"; device.mkdir(parents=True)
+            (device / "mem_info_gtt_used").write_text(str(20*1024**3))
+            hwmon = device / "hwmon/hwmon0"; hwmon.mkdir(parents=True)
+            (hwmon / "temp1_input").write_text("43000")
+            row = faex2.memory_snapshot(123, proc, sysroot)
+            self.assertEqual(row["rss_bytes"], 1024**3)
+            self.assertEqual(row["mem_available_bytes"], 16*1024**3)
+            self.assertEqual(row["gtt_used_bytes"], 20*1024**3)
+            self.assertIn(43.0, row["temperatures_c"].values())
+
+    def test_memory_guard_stops_only_owned_process_and_retains_snapshot(self):
+        self.assertTrue(callable(getattr(faex2, "ResourceMonitor", None)))
+        with tempfile.TemporaryDirectory() as directory:
+            outsider = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(15)"])
+            owned = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(15)"], start_new_session=True)
+            try:
+                path = Path(directory) / "monitor.jsonl"
+                row = {"rss_bytes": 1024, "mem_available_bytes": 7*1024**3,
+                       "gtt_used_bytes": 0, "temperatures_c": {}}
+                with patch.object(faex2, "memory_snapshot", return_value=row):
+                    monitor = faex2.ResourceMonitor(owned, path)
+                    monitor.start()
+                    owned.wait(timeout=4)
+                    monitor.close()
+                self.assertIsNone(outsider.poll())
+                self.assertIn("MemAvailable", monitor.error)
+                self.assertEqual(json.loads(path.read_text().splitlines()[0])["mem_available_bytes"], 7*1024**3)
+            finally:
+                for process in [owned, outsider]:
+                    if process.poll() is None: process.terminate()
+                    process.wait(timeout=3)
+
+    def test_monitor_guard_rejects_gtt_overage_and_missing_metrics(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for label, changes in [("gtt", {"gtt_used_bytes": 105*1024**3+1}),
+                                    ("missing", {"mem_available_bytes": None})]:
+                with self.subTest(label=label):
+                    owned = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(15)"],
+                        start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    try:
+                        row = {"rss_bytes": 1, "mem_available_bytes": 8*1024**3,
+                               "gtt_used_bytes": 105*1024**3, **changes}
+                        with patch.object(faex2, "memory_snapshot", return_value=row):
+                            monitor = faex2.ResourceMonitor(owned, Path(directory) / (label+".jsonl"))
+                            monitor.start(); owned.wait(timeout=4); monitor.close()
+                        self.assertTrue(monitor.error)
+                        rows = [json.loads(line) for line in (Path(directory) / (label+".jsonl")).read_text().splitlines()]
+                        self.assertEqual(rows[-1]["status"], "FAIL")
+                    finally:
+                        if owned.poll() is None: owned.terminate()
+                        owned.wait(timeout=3)
 
 
 class ClientTests(FakeHost):

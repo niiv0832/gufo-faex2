@@ -29,7 +29,16 @@ cache = Path(os.environ["XDG_CACHE_HOME"])
 (cache / "keep").write_text("cache-evidence")
 if mode == "exit77": sys.exit(77)
 if mode == "no-ready": time.sleep(30)
-print("event=load_completed kind=text speculative=" + ("mtp" if mode == "wrong-mode" else "off"), flush=True)
+speculative = option("--speculative")
+loaded = ("off" if speculative == "mtp" else "mtp") if mode == "wrong-mode" else speculative
+draft = "2" if mode == "wrong-draft" else option("--draft-tokens") if "--draft-tokens" in sys.argv else "7"
+thinking = ("on" if option("--think") == "off" else "off") if mode == "wrong-thinking" else option("--think")
+print("event=defaults thinking=" + thinking, flush=True)
+print("event=load_completed kind=text speculative=" + loaded + " draft_limit=" + draft, flush=True)
+if mode == "wrong-budget": print("reasoning_budget=513", flush=True)
+vision = "--mmproj" in sys.argv
+if vision: print("event=vision_prepared resident_bytes=8192", flush=True)
+if mode == "wrong-vision": vision = not vision
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *_): pass
@@ -91,15 +100,16 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/ready": payload = {"status": "ready", "model": alias}
         elif self.path == "/props": payload = {
             "model": alias, "model_alias": alias, "model_path": option("--model"),
-            "build_info": "development (" + revision + ")", "total_slots": 1,
-            "modalities": {"vision": False, "video": False, "audio": False},
-            "default_generation_settings": {"n_ctx": 8192, "params": {
+            "build_info": "development (" + revision + ")", "total_slots": int(option("--sessions")),
+            "modalities": {"vision": vision, "video": False, "audio": False},
+            "default_generation_settings": {"n_ctx": int(option("--context")), "params": {
                 "temperature": 1.0, "top_k": 20, "top_p": .95, "min_p": .05,
                 "presence_penalty": 0.0, "frequency_penalty": 0.0,
                 "repeat_penalty": 1.0, "repeat_last_n": 64}}}
         elif self.path == "/v1/models": payload = {"object": "list", "data": [{
             "object": "model", "id": alias, "owned_by": "gufo", "created": 1,
-            "context_length": 8192, "architecture": {"input_modalities": ["text"]}}]}
+            "context_length": int(option("--context")),
+            "architecture": {"input_modalities": ["text", "image"] if vision else ["text"]}}]}
         else: self.send_error(404); return
         data = json.dumps(payload).encode()
         self.send_response(200); self.send_header("Content-Type", "application/json")

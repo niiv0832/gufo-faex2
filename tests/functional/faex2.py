@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bounded FAEX2 B1 harness; server ownership and retained HTTP evidence."""
+"""Bounded FAEX2 profiles; server ownership and retained HTTP evidence."""
 
 from __future__ import annotations
 
@@ -18,6 +18,7 @@ import subprocess
 import sys
 import time
 import platform
+import threading
 from urllib.parse import urlsplit
 
 from discovery import assert_model_listing
@@ -32,11 +33,16 @@ def require(condition, message):
 
 
 def validate_mode(log, requested, rows):
+    loaded_mode(log, requested)
+    return validate_drafts(requested, rows)
+
+
+def loaded_mode(log, requested):
     modes = [match.group(1) for line in log.splitlines()
              if "event=load_completed" in line and "kind=text" in line
              for match in [re.search(r"\bspeculative=(\w+)", line)] if match]
     require(modes == [requested], f"requested {requested}, loaded {modes}")
-    return validate_drafts(requested, rows)
+    return {"loaded_mode": requested}
 
 
 def validate_drafts(requested, rows):
@@ -145,7 +151,9 @@ def file_hash(path):
 
 
 def validate_config(config):
-    require(config.get("stage") == "B1", "only B1 is implemented")
+    require(isinstance(config, dict), "config must be an object")
+    stage = config.get("stage")
+    require(stage in ("B1", "B2", "B3", "C"), "unsupported stage")
     for field, length in [("source_sha", 40), ("binary_sha256", 64), ("model_sha256", 64)]:
         require(isinstance(config.get(field), str) and
                 re.fullmatch("[0-9a-f]{" + str(length) + "}", config[field]),
@@ -155,14 +163,85 @@ def validate_config(config):
                 "absolute path required: " + field)
     require(type(config.get("port")) is int and 1024 <= config["port"] <= 65535,
             "invalid loopback port")
-    for field, default, maximum in [("lifetime_s", 900, 900), ("startup_timeout_s", 240, 240)]:
+    lifetime = {"B1": 900, "B2": 1800, "B3": 7200, "C": 7200}[stage]
+    for field, default, maximum in [("lifetime_s", lifetime, lifetime), ("startup_timeout_s", 240, 240)]:
         value = config.get(field, default)
         require(type(value) in (float, int) and math.isfinite(value) and 0 < value <= maximum,
                 "invalid " + field)
+    require(isinstance(config.get("libraries", {}), dict), "invalid libraries manifest")
     for path, digest in config.get("libraries", {}).items():
-        require(Path(path).is_absolute() and re.fullmatch(r"[0-9a-f]{64}", digest),
+        require(isinstance(path, str) and Path(path).is_absolute() and isinstance(digest, str)
+                and re.fullmatch(r"[0-9a-f]{64}", digest),
                 "invalid library manifest")
+    if stage != "B1":
+        allowed = {"stage", "source_sha", "binary", "binary_sha256", "model", "model_sha256",
+                   "library_path", "libraries", "port", "lifetime_s", "startup_timeout_s",
+                   "mode", "sessions", "context", "vision", "mmproj", "mmproj_sha256", "think",
+                   "reasoning_budget", "draft_tokens", "cache_ram_bytes", "cache_disk_bytes",
+                   "cache_disk", "max_request_bytes", "run_root"}
+        require(not (set(config) - allowed), "unsupported advanced config fields")
+        require(config.get("mode") in ("off", "mtp"), "invalid speculative mode")
+        require(type(config.get("sessions")) is int and config["sessions"] in (1, 2, 4), "invalid sessions")
+        require(type(config.get("context")) is int and config["context"] in (8192, 131072), "invalid context")
+        require(config.get("vision") is True, "advanced profiles require vision")
+        require(isinstance(config.get("mmproj"), str) and Path(config["mmproj"]).is_absolute(),
+                "absolute path required: mmproj")
+        require(isinstance(config.get("mmproj_sha256"), str) and
+                re.fullmatch(r"[0-9a-f]{64}", config["mmproj_sha256"]), "missing/invalid mmproj_sha256")
+        require(config.get("think") in ("off", "on"), "invalid think mode")
+        require(type(config.get("reasoning_budget")) is int and config["reasoning_budget"] == 512,
+                "reasoning_budget must be 512")
+        require(type(config.get("draft_tokens", 1)) is int and config.get("draft_tokens", 1) == 1,
+                "draft_tokens must be 1")
+        for field, minimum, maximum in [("cache_ram_bytes", 1, 16*1024**3),
+                                        ("cache_disk_bytes", 0, 64*1024**3),
+                                        ("max_request_bytes", 1, 64*1024**2)]:
+            require(type(config.get(field)) is int and minimum <= config[field] <= maximum,
+                    "invalid " + field)
+        require(isinstance(config.get("run_root"), str) and Path(config["run_root"]).is_absolute(),
+                "absolute path required: run_root")
+        root = Path(config["run_root"])
+        require(root.is_dir() and not root.is_symlink() and ".." not in root.parts, "invalid run_root")
+        if stage == "B2":
+            require((config["mode"], config["sessions"], config["context"]) == ("mtp", 1, 8192),
+                    "B2 requires mtp, 1 session, 8192 context")
+            require(config["cache_disk_bytes"] == 0, "B2 disk cache must be disabled")
+        if config["cache_disk_bytes"]:
+            require(isinstance(config.get("cache_disk"), str), "cache_disk required")
+            owned_directory(config["cache_disk"], root, inspect_contents=True)
+        else:
+            require("cache_disk" not in config, "disabled disk cache cannot have a path")
     return config
+
+
+def owned_directory(path, root, inspect_contents=False):
+    """Reject escapes and symlinks without touching an existing cache."""
+    path, root = Path(path), Path(root)
+    require(path.is_absolute() and ".." not in path.parts, "absolute owned path required")
+    try:
+        relative = path.relative_to(root)
+    except ValueError as error:
+        raise ValueError("path is outside run_root") from error
+    require(relative.parts, "path must be below run_root")
+    current = root
+    for part in relative.parts:
+        current /= part
+        require(not current.is_symlink(), "owned path contains symlink")
+        require(not current.exists() or current.is_dir(), "owned path is not a directory")
+    require(path.resolve().is_relative_to(root.resolve()), "resolved path escapes run_root")
+    if inspect_contents and path.exists():
+        for parent, directories, files in os.walk(path, followlinks=False):
+            for name in directories + files:
+                require(not (Path(parent) / name).is_symlink(), "cache contains symlink")
+    return path
+
+
+def profile(config):
+    if config["stage"] == "B1":
+        return {"sessions": 1, "context": 8192, "mode": "off", "think": "off",
+                "vision": False, "cache_ram_bytes": 0, "cache_disk_bytes": 0,
+                "max_request_bytes": 1048576, "lifetime_s": config.get("lifetime_s", 900)}
+    return {**config, "lifetime_s": config.get("lifetime_s", 1800 if config["stage"] == "B2" else 7200)}
 
 
 @contextlib.contextmanager
@@ -203,18 +282,110 @@ def probe(port, path):
 
 
 def validate_props(props, config):
+    settings = profile(config)
     require(props.get("model_alias") == ALIAS and props.get("model") == ALIAS, "wrong model alias")
     require(props.get("build_info") == "development (" + config["source_sha"] + ")", "wrong served version")
     require(props.get("model_path") == config["model"], "wrong served weights")
-    require(props.get("total_slots") == 1, "wrong slot count")
-    require(props.get("modalities", {}).get("vision") is False, "unexpected vision")
+    require(props.get("total_slots") == settings["sessions"], "wrong slot count")
+    require(props.get("modalities", {}).get("vision") is settings["vision"], "wrong vision mode")
     defaults = props.get("default_generation_settings", {})
-    require(defaults.get("n_ctx") == 8192, "wrong context")
+    require(defaults.get("n_ctx") == settings["context"], "wrong context")
     for field, expected in SAMPLER.items():
         got = defaults.get("params", {}).get(field)
         require(type(got) in (int, float) and math.isfinite(got) and
                 math.isclose(got, expected, rel_tol=1e-6, abs_tol=1e-7),
                 "wrong sampler " + field)
+    if config["stage"] != "B1":
+        for source in [props, defaults, defaults.get("params", {})]:
+            for field in ["reasoning_budget", "reasoning_budget_tokens", "thinking_budget_tokens"]:
+                if field in source:
+                    require(type(source[field]) is int and source[field] == 512, "wrong reasoning budget")
+
+
+def validate_loaded_profile(log, config):
+    if config["stage"] == "B1":
+        return validate_mode(log, "off", [])
+    result = loaded_mode(log, config["mode"])
+    loads = [line for line in log.splitlines() if "event=load_completed" in line and "kind=text" in line]
+    require(len(loads) == 1 and re.search(r"\bdraft_limit=1\b", loads[0]), "wrong loaded draft limit")
+    thinking = [match.group(1) for line in log.splitlines() if "event=defaults" in line
+                for match in [re.search(r"\bthinking=(\w+)", line)] if match]
+    require(thinking == [config["think"]], "wrong loaded thinking mode")
+    for match in re.finditer(r"\b(?:reasoning_budget|reasoning_budget_tokens|thinking_budget_tokens)=(-?\d+)", log):
+        require(match.group(1) == "512", "wrong loaded reasoning budget")
+    vision = [int(match.group(1)) for line in log.splitlines() if "event=vision_prepared" in line
+              for match in [re.search(r"\bresident_bytes=(\d+)\b", line)] if match]
+    require(len(vision) == 1 and vision[0] > 0, "uploaded vision projector absent")
+    return {**result, "loaded_draft_limit": 1, "loaded_thinking": thinking[0],
+            "vision_resident_bytes": vision[0],
+            "draft_coverage": "NOT_YET_MEASURED"}
+
+
+def memory_snapshot(pid, proc_root=None, sys_root=None):
+    """Read-only Linux metrics; explicit roots support CPU fixture checks."""
+    row = {"timestamp": time.time(), "monotonic_s": time.monotonic(), "pid": pid}
+    if proc_root is None and not sys.platform.startswith("linux"):
+        return {**row, "status": "UNSUPPORTED_PLATFORM", "rss_bytes": None,
+                "mem_available_bytes": None, "gtt_used_bytes": None, "temperatures_c": {}}
+    proc_root, sys_root = Path(proc_root or "/proc"), Path(sys_root or "/sys")
+    def kib(path, field):
+        found = re.search(r"^" + field + r":\s+(\d+)\s+kB$", path.read_text(), re.MULTILINE)
+        require(found is not None, "missing memory metric: " + field)
+        return int(found.group(1)) * 1024
+    devices = sorted(set(path.resolve() for path in
+                         sys_root.glob("class/drm/card[0-9]*/device/mem_info_gtt_used")))
+    require(devices, "GTT memory metrics unavailable")
+    gtt = [int(path.read_text().strip()) for path in devices]
+    require(all(value >= 0 for value in gtt), "invalid GTT memory metric")
+    temperatures = {}
+    for path in sys_root.glob("class/drm/card[0-9]*/device/hwmon/hwmon*/temp*_input"):
+        try:
+            temperatures[str(path)] = int(path.read_text().strip()) / 1000
+        except (OSError, ValueError):
+            pass  # Temperature sensors are diagnostic; RAM/GTT are mandatory guards.
+    return {**row, "status": "MEASURED", "rss_bytes": kib(proc_root / str(pid) / "status", "VmRSS"),
+            "mem_available_bytes": kib(proc_root / "meminfo", "MemAvailable"),
+            "gtt_used_bytes": sum(gtt), "temperatures_c": temperatures}
+
+
+class ResourceMonitor:
+    """Retain a sample every two seconds and stop only the owned process on risk."""
+    def __init__(self, process, path):
+        self.process, self.path = process, Path(path)
+        self.error = None
+        self.stopped = threading.Event()
+        self.thread = threading.Thread(target=self.run, name="faex2-memory-monitor", daemon=True)
+
+    def start(self):
+        self.thread.start()
+
+    def run(self):
+        try:
+            with self.path.open("x") as output:
+                while not self.stopped.is_set() and self.process.poll() is None:
+                    started = time.monotonic()
+                    row = memory_snapshot(self.process.pid)
+                    output.write(json.dumps(row, ensure_ascii=False) + "\n")
+                    output.flush()
+                    if row.get("status") != "UNSUPPORTED_PLATFORM":
+                        require(row["mem_available_bytes"] >= 8*1024**3, "MemAvailable below 8 GiB")
+                        require(row["gtt_used_bytes"] <= 105*1024**3, "GTT usage above 105 GiB")
+                    self.stopped.wait(max(0, 2 - (time.monotonic() - started)))
+        except Exception as error:
+            if self.stopped.is_set() or self.process.poll() is not None:
+                return
+            self.error = type(error).__name__ + ": " + str(error)
+            try:
+                with self.path.open("a") as output:
+                    output.write(json.dumps({"timestamp": time.time(), "pid": self.process.pid,
+                                             "status": "FAIL", "error": self.error}) + "\n")
+            except OSError:
+                pass  # The parent retains self.error even when the diagnostic disk is unavailable.
+            stop_owned(self.process)
+
+    def close(self):
+        self.stopped.set()
+        self.thread.join(timeout=7)
 
 
 def stop_owned(process):
@@ -261,22 +432,33 @@ def listener_owned(pid, port):
 def serve(config, output):
     """Own exactly one new server process; retain all files even on failure."""
     validate_config(config)
+    settings = profile(config)
+    advanced = config["stage"] != "B1"
     output = Path(output)
+    if advanced:
+        owned_directory(output, config["run_root"])
+        if config["cache_disk_bytes"]:
+            cache = Path(config["cache_disk"]).resolve()
+            require(not cache.is_relative_to(output.resolve()) and not output.resolve().is_relative_to(cache),
+                    "disk cache must be separate from attempt output")
     output.mkdir(exist_ok=False)  # Also rejects existing/dangling symlinks.
     output = output.resolve()
     report = {"status": "STARTING", "config": config, "started_at": time.time()}
     owned = []
     reservation = None
+    monitor = None
     handlers = {}
     def interrupted(signum, _frame):
         raise InterruptedError("signal " + str(signum))
     try:
         handlers = {sig: signal.signal(sig, interrupted) for sig in (signal.SIGTERM, signal.SIGINT)}
         write_json(output / "server-result.json", report)
-        with hard_timeout(config.get("lifetime_s", 900)):
+        with hard_timeout(settings["lifetime_s"]):
             reservation = socket.socket()
+            # Permit our restart after TIME_WAIT, never an existing listener.
+            reservation.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             reservation.bind(("127.0.0.1", config["port"]))
-            for name in ["binary", "model"]:
+            for name in (["binary", "model", "mmproj"] if advanced else ["binary", "model"]):
                 require(file_hash(config[name]) == config[name + "_sha256"], name + " hash mismatch")
             for path, digest in config.get("libraries", {}).items():
                 require(file_hash(path) == digest, "library hash mismatch: " + path)
@@ -285,6 +467,11 @@ def serve(config, output):
             environment = {"HOME": str(Path.home()), "PATH": "/usr/bin:/bin", "LC_ALL": "C",
                 "TMPDIR": str(output / "tmp"), "XDG_CACHE_HOME": str(output / "cache"),
                 "HSA_ENABLE_SDMA": "0", "LD_LIBRARY_PATH": config["library_path"]}
+            if advanced:
+                environment.update(GUFO_MTP_VOCAB="0", GUFO_MTP_MOE_MAX_COHORT="2")
+                if config["cache_disk_bytes"]:
+                    cache = owned_directory(config["cache_disk"], config["run_root"], inspect_contents=True)
+                    cache.mkdir(parents=True, exist_ok=True)
             with (output / "version.stdout").open("w") as stdout, (output / "version.stderr").open("w") as stderr:
                 process = subprocess.Popen([config["binary"], "--version"], stdout=stdout,
                     stderr=stderr, env=environment, start_new_session=True)
@@ -294,9 +481,15 @@ def serve(config, output):
                     "gufo version development (" + config["source_sha"] + ")\n", "wrong binary version")
             require(not (output / "version.stderr").read_bytes(), "unexpected version stderr")
             command = [config["binary"], "serve", "--host", "127.0.0.1", "--port", str(config["port"]),
-                "--sessions", "1", "--max-request-bytes", "1048576", "llm", "--model", config["model"],
-                "--served-model-name", ALIAS, "--context", "8192", "--speculative", "off", "--think", "off",
-                "--cache-ram-bytes", "0", "--cache-disk-bytes", "0", "--stall-timeout-ms", "120000"]
+                "--sessions", str(settings["sessions"]), "--max-request-bytes", str(settings["max_request_bytes"]),
+                "llm", "--model", config["model"], "--served-model-name", ALIAS,
+                "--context", str(settings["context"]), "--speculative", settings["mode"], "--think", settings["think"],
+                "--cache-ram-bytes", str(settings["cache_ram_bytes"]), "--cache-disk-bytes", str(settings["cache_disk_bytes"]),
+                "--stall-timeout-ms", "120000"]
+            if advanced:
+                command += ["--mmproj", config["mmproj"], "--draft-tokens", "1", "--reasoning-budget", "512"]
+                if settings["mode"] == "mtp": command += ["--mtp-model", "embedded"]
+                if config["cache_disk_bytes"]: command += ["--cache-disk", config["cache_disk"]]
             for name, value in SAMPLER.items(): command += ["--" + name.replace("_", "-"), str(value)]
             report.update(command=command, environment=environment)
             write_json(output / "server-result.json", report)
@@ -307,10 +500,15 @@ def serve(config, output):
                     env=environment, start_new_session=True)
                 owned.append(process)
                 report["pid"] = process.pid
+                if advanced:
+                    report["monitor_file"] = "monitor.jsonl"
+                    monitor = ResourceMonitor(process, output / "monitor.jsonl")
+                    monitor.start()
                 startup = time.monotonic()
                 with hard_timeout(config.get("startup_timeout_s", 240)):
                     until = startup + config.get("startup_timeout_s", 240)
                     while True:
+                        if monitor: require(not monitor.error, monitor.error)
                         require(process.poll() is None, "server exited " + str(process.returncode))
                         try:
                             health = probe(config["port"], "/health")
@@ -326,16 +524,18 @@ def serve(config, output):
                     props = probe(config["port"], "/props")
                     listing = probe(config["port"], "/v1/models")
                     validate_props(props, config)
-                    assert_model_listing(listing, ALIAS, 8192, ["text"])
-                    report.update(validate_mode((output / "server.log").read_text(), "off", []))
+                    assert_model_listing(listing, ALIAS, settings["context"], ["text", "image"] if settings["vision"] else ["text"])
+                    report.update(validate_loaded_profile((output / "server.log").read_text(), config))
+                    if monitor: require(not monitor.error, monitor.error)
                     require(process.poll() is None, "owned server exited before readiness")
                     require(listener_owned(process.pid, config["port"]), "listener belongs to another PID")
                     report.update(status="READY", props=props, models=listing,
                         startup_ms=(time.monotonic() - startup) * 1000,
-                        expires_at=report["started_at"] + config.get("lifetime_s", 900))
+                        expires_at=report["started_at"] + settings["lifetime_s"])
                     write_json(output / "ready.json", report)
                     write_json(output / "server-result.json", report)
                 while not (output / "stop-request").exists():
+                    if monitor: require(not monitor.error, monitor.error)
                     require(process.poll() is None, "owned server exited " + str(process.returncode))
                     time.sleep(.1)
                 report["status"] = "STOPPED"
@@ -343,6 +543,9 @@ def serve(config, output):
         report.update(status="FAIL", error=type(error).__name__ + ": " + str(error))
     finally:
         if reservation is not None: reservation.close()
+        if monitor:
+            monitor.close()
+            if monitor.error: report.update(status="FAIL", error=monitor.error)
         for process in reversed(owned): stop_owned(process)
         report["finished_at"] = time.time()
         report["child_exit_codes"] = [process.returncode for process in owned]
@@ -493,7 +696,7 @@ def check(record, base_url, output, request_timeout=120, total_timeout=900):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="action", required=True)
-    server = sub.add_parser("serve", help="owned B1 server; requires separate model approval")
+    server = sub.add_parser("serve", help="owned bounded B1/B2/B3/C server")
     server.add_argument("--config", type=Path, required=True)
     server.add_argument("--output", type=Path, required=True)
     check_config = sub.add_parser("validate-config", help="syntax only; no binary/weights execution")
