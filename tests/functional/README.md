@@ -1,5 +1,9 @@
 # Text API functional tests
 
+FAEX2: отдельный ограниченный B1-набор для Qwen3.6-35B-A3B описан в
+[HARNESS.md](../../docs/faex2/HARNESS.md). Его CPU-проверки не запускают модель;
+он не расширяет автоматически матрицу SDK-набора ниже.
+
 The runner starts an isolated local server and checks real responses with the
 OpenAI SDK. Use production binaries and local weights; no models are downloaded.
 
