@@ -4935,9 +4935,16 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
     if (reader->GetMetadataUint64("qwen35.embedding_length") == 5120) {
       vision = models::qwen::vision::Encoder::Open(model_path,
                                                    vision_model_path, 5120);
+    } else if (!vision_model_path.empty() &&
+               reader->GetMetadataUint64("qwen35moe.embedding_length") ==
+                   2048) {
+      // Qwen3.6-35B-A3B: the same vision tower as Qwen3.8-27B with a
+      // 2048-wide projection; image rows enter the shared executor path.
+      vision = models::qwen::vision::Encoder::Open(model_path,
+                                                   vision_model_path, 2048);
     } else if (!vision_model_path.empty()) {
       throw std::invalid_argument(
-          "image input supports Qwen3.8-27B and Flash-Next");
+          "image input supports Qwen3.8-27B, Qwen3.6-35B-A3B and Flash-Next");
     }
   } catch (const std::exception& e) {
     SetError(error, e.what());
