@@ -18,6 +18,7 @@
 #include "src/core/gguf_reader.hpp"
 #include "src/models/qwen/hip/ops/gemm.hpp"
 #include "src/models/qwen/vision/encoder.hpp"
+#include "src/models/qwen/vision/attention.hpp"
 
 namespace gufo::models::qwen::vision {
 namespace {
@@ -208,96 +209,6 @@ __global__ void QkvRope(const float* input, const float* bias, Bf16* q, Bf16* k,
                                     : k1 * cosine + k0 * sine);
   v[target] = Bf16(input[base + 2 * kHidden + head * kHeadDim + d] +
                    bias[2 * kHidden + head * kHeadDim + d]);
-}
-
-// Keep bounded rows in registers through normalization. Larger rows retain
-// the streaming path; caching them would spill and reread private memory.
-template<unsigned kValues>
-__global__ void Softmax(const float* scores, Bf16* probabilities,
-                        unsigned length) {
-  const unsigned row = blockIdx.x;
-  __shared__ float reduce[kThreads];
-  float values[kValues != 0 ? kValues : 1];
-  float maximum = -INFINITY;
-  if constexpr (kValues != 0) {
-#pragma unroll
-    for (unsigned j = 0; j < kValues; ++j) {
-      const unsigned i = threadIdx.x + j * kThreads;
-      values[j] =
-          i < length
-              ? Round(Round(scores[row * length + i]) * 0.1178511301977579F)
-              : -INFINITY;
-      maximum = fmaxf(maximum, values[j]);
-    }
-  } else {
-    for (unsigned i = threadIdx.x; i < length; i += kThreads) {
-      maximum = fmaxf(maximum, Round(Round(scores[row * length + i]) *
-                                     0.1178511301977579F));
-    }
-  }
-  reduce[threadIdx.x] = maximum;
-  __syncthreads();
-  for (unsigned stride = kThreads / 2; stride; stride /= 2) {
-    if (threadIdx.x < stride)
-      reduce[threadIdx.x] =
-          fmaxf(reduce[threadIdx.x], reduce[threadIdx.x + stride]);
-    __syncthreads();
-  }
-  maximum = reduce[0];
-  __syncthreads();
-  float sum = 0;
-  if constexpr (kValues != 0) {
-#pragma unroll
-    for (unsigned j = 0; j < kValues; ++j) {
-      if (threadIdx.x + j * kThreads < length) {
-        values[j] = expf(values[j] - maximum);
-        sum += values[j];
-        // Limit overlapping exponential temporaries without changing their
-        // order. Wider shapes otherwise spill registers on gfx1151.
-        if constexpr (kValues > 16)
-          __builtin_amdgcn_sched_barrier(0);
-      }
-    }
-  } else {
-    for (unsigned i = threadIdx.x; i < length; i += kThreads)
-      sum += expf(Round(Round(scores[row * length + i]) * 0.1178511301977579F) -
-                  maximum);
-  }
-  reduce[threadIdx.x] = sum;
-  __syncthreads();
-  for (unsigned stride = kThreads / 2; stride; stride /= 2) {
-    if (threadIdx.x < stride)
-      reduce[threadIdx.x] += reduce[threadIdx.x + stride];
-    __syncthreads();
-  }
-  const float inverse = 1.0F / reduce[0];
-  if constexpr (kValues != 0) {
-#pragma unroll
-    for (unsigned j = 0; j < kValues; ++j) {
-      const unsigned i = threadIdx.x + j * kThreads;
-      if (i < length)
-        probabilities[row * length + i] = Bf16(values[j] * inverse);
-    }
-  } else {
-    for (unsigned i = threadIdx.x; i < length; i += kThreads) {
-      probabilities[row * length + i] = Bf16(
-          expf(Round(Round(scores[row * length + i]) * 0.1178511301977579F) -
-               maximum) *
-          inverse);
-    }
-  }
-}
-
-__global__ void AttentionRows(const float* input, Bf16* output, unsigned begin,
-                              unsigned rows) {
-  const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= rows * kHidden)
-    return;
-  const unsigned token = i / kHidden;
-  const unsigned head = (i % kHidden) / kHeadDim;
-  const unsigned d = i % kHeadDim;
-  output[(begin + token) * kHidden + head * kHeadDim + d] =
-      Bf16(input[(head * rows + token) * kHeadDim + d]);
 }
 
 __global__ void Finish(float* output, const float* bias, unsigned size,
@@ -550,6 +461,11 @@ const std::string& Encoder::identity() const {
       impl_->identity.push_back(hex[byte >> 4]);
       impl_->identity.push_back(hex[byte & 15]);
     }
+    // Cached prompts hold this encoder's embeddings: a different attention
+    // kernel rounds differently, so it must not reuse another kernel's cache.
+    impl_->identity += DefaultAttentionKernel() == AttentionKernel::kFused
+                           ? "-attention-fused1"
+                           : "-attention-tiled-bf16";
   });
   return impl_->identity;
 }
@@ -590,13 +506,7 @@ std::shared_ptr<const Encoder::Embedding> Encoder::Encode(
                         sizeof(Bf16));
   Allocation qkv(std::size_t{3} * count * kHidden * sizeof(Bf16));
   Allocation attention(std::size_t{count} * kHidden * sizeof(Bf16));
-  // Smaller attention tiles reduce scratch traffic for the 4096-patch
-  // shape while preserving its BLAS reductions. Ragged tails require
-  // their existing GEMM shapes to preserve rounding.
-  const unsigned tile = std::min(count, count == 4096 ? 64U : 128U);
-  Allocation scores(std::size_t{kHeads} * tile * count * sizeof(float));
-  Allocation probabilities(std::size_t{kHeads} * tile * count * sizeof(Bf16));
-  Allocation output_tile(std::size_t{tile} * kHidden * sizeof(float));
+  const auto attention_kernel = DefaultAttentionKernel();
   Check(hipMemcpyAsync(pixels.data, image.pixels.data(), image.pixels.size(),
                        hipMemcpyHostToDevice, stream));
   Patchify<<<(count * kPatchDim + kThreads - 1) / kThreads, kThreads, 0,
@@ -636,41 +546,8 @@ std::shared_ptr<const Encoder::Embedding> Encoder::Encode(
               stream>>>(work.As<float>(),
                         impl_->FloatWeight(prefix + "attn_qkv.bias"), q, k, v,
                         count, image.width / 16);
-    for (unsigned begin = 0; begin < count; begin += tile) {
-      check_cancelled();
-      const unsigned rows = std::min(tile, count - begin);
-      constexpr float zero = 0, one = 1;
-      CheckBlas(hipblasGemmStridedBatchedEx(
-          impl_->blas, HIPBLAS_OP_T, HIPBLAS_OP_N, count, rows, kHeadDim, &one,
-          k, HIP_R_16BF, kHeadDim, count * kHeadDim, q + begin * kHeadDim,
-          HIP_R_16BF, kHeadDim, count * kHeadDim, &zero, scores.data, HIP_R_32F,
-          count, rows * count, kHeads, HIPBLAS_COMPUTE_32F,
-          HIPBLAS_GEMM_DEFAULT));
-      if (count <= 1024)
-        Softmax<4><<<kHeads * rows, kThreads, 0, stream>>>(
-            scores.As<float>(), probabilities.As<Bf16>(), count);
-      else if (count <= 2048)
-        Softmax<8><<<kHeads * rows, kThreads, 0, stream>>>(
-            scores.As<float>(), probabilities.As<Bf16>(), count);
-      else if (count <= 4096)
-        Softmax<16><<<kHeads * rows, kThreads, 0, stream>>>(
-            scores.As<float>(), probabilities.As<Bf16>(), count);
-      else if (count <= 8192)
-        Softmax<32><<<kHeads * rows, kThreads, 0, stream>>>(
-            scores.As<float>(), probabilities.As<Bf16>(), count);
-      else
-        Softmax<0><<<kHeads * rows, kThreads, 0, stream>>>(
-            scores.As<float>(), probabilities.As<Bf16>(), count);
-      CheckBlas(hipblasGemmStridedBatchedEx(
-          impl_->blas, HIPBLAS_OP_N, HIPBLAS_OP_N, kHeadDim, rows, count, &one,
-          v, HIP_R_16BF, kHeadDim, count * kHeadDim, probabilities.data,
-          HIP_R_16BF, count, rows * count, &zero, output_tile.data, HIP_R_32F,
-          kHeadDim, rows * kHeadDim, kHeads, HIPBLAS_COMPUTE_32F,
-          HIPBLAS_GEMM_DEFAULT));
-      AttentionRows<<<(rows * kHidden + kThreads - 1) / kThreads, kThreads, 0,
-                      stream>>>(output_tile.As<float>(), attention.As<Bf16>(),
-                                begin, rows);
-    }
+    Attention(attention_kernel, impl_->blas, q, k, v, attention.As<Bf16>(),
+              count, stream);
     impl_->Gemm(prefix + "attn_out.weight", attention.As<Bf16>(),
                 work.As<float>(), count, kHidden, kHidden);
     BiasResidual<<<(count * kHidden + kThreads - 1) / kThreads, kThreads, 0,

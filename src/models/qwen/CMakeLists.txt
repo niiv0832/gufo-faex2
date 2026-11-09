@@ -26,6 +26,7 @@ if (ENGINE_ENABLE_HIP)
   target_link_libraries(gufo_core PRIVATE OpenSSL::Crypto)
   target_sources(gufo_core PRIVATE
     ${PROJECT_SOURCE_DIR}/src/models/qwen/vision/encoder.hip
+    ${PROJECT_SOURCE_DIR}/src/models/qwen/vision/attention.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/vision/device_input.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/attention.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/batched_ssm.hip

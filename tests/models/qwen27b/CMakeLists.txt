@@ -55,6 +55,12 @@ if (ENGINE_ENABLE_HIP)
   add_qwen27b_test(qwen_vision_prepare_test ../qwen/vision_prepare_test.cpp
     "qwen38-flash-next;gpu;hip;vision;external-model")
   target_link_libraries(qwen_vision_prepare_test PRIVATE hip::host)
+  add_qwen27b_test(qwen_vision_attention_test vision_attention_test.hip
+    "gpu;hip;vision;correctness")
+  target_link_libraries(qwen_vision_attention_test PRIVATE hip::host)
+  # Encodes one image with the vision tower; compares encoder variants and times them.
+  add_executable(qwen_vision_encode_dump vision_encode_dump.cpp)
+  target_link_libraries(qwen_vision_encode_dump PRIVATE gufo_core hip::host)
   add_test(NAME inference_backend_gpu_test COMMAND inference_backend_gpu_test)
   set_tests_properties(inference_backend_gpu_test PROPERTIES
     LABELS "qwen27b;hip;gpu;server;correctness;external-model"
