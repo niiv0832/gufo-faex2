@@ -2,7 +2,11 @@
 
 run_control(runner, records, groups=None) использует подтверждённое B3 число
 архивных записей. groups: short, vision, batch, long_cache; порядок фиксирован,
-long_cache всегда исполняется целиком. Каждый повтор требует нового Runner и
+long_cache всегда исполняется целиком. Перед выбранными группами всегда идёт
+обязательная mtp_c1: один sampled JSON с 40 квадратами, proposed>0/accepted>0.
+Он входит в cases/history и тайминги, одинаков для full и targeted повторов.
+Control v1 без этого доказательства не принимается compare_reports.
+Каждый повтор требует нового Runner и
 свежего отдельного server cache. Вход comparison_conditions в runner.report:
 model_sha256/mmproj_sha256/harness_sha256/runtime_sha256, точный profile
 (sampler/cache/think и остальные настройки без уникальных run paths/порта), cache_start='fresh-separated',
@@ -36,6 +40,7 @@ import time
 from types import SimpleNamespace
 
 from faex2 import require
+from faex2_acceptance import grade
 import faex2_family as family
 from faex2_images import image_content
 from metrics import timing_measurement
@@ -43,6 +48,20 @@ from metrics import timing_measurement
 GROUPS = ("short", "vision", "batch", "long_cache")
 PHASES = ("prefill_ms", "decode_ms", "ttft_ms", "client_ttfa_ms", "wall_ms")
 COUNTERS = ("prompt_tokens", "prefill_tokens", "cached_tokens", "completion_tokens")
+
+
+def _mtp_c1():
+    squares = [1, 4, 9, 16, 25, 36, 49, 64, 81, 100, 121, 144, 169, 196, 225, 256, 289, 324,
+               361, 400, 441, 484, 529, 576, 625, 676, 729, 784, 841, 900, 961, 1024, 1089,
+               1156, 1225, 1296, 1369, 1444, 1521, 1600]
+    request = family._chat([
+        {"role": "system", "content": "Независимая контрольная беседа C1_MTP_742."},
+        {"role": "user", "content": "Вычисли квадраты целых чисел от 1 до 40 включительно. "
+         "Верни только JSON: session — идентификатор этой беседы, squares — сорок квадратов по порядку."}],
+        family._schema({"session": {"type": "string"}, "squares": {"type": "array",
+            "items": {"type": "integer"}, "minItems": 40, "maxItems": 40}}),
+        temperature=1, cache=False, max_tokens=384)
+    return "control-mtp-c1", request, {"json": {"session": "C1_MTP_742", "squares": squares}, "draft_work": True}
 
 
 def _conditions(report):
@@ -98,10 +117,10 @@ def run_control(runner, records, groups=None):
     chosen = tuple(group for group in GROUPS if group in chosen)
     cold_request = family._long_request(records, cache=False)  # Проверить глубину до первого HTTP.
     require("control" not in runner.report, "control was already started in this Runner")
-    control = {"version": 1, "status": "RUNNING", "groups": list(chosen),
+    control = {"version": 2, "status": "RUNNING", "groups": ["mtp_c1", *chosen],
                "records": records, "cases": [], "started_at": time.time()}
     runner.report["control"] = control
-    histories = {group: [] for group in chosen}
+    histories = {group: [] for group in ("mtp_c1", *chosen)}
     runner.save()
 
     def dispatch(group, cases, *, batch=False, timeout=120):
@@ -119,6 +138,7 @@ def run_control(runner, records, groups=None):
         return results[0] if not batch else results
 
     try:
+        dispatch("mtp_c1", [_mtp_c1()])
         if "short" in chosen:
             for streaming, suffix in ((False, "json"), (True, "sse")):
                 request = family._chat([{"role": "user", "content":
@@ -171,6 +191,17 @@ def _report(value):
     require(isinstance(result, dict) and result.get("status") == "PASS" and
             result.get("control", {}).get("status") == "PASS", "control report is unfinished or failed")
     _conditions(result)
+    control = result["control"]
+    require(control.get("version") == 2 and control.get("groups", [])[:1] == ["mtp_c1"],
+            "control lacks mandatory explicit MTP C1 qualification")
+    identifier, request, expected = _mtp_c1()
+    fingerprint = family._hash(request)
+    descriptor = {"id": identifier, "group": "mtp_c1", "width": 1, "request_sha256": fingerprint,
+                  "expected_sha256": family._hash(expected), "history_sha256": family._hash([[fingerprint]]), "timeout": 120}
+    require(control.get("cases", [])[:1] == [descriptor], "MTP C1 input/history changed or is missing")
+    gate = [row for row in result.get("requests", []) if row.get("id") == identifier]
+    require(len(gate) == 1 and gate[0].get("status") == "PASS", "MTP C1 result is missing or failed")
+    grade(gate[0].get("result", {}), expected, "mtp")
     return result
 
 

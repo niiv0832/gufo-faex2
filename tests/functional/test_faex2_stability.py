@@ -44,6 +44,10 @@ class RecordingRunner:
         if "Архивная запись" in contents:
             answer = {"start": "ЛИПА_274", "middle": "РЕКА_583",
                       "end": "ЗВЕЗДА_408" if "ЗВЕЗДА_408" in contents else "СОВА_916"}
+        elif "C1_MTP_742" in contents:
+            answer = {"session": "C1_MTP_742", "squares": [1, 4, 9, 16, 25, 36, 49, 64, 81, 100,
+                121, 144, 169, 196, 225, 256, 289, 324, 361, 400, 441, 484, 529, 576, 625,
+                676, 729, 784, 841, 900, 961, 1024, 1089, 1156, 1225, 1296, 1369, 1444, 1521, 1600]}
         elif "image_url" in contents:
             answer = "red"
         elif "reasoning" in body:
@@ -115,7 +119,7 @@ class StabilityTests(unittest.TestCase):
     def test_control_covers_exact_short_vision_concurrency_and_long_cache(self):
         with tempfile.TemporaryDirectory() as root:
             runner = self.control(root)
-            cases = runner.calls
+            cases = runner.calls[1:]
             self.assertEqual([len(batch) for batch in runner.batches], [2, 4])
             self.assertEqual([case[0] for case in cases[:3]],
                              ["control-short-json", "control-short-sse", "control-vision-red"])
@@ -133,13 +137,67 @@ class StabilityTests(unittest.TestCase):
             self.assertTrue(all(case[2]["min_cached_tokens"] >= 117744 for case in longs[1:]))
             self.assertEqual(longs[-2][2]["json"]["end"], "ЗВЕЗДА_408")
 
+    def test_every_filtered_run_begins_with_a_bounded_sampled_c1_gate(self):
+        for groups in (None, ["short"], ["vision"], ["batch"], ["long_cache"]):
+            with self.subTest(groups=groups), tempfile.TemporaryDirectory() as root:
+                runner = self.control(root, groups=groups)
+                identifier, request, expected, timeout = runner.calls[0]
+                self.assertEqual(identifier, "control-mtp-c1")
+                self.assertEqual(runner.report["control"]["cases"][0]["group"], "mtp_c1")
+                self.assertEqual(runner.report["control"]["groups"][0], "mtp_c1")
+                self.assertTrue(expected["draft_work"])
+                self.assertEqual(expected["json"]["session"], "C1_MTP_742")
+                self.assertEqual(len(expected["json"]["squares"]), 40)
+                self.assertEqual(expected["json"]["squares"][-1], 1600)
+                self.assertEqual(expected["json"]["squares"], [number * number for number in range(1, 41)])
+                self.assertEqual(request["body"]["temperature"], 1)
+                self.assertEqual(request["body"]["max_completion_tokens"], 384)
+                self.assertEqual(timeout, 120)
+                self.assertFalse(request["body"]["cache_prompt"])
+                self.assertNotIn("enum", json.dumps(request["body"]["response_format"]))
+
+    def test_zero_proposed_or_zero_accepted_stops_control_at_c1_gate(self):
+        for proposed, accepted in [(0, 0), (10, 0)]:
+            def damage(_identifier, result):
+                result["metrics"].update(draft_tokens=proposed, draft_tokens_accepted=accepted)
+            with self.subTest(proposed=proposed), tempfile.TemporaryDirectory() as root:
+                runner = RecordingRunner(root, damage=damage)
+                with self.assertRaises(ValueError): self.api().run_control(runner, 3800, ["short"])
+                self.assertEqual(len(runner.calls), 1)
+                self.assertEqual(runner.report["control"]["status"], "FAIL")
+
+    def test_comparison_rechecks_mtp_gate_but_does_not_require_equal_positive_drafts(self):
+        with tempfile.TemporaryDirectory() as root:
+            base = self.control(root, groups=["short"]).report
+        changed = deepcopy(base)
+        changed["requests"][0]["result"]["metrics"].update(draft_tokens=0, draft_tokens_accepted=0)
+        with self.assertRaises(ValueError): self.api().compare_reports(base, changed)
+        changed["requests"][0]["result"]["metrics"].update(draft_tokens=70, draft_tokens_accepted=60)
+        self.assertEqual(self.api().compare_reports(base, changed)["status"], "PASS")
+
+    def test_c2_c4_may_gate_drafts_after_c1_proved_mtp(self):
+        def damage(identifier, result):
+            if identifier.startswith("control-batch"):
+                result["metrics"].update(draft_tokens=0, draft_tokens_accepted=0)
+        with tempfile.TemporaryDirectory() as root:
+            runner = RecordingRunner(root, damage=damage)
+            self.api().run_control(runner, 3800, ["batch"])
+            self.assertEqual(runner.report["control"]["status"], "PASS")
+
+    def test_comparison_rejects_legacy_control_without_explicit_c1_evidence(self):
+        with tempfile.TemporaryDirectory() as root:
+            report = self.control(root, groups=["short"]).report
+        report["control"]["version"] = 1
+        with self.assertRaises(ValueError): self.api().compare_reports(report, deepcopy(report))
+
     def test_group_repeat_keeps_full_history_and_original_inputs(self):
         with tempfile.TemporaryDirectory() as left, tempfile.TemporaryDirectory() as right:
             original = self.control(left)
             repeated = self.control(right, groups=["long_cache"])
-            self.assertEqual(original.calls[9:], repeated.calls)
+            self.assertEqual(original.calls[0], repeated.calls[0])
+            self.assertEqual(original.calls[10:], repeated.calls[1:])
             first = [case for case in original.report["control"]["cases"] if case["group"] == "long_cache"]
-            self.assertEqual(first, repeated.report["control"]["cases"])
+            self.assertEqual(first, repeated.report["control"]["cases"][1:])
 
     def test_control_rejects_missing_conditions_unknown_groups_and_bad_depth(self):
         for records, groups, delete in [(3800, ["arbitrary"], False), (7, None, False), (3800, None, True)]:
@@ -155,7 +213,7 @@ class StabilityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             runner = RecordingRunner(root, damage=damage)
             with self.assertRaises(ValueError): self.api().run_control(runner, 3800, ["long_cache"])
-            self.assertEqual(len(runner.calls), 2)
+            self.assertEqual(len(runner.calls), 3)
             saved = json.loads((Path(root) / "report.json").read_text())
             self.assertEqual(saved["control"]["status"], "FAIL")
             self.assertEqual(saved["requests"][-1]["status"], "FAIL")
@@ -164,14 +222,14 @@ class StabilityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             original = self.control(root, groups=["short"]).report
         changed = deepcopy(original)
-        changed["requests"][0]["result"]["metrics"]["decode_ms"] = 54
-        changed["requests"][1]["result"]["metrics"]["decode_ms"] = 1
+        changed["requests"][1]["result"]["metrics"]["decode_ms"] = 54
+        changed["requests"][2]["result"]["metrics"]["decode_ms"] = 1
         report = self.api().compare_reports(original, changed)
         self.assertEqual(report["status"], "NEEDS_INVESTIGATION")
         flags = [row for row in report["measurements"] if row["status"] == "NEEDS_INVESTIGATION"]
         self.assertEqual([(row["case"], row["metric"]) for row in flags],
                          [("control-short-json", "decode_ms")])
-        self.assertEqual(len(report["measurements"]), 10)
+        self.assertEqual(len(report["measurements"]), 15)
 
     def test_comparison_requires_both_five_percent_and_three_ms(self):
         with tempfile.TemporaryDirectory() as root:
@@ -180,7 +238,7 @@ class StabilityTests(unittest.TestCase):
                                                (10, 13.1, "NEEDS_INVESTIGATION")]:
             left, right = deepcopy(base), deepcopy(base)
             for report, value in [(left, baseline), (right, candidate)]:
-                report["requests"][0]["result"]["metrics"]["prefill_ms"] = value
+                report["requests"][1]["result"]["metrics"]["prefill_ms"] = value
             self.assertEqual(self.api().compare_reports(left, right)["status"], expected)
 
     def test_comparison_rejects_unmatched_inputs_conditions_or_history(self):
@@ -200,17 +258,17 @@ class StabilityTests(unittest.TestCase):
             base = self.control(root, groups=["long_cache"]).report
         left, right = deepcopy(base), deepcopy(base)
         for report in (left, right):
-            del report["requests"][1]["result"]["metrics"]["prefill_ms"]
+            del report["requests"][2]["result"]["metrics"]["prefill_ms"]
         compared = self.api().compare_reports(left, right)
         na = [row for row in compared["measurements"] if row["status"] == "N/A"]
         self.assertEqual([(row["case"], row["metric"]) for row in na], [("control-long-repeat", "prefill_ms")])
-        del right["requests"][0]["result"]["metrics"]["decode_ms"]
+        del right["requests"][1]["result"]["metrics"]["decode_ms"]
         with self.assertRaises(ValueError): self.api().compare_reports(left, right)
 
     def test_mismatched_token_work_cannot_produce_qualified_timings(self):
         with tempfile.TemporaryDirectory() as root:
             base = self.control(root, groups=["short"]).report
-        changed = deepcopy(base); changed["requests"][0]["result"]["metrics"]["completion_tokens"] = 81
+        changed = deepcopy(base); changed["requests"][1]["result"]["metrics"]["completion_tokens"] = 81
         result = self.api().compare_reports(base, changed)
         self.assertEqual(result["status"], "NEEDS_INVESTIGATION")
         self.assertTrue(result["work_changes"])
@@ -221,8 +279,8 @@ class StabilityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             base = self.control(root, groups=["long_cache"]).report
         left, right = deepcopy(base), deepcopy(base)
-        del left["requests"][1]["result"]["metrics"]["prefill_ms"]
-        right["requests"][1]["result"]["metrics"]["prefill_ms"] = "invalid"
+        del left["requests"][2]["result"]["metrics"]["prefill_ms"]
+        right["requests"][2]["result"]["metrics"]["prefill_ms"] = "invalid"
         with self.assertRaises(ValueError): self.api().compare_reports(left, right)
 
     def test_interrupt_is_persisted_as_failed_control_or_soak(self):
