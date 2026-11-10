@@ -270,17 +270,24 @@ private:
     if (found != scratch_by_stream_.end()) {
       return found->second.get();
     }
+    // A failed stream keeps a null entry: report once, then leave that stream
+    // on the per-token path instead of retrying the allocation for every layer.
+    std::string error = "out of host memory";
     try {
       auto scratch = std::make_unique<Scratch>();
-      if (!Allocate(*scratch, nullptr)) {
-        return nullptr;
+      if (Allocate(*scratch, &error)) {
+        Scratch* const result = scratch.get();
+        scratch_by_stream_.emplace(stream, std::move(scratch));
+        return result;
       }
-      Scratch* const result = scratch.get();
-      scratch_by_stream_.emplace(stream, std::move(scratch));
-      return result;
     } catch (const std::bad_alloc&) {
-      return nullptr;
     }
+    std::fprintf(stderr, "MoE prefill off for one stream: %s\n", error.c_str());
+    try {
+      scratch_by_stream_.emplace(stream, nullptr);
+    } catch (const std::bad_alloc&) {
+    }
+    return nullptr;
   }
 
   bool Allocate(Scratch& scratch, std::string* error) {
