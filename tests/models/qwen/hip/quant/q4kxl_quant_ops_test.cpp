@@ -878,6 +878,7 @@ int main() {
   }
   // Rows that would otherwise split run in one masked sixteen-row group; the
   // guard rows check that no padded token is stored.
+  const FormatCase q4{Type::kQ4_K, "Q4_K"};
   const FormatCase q5{Type::kQ5_K, "Q5_K"};
   const FormatCase q6{Type::kQ6_K, "Q6_K"};
   for (const auto batch : {9U, 12U, 13U, 15U, 25U})
