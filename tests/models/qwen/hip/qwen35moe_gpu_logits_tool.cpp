@@ -6,6 +6,13 @@
 // usage: qwen35moe_gpu_logits_tool <model.gguf> <ids.txt> <out> [n_gen]
 //   without n_gen: writes <out> as raw float32 logits of the last position.
 //   with n_gen:    writes <out> as n_gen greedy token ids, space separated.
+//
+// TWO_SESSIONS=<ids2.txt> with TWO_SESSIONS_HEAD=<n>: two executors share one
+// model, as serve sessions do. Each prefills the first n ids of its own
+// sequence without a final synchronization, one right after the other, then
+// decodes one token. Both logit rows must be bitwise equal to the serial
+// reference; exits 1 otherwise. n >= 64 takes the grouped MoE prefill, a
+// smaller n the per-token one.
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -40,6 +47,85 @@ int main(int argc, char** argv) {
   }
   const std::shared_ptr<const gufo::core::GgufReader> reader(
       std::move(reader_owner));
+  if (const char* second_env = std::getenv("TWO_SESSIONS")) {
+    // One shared model only: this mode runs before the single-session executor
+    // below would load a second copy of the weights.
+    std::vector<gufo::tokenization::TokenId> ids;
+    std::ifstream first(argv[2]);
+    for (std::uint32_t id; first >> id;)
+      ids.push_back(id);
+    std::vector<gufo::tokenization::TokenId> other;
+    std::ifstream second(second_env);
+    for (std::uint32_t id; second >> id;)
+      other.push_back(id);
+    const std::size_t head = std::getenv("TWO_SESSIONS_HEAD") != nullptr
+                                 ? std::stoul(std::getenv("TWO_SESSIONS_HEAD"))
+                                 : 96;
+    if (head == 0 || ids.size() <= head || other.size() <= head) {
+      std::cerr << "both id lists need more than " << head << " ids\n";
+      return 2;
+    }
+    const std::uint32_t context =
+        std::getenv("QUALITY_CTX") != nullptr
+            ? static_cast<std::uint32_t>(std::stoul(std::getenv("QUALITY_CTX")))
+            : 4096U;
+    auto model = gufo::hip::QwenGpuModel::CreateFromGguf(reader, &error);
+    std::unique_ptr<gufo::hip::QwenGpuExecutor> sessions[2];
+    for (auto& session : sessions) {
+      session = model
+                    ? gufo::hip::QwenGpuExecutor::Create(model, &error, context)
+                    : nullptr;
+      if (!session) {
+        std::cerr << "executor failed: " << error << '\n';
+        return 1;
+      }
+    }
+    const std::vector<gufo::tokenization::TokenId>* inputs[2] = {&ids, &other};
+    const auto prefill = [&](int s) {
+      sessions[s]->Reset();
+      (void)sessions[s]->ForwardPromptBatch(std::span(*inputs[s]).first(head),
+                                            0, false);
+    };
+    const auto decode = [&](int s) {
+      (void)sessions[s]->ForwardToken((*inputs[s])[head],
+                                      static_cast<std::uint32_t>(head));
+      const auto logits = sessions[s]->CopyLastLogits();
+      return std::vector<float>(logits.begin(), logits.end());
+    };
+    std::vector<float> reference[2];
+    int unstable = 0;
+    for (int pass = 0; pass < 2; ++pass) {
+      for (int s = 0; s < 2; ++s) {
+        prefill(s);
+        auto row = decode(s);
+        if (pass == 1 && row != reference[s])
+          ++unstable;
+        reference[s] = std::move(row);
+      }
+    }
+    const int rounds = std::getenv("TWO_SESSIONS_ROUNDS") != nullptr
+                           ? std::stoi(std::getenv("TWO_SESSIONS_ROUNDS"))
+                           : 20;
+    int mismatches = 0;
+    float worst = 0.0F;
+    for (int round = 0; round < rounds; ++round) {
+      prefill(0);
+      prefill(1);
+      for (int s = 0; s < 2; ++s) {
+        const auto row = decode(s);
+        if (row == reference[s])
+          continue;
+        ++mismatches;
+        for (std::size_t i = 0; i < row.size(); ++i)
+          worst = std::max(worst, std::abs(row[i] - reference[s][i]));
+      }
+    }
+    std::printf(
+        "two sessions head %zu: serial repeat mismatches %d, "
+        "interleaved mismatches %d of %d, max|diff| %.4f\n",
+        head, unstable, mismatches, rounds * 2, worst);
+    return unstable == 0 && mismatches == 0 ? 0 : 1;
+  }
   auto executor = gufo::hip::QwenGpuExecutor::CreateFromGguf(
       reader, &error,
       std::getenv("QUALITY_CTX") != nullptr
