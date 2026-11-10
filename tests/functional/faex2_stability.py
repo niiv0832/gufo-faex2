@@ -208,7 +208,10 @@ def _report(value):
     return result
 
 
-ADMISSION_PHASES = ("ttft_ms", "client_ttfa_ms", "wall_ms")
+# Место допуска сдвигает только первый токен. Полное время запроса от места почти не
+# зависит (пакет заканчивается вместе), поэтому wall_ms всегда сравнивается по имени:
+# иначе замедление после первого токена было бы скрыто при перестановке.
+ADMISSION_PHASES = ("ttft_ms", "client_ttfa_ms")
 
 
 def _batches(cases):
@@ -259,12 +262,8 @@ def _rank_measurements(cases, sources, moved):
             pair = [next(name for name in names if moved[name][side] == rank) for side in (0, 1)]
             results = [source[name]["result"] for source, name in zip(sources, pair)]
             metrics = [result.get("metrics", {}) for result in results]
-            same_work = all(metrics[0][field] == metrics[1][field] for field in COUNTERS)
             for phase in ADMISSION_PHASES:
-                if phase == "wall_ms" and not same_work:
-                    continue  # Полное время зависит от длины ответа другого запроса.
-                values = [result.get(phase) if phase == "wall_ms" else metric.get(phase)
-                          for result, metric in zip(results, metrics)]
+                values = [metric.get(phase) for metric in metrics]
                 require(all(type(value) in (int, float) and math.isfinite(value) and value >= 0
                             for value in values), f"{label}: invalid {phase} at admission {rank}")
                 row = timing_measurement(f"{label}#admission-{rank}", phase, *values,

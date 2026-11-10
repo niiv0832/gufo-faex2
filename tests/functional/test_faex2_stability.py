@@ -317,6 +317,40 @@ class StabilityTests(unittest.TestCase):
                                  ("control-batch-c4#admission-4", "client_ttfa_ms")])
         self.assertEqual(report["status"], "NEEDS_INVESTIGATION")
 
+    def test_permuted_batch_still_checks_full_request_time_by_name(self):
+        """Перестановка допуска не должна скрывать замедление после первого токена.
+
+        Ревью: при разной длине ответов у пары одного места wall не сравнивался вовсе.
+        Полное время запроса от места почти не зависит и остаётся строгим сравнением по имени.
+        """
+        with tempfile.TemporaryDirectory() as root:
+            base = self.control(root, groups=["batch"]).report
+        left, right = deepcopy(base), deepcopy(base)
+        self.admission(left, ["OWL_142", "MOON_853", "PINE_627", "LAKE_394"])
+        self.admission(right, ["PINE_627", "MOON_853", "LAKE_394", "OWL_142"], ttft=(663, 663, 746, 865))
+        for report in (left, right):
+            for row in report["requests"]:
+                if "-c4-" in row["id"]:
+                    # Разная длина ответов, как в реальных отчётах; пакет заканчивается вместе.
+                    row["result"]["metrics"]["completion_tokens"] = 43 if row["id"].endswith("OWL_142") else 44
+                    row["result"]["wall_ms"] = 2090
+        clean = self.api().compare_reports(left, right)
+        walls = [row for row in clean["measurements"] if row["metric"] == "wall_ms" and "-c4-" in row["case"]]
+        self.assertEqual(len(walls), 4)
+        self.assertEqual({row["status"] for row in walls}, {"PASS"})
+        self.assertFalse([row for row in clean["measurements"]
+                          if "#admission-" in row["case"] and row["metric"] == "wall_ms"])
+        self.assertEqual(clean["status"], "PASS")
+        slow = deepcopy(right)
+        for row in slow["requests"]:
+            if row["id"].endswith("-c4-OWL_142"):
+                row["result"]["wall_ms"] += 200   # замедление после первого токена
+        report = self.api().compare_reports(left, slow)
+        flags = [(row["case"], row["metric"]) for row in report["measurements"]
+                 if row["status"] == "NEEDS_INVESTIGATION"]
+        self.assertEqual(flags, [("control-batch-c4-OWL_142", "wall_ms")])
+        self.assertEqual(report["status"], "NEEDS_INVESTIGATION")
+
     def test_same_admission_order_keeps_strict_per_request_comparison(self):
         with tempfile.TemporaryDirectory() as root:
             base = self.control(root, groups=["batch"]).report
