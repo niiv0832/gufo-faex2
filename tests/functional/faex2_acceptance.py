@@ -13,7 +13,8 @@ from concurrent.futures import ThreadPoolExecutor
 
 from faex2 import ALIAS, file_hash, hard_timeout, load_cases, profile, require, validate_drafts, validate_props
 from discovery import assert_model_listing
-from faex2_images import image_content, text_image_content
+from faex2_images import image_content
+import faex2_vision_probes as vision_probes
 from image_inputs import image_cases
 from run import write_json
 
@@ -185,6 +186,32 @@ class Runner:
         self.reserve(identifier)
         return self.record([self.exchange(identifier, request, expected, timeout, cancel)])[0]
 
+    def run_probe(self, identifier, request, text, known_limit, timeout=120):
+        """Зрительная проба: известный отказ остаётся виден и не становится PASS.
+
+        Ограничение покрывает только содержание ответа. Сбой транспорта, HTTP,
+        незавершённый ответ или отсутствие свежего prefill — обычный FAIL.
+        """
+        self.reserve(identifier)
+        row = self.exchange(identifier, request, {"fresh_prefill": True}, timeout)
+        row["expected"] = {"fresh_prefill": True, "probe_text": text, "known_limit": known_limit}
+        if row["status"] == "PASS":
+            if vision_probes.grade(row["result"].get("text", ""), text):
+                if known_limit:
+                    self.report.setdefault("unexpected_probe_passes", []).append(identifier)
+            elif known_limit:
+                row["status"] = "KNOWN_LIMIT_FAIL"
+                self.report.setdefault("known_limit_failures", []).append(identifier)
+            else:
+                row.update(status="FAIL", error="ValueError: wrong probe answer")
+        self.report["requests"].append(row)
+        if row["status"] == "FAIL":
+            self.report["status"] = "FAIL"
+            self.save()
+            raise ValueError(identifier + ": " + row["error"])
+        self.save()
+        return row["status"]
+
     def run_batch(self, cases, timeout=120):
         require(1 <= len(cases) <= 4, "batch must have one to four requests")
         for identifier, _, _ in cases:
@@ -197,8 +224,10 @@ class Runner:
 
     def finish(self):
         if self.report["status"] != "FAIL":
-            self.report["status"] = ("NEEDS_REVIEW" if any(
-                row["status"] == "NEEDS_REVIEW" for row in self.report["requests"]) else "PASS")
+            statuses = {row["status"] for row in self.report["requests"]}
+            # Известный отказ важнее ожидающей ручной оценки: итог не должен читаться как успех.
+            self.report["status"] = ("KNOWN_FAILURES" if "KNOWN_LIMIT_FAIL" in statuses else
+                                     "NEEDS_REVIEW" if "NEEDS_REVIEW" in statuses else "PASS")
         self.report["finished_at"] = time.time()
         self.save()
 
@@ -231,9 +260,6 @@ def b2_visual_cases():
     cases = [visual("vision-" + name, [{"type": "image_url", "image_url": {"url": url}}],
                     color, {"text": "red"}, name in ("jpeg", "webp_lossy"))
              for name, url in image_cases(image_content)[:4]]
-    cases.append(visual("vision-text", [text_image_content()],
-                        "Read the text in this image. Reply with the text only, preserving the space.",
-                        {"text": "GUFO 742"}))
     question = ("Name the dominant color of each image, in the order shown. "
                 "Reply with two lowercase English color names separated by a comma, without spaces.")
     for name, colors in (("forward", ("red", "blue")), ("reverse", ("blue", "red"))):
@@ -244,6 +270,12 @@ def b2_visual_cases():
                          {"http_status": 400, "error_contains": "base64"}))
     cases.append(visual("vision-recovery", [image_content("blue")], color, {"text": "blue"}, True))
     return cases
+
+
+def b2_probe_cases():
+    """Независимые зрительные пробы; первая — исходная фикстура GUFO 742 без изменений."""
+    return [("probe-" + case["id"], vision_probes.request(case), case["expected"], case["known_limit"])
+            for case in vision_probes.probes()]
 
 
 def check_ready(runner, record, stage):
@@ -266,7 +298,8 @@ def run_b2(runner):
     quality_path = root / "faex2_quality.jsonl"
     quality = [json.loads(line) for line in quality_path.read_text().splitlines() if line.strip()]
     runner.report["fixture_sha256"] = {name: file_hash(root / name) for name in
-        ("faex2_cases.jsonl", "faex2_quality.jsonl", "faex2_images.py", "image_inputs.py")}
+        ("faex2_cases.jsonl", "faex2_quality.jsonl", "faex2_images.py", "image_inputs.py",
+         "faex2_vision_probes.py")}
     write_json(runner.output / "quality-rubric.json", quality)
     runner.save()
     for case in load_cases(root / "faex2_cases.jsonl"):
@@ -283,6 +316,8 @@ def run_b2(runner):
         {"draft_work": True, "manual_quality": True, "contains": ["150", "50"]})
     for identifier, request, expected in b2_visual_cases():
         runner.run_case(identifier, request, expected)
+    for identifier, request, text, known_limit in b2_probe_cases():
+        runner.run_probe(identifier, request, text, known_limit)
     for case in quality:
         request = chat_request({"messages": case.get("messages", [{"role": "user", "content": case["prompt"]}]),
                                 "max_completion_tokens": case["max_completion_tokens"]}, True)

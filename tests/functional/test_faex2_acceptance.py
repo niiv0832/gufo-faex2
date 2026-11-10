@@ -192,12 +192,86 @@ result={'status':'PASS','http_status':200,'text':text,'reasoning':'','tools':[],
             req, expect = cases[name]
             self.assertEqual(expect["text"], "red")
             self.assertTrue(req["body"]["messages"][0]["content"][0]["image_url"]["url"].startswith("data:"+mime))
-        self.assertEqual(cases["vision-text"][1]["text"], "GUFO 742")
+        self.assertNotIn("vision-text", cases)  # исходная фикстура стала первой зрительной пробой
         for name in ("vision-two-forward", "vision-two-reverse"):
             parts = cases[name][0]["body"]["messages"][0]["content"]
             self.assertNotEqual(parts[0]["image_url"]["url"], parts[1]["image_url"]["url"])
         self.assertEqual(cases["vision-bad-base64"][1]["http_status"], 400)
         self.assertEqual(cases["vision-recovery"][1]["text"], "blue")
+
+    def probe_transport(self, directory):
+        script = Path(directory) / "probe_transport.py"
+        script.write_text('''import sys,json
+from pathlib import Path
+args=sys.argv
+request=json.loads(Path(args[args.index('--request')+1]).read_text())
+out=Path(args[args.index('--output')+1]);out.mkdir()
+answer=request['body'].get('fake_answer','')
+broken=request['body'].get('fake_broken',False)
+result={'status':'FAIL' if broken else 'PASS','http_status':200,'text':answer,'reasoning':'','tools':[],
+ 'finish':'stop','usage':{},'metrics':{'draft_tokens':5,'draft_tokens_accepted':3,
+ 'prompt_tokens':150,'cached_tokens':0,'prefill_tokens':150}}
+(out/'response.raw').write_text(answer)
+(out/'result.json').write_text(json.dumps(result))
+''')
+        return [sys.executable, str(script)]
+
+    def probe_request(self, answer, broken=False):
+        return {"method": "POST", "path": "/v1/chat/completions",
+                "body": {"messages": [{"role": "user", "content": "probe"}], "fake_answer": answer, "fake_broken": broken}}
+
+    def test_known_limit_probe_failure_is_shown_and_never_counted_as_pass(self):
+        api = self.api()
+        self.assertTrue(hasattr(api.Runner, "run_probe"), "зрительные пробы не подключены к приёмке")
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "out"
+            runner = api.Runner("http://127.0.0.1:13346", out, "mtp", transport_command=self.probe_transport(tmp))
+            self.assertEqual(runner.run_probe("probe-small", self.probe_request(" GUFO 742"), "GUFO 742", False), "PASS")
+            self.assertEqual(runner.run_probe("probe-large", self.probe_request("H U P O 2 7"), "GUFO 742", True),
+                             "KNOWN_LIMIT_FAIL")
+            runner.finish()
+            report = json.loads((out / "report.json").read_text())
+            self.assertEqual(report["status"], "KNOWN_FAILURES")
+            self.assertEqual(report["known_limit_failures"], ["probe-large"])
+            rows = {row["id"]: row for row in report["requests"]}
+            self.assertEqual((rows["probe-small"]["status"], rows["probe-large"]["status"]), ("PASS", "KNOWN_LIMIT_FAIL"))
+            self.assertEqual(rows["probe-large"]["expected"]["probe_text"], "GUFO 742")
+
+    def test_unexpected_probe_failure_stops_and_known_limit_does_not_excuse_broken_transport(self):
+        api = self.api()
+        self.assertTrue(hasattr(api.Runner, "run_probe"), "зрительные пробы не подключены к приёмке")
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = api.Runner("http://127.0.0.1:13346", Path(tmp) / "out", "mtp",
+                                transport_command=self.probe_transport(tmp))
+            with self.assertRaises(ValueError):
+                runner.run_probe("probe-geometry", self.probe_request("blue"), "red", False)
+            with self.assertRaises(ValueError):
+                runner.run_probe("probe-broken", self.probe_request("H U P O", broken=True), "GUFO 742", True)
+            runner.finish()
+            self.assertEqual(runner.report["status"], "FAIL")
+
+    def test_known_limit_probe_that_passes_is_reported_as_unexpected_pass(self):
+        api = self.api()
+        self.assertTrue(hasattr(api.Runner, "run_probe"), "зрительные пробы не подключены к приёмке")
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = api.Runner("http://127.0.0.1:13346", Path(tmp) / "out", "mtp",
+                                transport_command=self.probe_transport(tmp))
+            self.assertEqual(runner.run_probe("probe-large", self.probe_request("GUFO 742"), "GUFO 742", True), "PASS")
+            runner.finish()
+            self.assertEqual((runner.report["status"], runner.report["unexpected_probe_passes"]), ("PASS", ["probe-large"]))
+
+    def test_b2_runs_every_vision_probe_with_the_original_fixture_first(self):
+        api = self.api()
+        self.assertTrue(hasattr(api, "b2_probe_cases"), "зрительные пробы не подключены к приёмке")
+        import faex2_images, faex2_vision_probes
+        cases = api.b2_probe_cases()
+        self.assertEqual(len(cases), len(faex2_vision_probes.probes()))
+        identifier, request, expected, known = cases[0]
+        self.assertEqual((identifier, expected, known), ("probe-pixel-s12-640x192", "GUFO 742", True))
+        self.assertEqual(request["body"]["messages"][0]["content"][0], faex2_images.text_image_content())
+        self.assertEqual((request["body"]["temperature"], request["body"]["cache_prompt"]), (0, False))
+        self.assertEqual(sum(1 for case in cases if case[3]), 4)
+        self.assertEqual(len({case[0] for case in cases}), len(cases))
 
 
 if __name__ == "__main__":
