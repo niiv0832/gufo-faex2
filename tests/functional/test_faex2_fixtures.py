@@ -118,6 +118,84 @@ class ImageFixtureTests(unittest.TestCase):
             base64.b64decode(bad_url.split(",", 1)[1], validate=True)
 
 
+
+class VisionProbeFixtureTests(unittest.TestCase):
+    """Независимые зрительные пробы: размеры, порядок и геометрия, без модели."""
+
+    def setUp(self):
+        self.assertIsNotNone(importlib.util.find_spec("faex2_vision_probes"),
+                             "Набор независимых зрительных проб ещё не реализован")
+        self.probes = importlib.import_module("faex2_vision_probes")
+        self.images = importlib.import_module("faex2_images")
+
+    def test_ids_are_unique_and_every_probe_has_an_exact_expected_answer(self):
+        cases = self.probes.probes()
+        self.assertEqual(len({case["id"] for case in cases}), len(cases))
+        self.assertGreaterEqual(len(cases), 17)
+        for case in cases:
+            self.assertEqual(set(case), {"id", "group", "content", "question", "expected", "known_limit"})
+            self.assertIn(case["group"], ("pixel-text", "spatial"))
+            self.assertTrue(case["question"].strip() and case["expected"].strip())
+            self.assertIsInstance(case["known_limit"], bool)
+            decode_png(case["content"])
+
+    def test_original_failing_fixture_is_kept_bytewise_as_the_first_pixel_probe(self):
+        first = self.probes.probes()[0]
+        self.assertEqual(first["id"], "pixel-s12-640x192")
+        self.assertEqual(first["content"], self.images.text_image_content())
+        self.assertTrue(first["known_limit"])
+        width, height, pixels = decode_png(first["content"])
+        self.assertEqual(hashlib.sha256(pixels).hexdigest(),
+                         "55056333621b13a0ea93250431999f4bc8e19714b8fabe42286de2623a816f50")
+
+    def test_pixel_text_scales_keep_the_same_glyphs_and_only_two_colours(self):
+        scales = {}
+        for case in self.probes.probes():
+            if case["group"] != "pixel-text":
+                continue
+            width, height, pixels = decode_png(case["content"])
+            colours = {pixels[index:index + 3] for index in range(0, len(pixels), 3)}
+            self.assertEqual(colours, {b"\0\0\0", b"\xff\xff\xff"}, case["id"])
+            dark = sum(pixels[index] == (255 if "inverted" in case["id"] else 0)
+                       for index in range(0, len(pixels), 3))
+            scale = int(re.search(r"-s(\d+)-", case["id"]).group(1))
+            # 7 знаков по 5×7: число тёмных ячеек шрифта не зависит от масштаба.
+            self.assertEqual(dark % (scale * scale), 0, case["id"])
+            scales[case["id"]] = dark // (scale * scale)
+        self.assertGreaterEqual(len(scales), 6)
+        self.assertEqual(len(set(scales.values())), 1, scales)
+
+    def test_spatial_probes_have_the_geometry_their_questions_ask_about(self):
+        cases = {case["id"]: case for case in self.probes.probes()}
+
+        def pixel(case, x, y):
+            width, _, pixels = decode_png(case["content"])
+            return tuple(pixels[(y * width + x) * 3:(y * width + x) * 3 + 3])
+
+        halves = cases["left-red-right-blue-640x192"]
+        self.assertEqual((pixel(halves, 10, 96), pixel(halves, 630, 96)), ((255, 0, 0), (0, 0, 255)))
+        self.assertEqual(halves["expected"], "red")
+        odd = cases["left-red-right-blue-500x300"]
+        self.assertEqual(decode_png(odd["content"])[:2], (500, 300))  # не кратно 32: путь resize
+        tall = cases["top-green-bottom-yellow-192x640"]
+        self.assertEqual((pixel(tall, 96, 10), pixel(tall, 96, 630)), ((0, 160, 0), (255, 220, 0)))
+        quad = cases["quadrants-448x448-bottom-left"]
+        self.assertEqual(pixel(quad, 10, 440), (0, 0, 255))
+        self.assertEqual(quad["expected"], "blue")
+        corner = cases["square-top-right-576x576"]
+        self.assertEqual((pixel(corner, 480, 96), pixel(corner, 96, 480)), ((0, 0, 0), (255, 255, 255)))
+        stripes = cases["stripes-left-to-right-640x160"]
+        self.assertEqual([pixel(stripes, 80 + 160 * index, 80) for index in range(4)],
+                         [(255, 0, 0), (0, 160, 0), (0, 0, 255), (255, 220, 0)])
+        self.assertEqual(stripes["expected"], "red, green, blue, yellow")
+
+    def test_grading_is_exact_after_trivial_normalisation_only(self):
+        grade = self.probes.grade
+        self.assertTrue(grade(" GUFO 742", "GUFO 742"))
+        self.assertTrue(grade("Blue.", "blue"))
+        self.assertFalse(grade("H U P O 2 7", "GUFO 742"))
+        self.assertFalse(grade("red, green, yellow, blue", "red, green, blue, yellow"))
+
 class QualityFixtureTests(unittest.TestCase):
     def setUp(self):
         path = Path(__file__).with_name("faex2_quality.jsonl")
