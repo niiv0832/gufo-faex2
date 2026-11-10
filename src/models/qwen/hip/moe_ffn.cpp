@@ -3,7 +3,10 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
+#include <mutex>
 #include <stdexcept>
+#include <unordered_map>
 #include <vector>
 
 #include "src/core/hip/hip_utils.hpp"
@@ -87,9 +90,20 @@ struct MoeFfnScratch {
   }
 };
 
-MoeFfnScratch& GetMoeFfnScratch() {
-  static MoeFfnScratch scratch;
-  return scratch;
+// One scheduler thread drives all sessions; queued kernels still read scratch
+// after the call returns. Keep one instance per stream for the process
+// lifetime, without erasing entries when streams are destroyed. Calls on the
+// same stream must not overlap across CPU threads.
+MoeFfnScratch& GetMoeFfnScratch(hipStream_t stream) {
+  static std::mutex mutex;
+  static std::unordered_map<hipStream_t, std::unique_ptr<MoeFfnScratch>>
+      scratch_by_stream;
+  const std::lock_guard lock(mutex);
+  auto& scratch = scratch_by_stream[stream];
+  if (scratch == nullptr) {
+    scratch = std::make_unique<MoeFfnScratch>();
+  }
+  return *scratch;
 }
 
 [[nodiscard]] const void* ExpertSlice(const models::QwenTensorRef& stacked,
@@ -111,7 +125,7 @@ void MoeFfnForwardSingleToken(const models::QwenLayerWeights& layer,
   const std::size_t shared_ff = config.shared_expert_ff;
   const std::size_t hidden = config.hidden_size;
 
-  auto& scratch = GetMoeFfnScratch();
+  auto& scratch = GetMoeFfnScratch(stream);
   scratch.Ensure(config);
 
   LaunchGEMV(layer.ffn_gate_inp_shexp.data, layer.ffn_gate_inp_shexp.type, x,

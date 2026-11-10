@@ -9,7 +9,11 @@
 #include <algorithm>
 #include <cstdio>
 #include <memory>
+#include <mutex>
+#include <new>
 #include <string>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "src/models/qwen/hip/moe_prefill.hpp"
@@ -46,6 +50,41 @@ bool HipOk(hipError_t status, const char* what, std::string* error) {
 }
 
 class Qwen35MoePrefill final : public hip::QwenMoePrefill {
+  struct Scratch {
+    std::int32_t* ids_{nullptr};
+    float* weights_{nullptr};
+    std::uint32_t* counts_{nullptr};
+    std::int32_t* bounds_{nullptr};
+    std::int32_t* cursors_{nullptr};
+    std::int32_t* rows_token_{nullptr};
+    std::int32_t* rows_slot_{nullptr};
+    std::int32_t* tiles_pair_{nullptr};
+    std::int32_t* tiles_down_{nullptr};
+    void* act_{nullptr};
+    void* down_{nullptr};
+    std::uint32_t* host_counts_{nullptr};
+    std::int32_t* host_tiles_{nullptr};
+
+    ~Scratch() {
+      for (void* pointer :
+           {static_cast<void*>(ids_), static_cast<void*>(weights_),
+            static_cast<void*>(counts_), static_cast<void*>(bounds_),
+            static_cast<void*>(cursors_), static_cast<void*>(rows_token_),
+            static_cast<void*>(rows_slot_), static_cast<void*>(tiles_pair_),
+            static_cast<void*>(tiles_down_), act_, down_}) {
+        if (pointer != nullptr) {
+          (void)hipFree(pointer);
+        }
+      }
+      if (host_counts_ != nullptr) {
+        (void)hipHostFree(host_counts_);
+      }
+      if (host_tiles_ != nullptr) {
+        (void)hipHostFree(host_tiles_);
+      }
+    }
+  };
+
 public:
   static std::unique_ptr<hip::QwenMoePrefill> Create(
       const QwenModelWeights& weights, std::uint32_t max_tokens,
@@ -57,9 +96,10 @@ public:
     std::unique_ptr<Qwen35MoePrefill> self(new Qwen35MoePrefill());
     self->config_ = c;
     self->max_tokens_ = max_tokens;
-    if (!self->Allocate(error)) {
-      return nullptr;
-    }
+    const std::size_t slots = std::size_t{max_tokens} * c.num_experts_used;
+    self->tile_capacity_ = static_cast<std::uint32_t>(
+        (slots + std::size_t{c.num_experts} * (kPadRows - 1)) / kPadRows +
+        c.num_experts + 1);
     hipStream_t stream = nullptr;
     if (!HipOk(hipStreamCreate(&stream), "stream", error)) {
       return nullptr;
@@ -131,22 +171,6 @@ public:
         (void)hipFree(layer.converted_down);
       }
     }
-    for (void* pointer :
-         {static_cast<void*>(ids_), static_cast<void*>(weights_),
-          static_cast<void*>(counts_), static_cast<void*>(bounds_),
-          static_cast<void*>(cursors_), static_cast<void*>(rows_token_),
-          static_cast<void*>(rows_slot_), static_cast<void*>(tiles_pair_),
-          static_cast<void*>(tiles_down_), act_, down_}) {
-      if (pointer != nullptr) {
-        (void)hipFree(pointer);
-      }
-    }
-    if (host_counts_ != nullptr) {
-      (void)hipHostFree(host_counts_);
-    }
-    if (host_tiles_ != nullptr) {
-      (void)hipHostFree(host_tiles_);
-    }
   }
 
   std::uint32_t MaxTokens() const noexcept override { return max_tokens_; }
@@ -161,15 +185,20 @@ public:
     if (!Supports(layer) || n_tokens == 0 || n_tokens > max_tokens_) {
       return false;
     }
+    Scratch* const scratch = GetScratch(stream);
+    if (scratch == nullptr) {
+      return false;
+    }
     const LayerExperts& experts = layers_[layer];
     const std::uint32_t used = config_.num_experts_used;
     const std::uint32_t num_experts = config_.num_experts;
     const std::uint32_t hidden = config_.hidden_size;
     const std::uint32_t ff = config_.expert_ff;
-    RouterTopK(router_logits, num_experts, ids_, weights_, n_tokens,
-               num_experts, used, stream);
-    ExpertCounts(ids_, counts_, n_tokens, num_experts, used, stream);
-    if (hipMemcpyAsync(host_counts_, counts_,
+    RouterTopK(router_logits, num_experts, scratch->ids_, scratch->weights_,
+               n_tokens, num_experts, used, stream);
+    ExpertCounts(scratch->ids_, scratch->counts_, n_tokens, num_experts, used,
+                 stream);
+    if (hipMemcpyAsync(scratch->host_counts_, scratch->counts_,
                        num_experts * sizeof(std::uint32_t),
                        hipMemcpyDeviceToHost, stream) != hipSuccess ||
         hipStreamSynchronize(stream) != hipSuccess) {
@@ -179,11 +208,11 @@ public:
     // bucket, one map per tile width.
     std::uint32_t pair_tiles = 0;
     std::uint32_t down_tiles = 0;
-    std::int32_t* host_pair = host_tiles_;
-    std::int32_t* host_down = host_tiles_ + tile_capacity_;
+    std::int32_t* host_pair = scratch->host_tiles_;
+    std::int32_t* host_down = scratch->host_tiles_ + tile_capacity_;
     for (std::uint32_t e = 0; e < num_experts; ++e) {
       const std::uint32_t padded =
-          (host_counts_[e] + kPadRows - 1) / kPadRows * kPadRows;
+          (scratch->host_counts_[e] + kPadRows - 1) / kPadRows * kPadRows;
       for (std::uint32_t j = 0;
            j < (padded + kPairTileRows - 1) / kPairTileRows; ++j) {
         host_pair[pair_tiles++] = static_cast<std::int32_t>(e | (j << 16));
@@ -197,74 +226,100 @@ public:
     if (pair_tiles == 0) {
       return false;
     }
-    if (hipMemcpyAsync(tiles_pair_, host_pair,
+    if (hipMemcpyAsync(scratch->tiles_pair_, host_pair,
                        pair_tiles * sizeof(std::int32_t), hipMemcpyHostToDevice,
                        stream) != hipSuccess ||
-        hipMemcpyAsync(tiles_down_, host_down,
+        hipMemcpyAsync(scratch->tiles_down_, host_down,
                        down_tiles * sizeof(std::int32_t), hipMemcpyHostToDevice,
                        stream) != hipSuccess) {
       return false;
     }
-    RoutedCompact(ids_, counts_, bounds_, cursors_, rows_token_, rows_slot_,
+    RoutedCompact(scratch->ids_, scratch->counts_, scratch->bounds_,
+                  scratch->cursors_, scratch->rows_token_, scratch->rows_slot_,
                   n_tokens, used, num_experts, stream);
-    auto* act = static_cast<__half*>(act_);
+    auto* act = static_cast<__half*>(scratch->act_);
     if (!RoutedGatedF16Gemm(experts.gate, experts.up, experts.gate_type, x_half,
-                            tiles_pair_, pair_tiles, kPairTileRows, bounds_,
-                            rows_token_, rows_slot_, act, ff, hidden, stream)) {
+                            scratch->tiles_pair_, pair_tiles, kPairTileRows,
+                            scratch->bounds_, scratch->rows_token_,
+                            scratch->rows_slot_, act, ff, hidden, stream)) {
       return false;
     }
-    auto* down = static_cast<__half*>(down_);
-    if (!RoutedF16Gemm(experts.down, experts.down_type, act, tiles_down_,
-                       down_tiles, experts.down_tile_rows, bounds_, rows_slot_,
-                       rows_slot_, nullptr, nullptr, down, hidden, ff,
+    auto* down = static_cast<__half*>(scratch->down_);
+    if (!RoutedF16Gemm(experts.down, experts.down_type, act,
+                       scratch->tiles_down_, down_tiles, experts.down_tile_rows,
+                       scratch->bounds_, scratch->rows_slot_,
+                       scratch->rows_slot_, nullptr, nullptr, down, hidden, ff,
                        stream)) {
       return false;
     }
-    MoeEpilogueVec4F16(down, weights_, shared_out, shared_logit, 1, out,
-                       n_tokens, used, hidden, stream);
+    MoeEpilogueVec4F16(down, scratch->weights_, shared_out, shared_logit, 1,
+                       out, n_tokens, used, hidden, stream);
     return true;
   }
 
 private:
   Qwen35MoePrefill() = default;
 
-  bool Allocate(std::string* error) {
+  // One scheduler thread drives all sessions, but queued GPU work still
+  // reads scratch after Run returns. Keep each stream's device and host buffers
+  // until this object is destroyed; stream destruction does not erase entries.
+  // Calls on the same stream must not overlap across CPU threads.
+  Scratch* GetScratch(hipStream_t stream) {
+    const std::lock_guard lock(scratch_mutex_);
+    const auto found = scratch_by_stream_.find(stream);
+    if (found != scratch_by_stream_.end()) {
+      return found->second.get();
+    }
+    try {
+      auto scratch = std::make_unique<Scratch>();
+      if (!Allocate(*scratch, nullptr)) {
+        return nullptr;
+      }
+      Scratch* const result = scratch.get();
+      scratch_by_stream_.emplace(stream, std::move(scratch));
+      return result;
+    } catch (const std::bad_alloc&) {
+      return nullptr;
+    }
+  }
+
+  bool Allocate(Scratch& scratch, std::string* error) {
     const std::size_t slots =
         std::size_t{max_tokens_} * config_.num_experts_used;
     const std::size_t rows = RoutedCompactRows(slots, config_.num_experts);
-    tile_capacity_ = static_cast<std::uint32_t>(
-        (slots + std::size_t{config_.num_experts} * (kPadRows - 1)) / kPadRows +
-        config_.num_experts + 1);
-    return HipOk(hipMalloc(&ids_, slots * sizeof(std::int32_t)), "ids",
+    return HipOk(hipMalloc(&scratch.ids_, slots * sizeof(std::int32_t)), "ids",
                  error) &&
-           HipOk(hipMalloc(&weights_, slots * sizeof(float)), "weights",
+           HipOk(hipMalloc(&scratch.weights_, slots * sizeof(float)), "weights",
                  error) &&
-           HipOk(
-               hipMalloc(&counts_, config_.num_experts * sizeof(std::uint32_t)),
-               "counts", error) &&
-           HipOk(hipMalloc(&bounds_,
+           HipOk(hipMalloc(&scratch.counts_,
+                           config_.num_experts * sizeof(std::uint32_t)),
+                 "counts", error) &&
+           HipOk(hipMalloc(&scratch.bounds_,
                            (config_.num_experts + 1) * sizeof(std::int32_t)),
                  "bounds", error) &&
-           HipOk(
-               hipMalloc(&cursors_, config_.num_experts * sizeof(std::int32_t)),
-               "cursors", error) &&
-           HipOk(hipMalloc(&rows_token_, rows * sizeof(std::int32_t)), "rows",
-                 error) &&
-           HipOk(hipMalloc(&rows_slot_, rows * sizeof(std::int32_t)), "rows",
-                 error) &&
-           HipOk(hipMalloc(&tiles_pair_, tile_capacity_ * sizeof(std::int32_t)),
+           HipOk(hipMalloc(&scratch.cursors_,
+                           config_.num_experts * sizeof(std::int32_t)),
+                 "cursors", error) &&
+           HipOk(hipMalloc(&scratch.rows_token_, rows * sizeof(std::int32_t)),
+                 "rows", error) &&
+           HipOk(hipMalloc(&scratch.rows_slot_, rows * sizeof(std::int32_t)),
+                 "rows", error) &&
+           HipOk(hipMalloc(&scratch.tiles_pair_,
+                           tile_capacity_ * sizeof(std::int32_t)),
                  "tiles", error) &&
-           HipOk(hipMalloc(&tiles_down_, tile_capacity_ * sizeof(std::int32_t)),
+           HipOk(hipMalloc(&scratch.tiles_down_,
+                           tile_capacity_ * sizeof(std::int32_t)),
                  "tiles", error) &&
-           HipOk(hipMalloc(&act_, slots * config_.expert_ff * sizeof(__half)),
+           HipOk(hipMalloc(&scratch.act_,
+                           slots * config_.expert_ff * sizeof(__half)),
                  "act", error) &&
-           HipOk(
-               hipMalloc(&down_, slots * config_.hidden_size * sizeof(__half)),
-               "down", error) &&
-           HipOk(hipHostMalloc(reinterpret_cast<void**>(&host_counts_),
+           HipOk(hipMalloc(&scratch.down_,
+                           slots * config_.hidden_size * sizeof(__half)),
+                 "down", error) &&
+           HipOk(hipHostMalloc(reinterpret_cast<void**>(&scratch.host_counts_),
                                config_.num_experts * sizeof(std::uint32_t)),
                  "host counts", error) &&
-           HipOk(hipHostMalloc(reinterpret_cast<void**>(&host_tiles_),
+           HipOk(hipHostMalloc(reinterpret_cast<void**>(&scratch.host_tiles_),
                                2 * tile_capacity_ * sizeof(std::int32_t)),
                  "host tiles", error);
   }
@@ -273,19 +328,8 @@ private:
   std::uint32_t max_tokens_{0};
   std::uint32_t tile_capacity_{0};
   std::vector<LayerExperts> layers_;
-  std::int32_t* ids_{nullptr};
-  float* weights_{nullptr};
-  std::uint32_t* counts_{nullptr};
-  std::int32_t* bounds_{nullptr};
-  std::int32_t* cursors_{nullptr};
-  std::int32_t* rows_token_{nullptr};
-  std::int32_t* rows_slot_{nullptr};
-  std::int32_t* tiles_pair_{nullptr};
-  std::int32_t* tiles_down_{nullptr};
-  void* act_{nullptr};
-  void* down_{nullptr};
-  std::uint32_t* host_counts_{nullptr};
-  std::int32_t* host_tiles_{nullptr};
+  std::mutex scratch_mutex_;
+  std::unordered_map<hipStream_t, std::unique_ptr<Scratch>> scratch_by_stream_;
 };
 
 }  // namespace
