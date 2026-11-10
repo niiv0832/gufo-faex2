@@ -77,6 +77,8 @@ private:
   friend struct TokenConstraint;
   State CanonicalMaskState(const State& state, std::size_t token_bytes) const;
   State Expand(State state) const;
+  // Whether `state` is still in the WithReasoning phase, or its opener.
+  bool InReasoning(const State& state) const;
   std::vector<Rule> rules_;
   std::vector<std::bitset<256>> classes_;
   std::vector<std::shared_ptr<const JsonSchemaLexeme>> lexemes_;
@@ -93,6 +95,9 @@ private:
   bool automatic_tools_{false};
   std::string reasoning_tool_prefix_;
   std::uint32_t reasoning_tool_root_{0};
+  // WithReasoning's rules and lexemes are numbered from these on.
+  std::uint32_t reasoning_rules_{UINT32_MAX};
+  std::uint32_t reasoning_lexemes_{UINT32_MAX};
 };
 
 class ConstraintVocabulary {
