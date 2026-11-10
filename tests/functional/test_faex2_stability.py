@@ -268,6 +268,82 @@ class StabilityTests(unittest.TestCase):
                          [("control-short-json", "decode_ms")])
         self.assertEqual(len(report["measurements"]), 15)
 
+    def admission(self, report, order, ttft=(665, 665, 754, 874)):
+        """Задать порядок допуска C4 и серверный TTFT, определяемый этим порядком."""
+        rows = {row["id"].rsplit("-", 1)[-1]: row for row in report["requests"] if "-c4-" in row["id"]}
+        self.assertEqual(sorted(rows), sorted(order))
+        for rank, marker in enumerate(order, 1):
+            metrics = rows[marker]["result"]["metrics"]
+            metrics["resident_requests_at_admission"] = rank
+            metrics["ttft_ms"] = ttft[rank - 1]
+            metrics["client_ttfa_ms"] = ttft[rank - 1] + 12
+
+    def test_concurrent_batch_is_compared_by_admission_rank_not_by_racy_name(self):
+        """Регрессия C timing: перестановка допуска не является замедлением запроса.
+
+        В реальных прогонах OWL был допущен первым в одном прогоне и четвёртым в другом;
+        сравнение по имени дало +30 % TTFT при совпадении времён каждого места до 0,7 %.
+        """
+        with tempfile.TemporaryDirectory() as root:
+            base = self.control(root, groups=["batch"]).report
+        left, right = deepcopy(base), deepcopy(base)
+        self.admission(left, ["OWL_142", "MOON_853", "PINE_627", "LAKE_394"])
+        self.admission(right, ["PINE_627", "MOON_853", "LAKE_394", "OWL_142"], ttft=(663, 663, 746, 865))
+        report = self.api().compare_reports(left, right)
+        by_name = [row for row in report["measurements"] if row["case"].endswith("-c4-OWL_142")
+                   and row["metric"] in ("ttft_ms", "client_ttfa_ms")]
+        self.assertEqual({row["status"] for row in by_name}, {"UNMATCHED_ADMISSION"})
+        self.assertEqual({row["baseline_admission_rank"] for row in by_name}, {1})
+        self.assertEqual({row["candidate_admission_rank"] for row in by_name}, {4})
+        ranked = [row for row in report["measurements"] if "#admission-" in row["case"]]
+        self.assertEqual(sorted({row["case"] for row in ranked}),
+                         [f"control-batch-c4#admission-{rank}" for rank in (1, 2, 3, 4)])
+        self.assertEqual({row["status"] for row in ranked}, {"PASS"})
+        self.assertEqual(report["status"], "PASS")
+        # Работа запроса не зависит от места допуска и по-прежнему сравнивается по имени.
+        self.assertTrue(all(row["status"] == "PASS" for row in report["measurements"]
+                            if row["case"].endswith("-c4-OWL_142") and row["metric"] in ("prefill_ms", "decode_ms")))
+
+    def test_slow_admission_rank_is_still_flagged_after_permutation(self):
+        with tempfile.TemporaryDirectory() as root:
+            base = self.control(root, groups=["batch"]).report
+        left, right = deepcopy(base), deepcopy(base)
+        self.admission(left, ["OWL_142", "MOON_853", "PINE_627", "LAKE_394"])
+        self.admission(right, ["PINE_627", "MOON_853", "LAKE_394", "OWL_142"], ttft=(663, 663, 746, 930))
+        report = self.api().compare_reports(left, right)
+        flags = [(row["case"], row["metric"]) for row in report["measurements"]
+                 if row["status"] == "NEEDS_INVESTIGATION"]
+        self.assertEqual(flags, [("control-batch-c4#admission-4", "ttft_ms"),
+                                 ("control-batch-c4#admission-4", "client_ttfa_ms")])
+        self.assertEqual(report["status"], "NEEDS_INVESTIGATION")
+
+    def test_same_admission_order_keeps_strict_per_request_comparison(self):
+        with tempfile.TemporaryDirectory() as root:
+            base = self.control(root, groups=["batch"]).report
+        left, right = deepcopy(base), deepcopy(base)
+        order = ["OWL_142", "MOON_853", "PINE_627", "LAKE_394"]
+        self.admission(left, order)
+        self.admission(right, order, ttft=(665, 665, 754, 930))
+        report = self.api().compare_reports(left, right)
+        flags = [(row["case"], row["metric"]) for row in report["measurements"]
+                 if row["status"] == "NEEDS_INVESTIGATION"]
+        self.assertEqual(flags, [("control-batch-c4-LAKE_394", "ttft_ms"),
+                                 ("control-batch-c4-LAKE_394", "client_ttfa_ms")])
+        self.assertFalse([row for row in report["measurements"] if "#admission-" in row["case"]])
+
+    def test_ambiguous_admission_ranks_cannot_qualify_a_permuted_batch(self):
+        with tempfile.TemporaryDirectory() as root:
+            base = self.control(root, groups=["batch"]).report
+        left, right = deepcopy(base), deepcopy(base)
+        self.admission(left, ["OWL_142", "MOON_853", "PINE_627", "LAKE_394"])
+        self.admission(right, ["PINE_627", "MOON_853", "LAKE_394", "OWL_142"])
+        for row in right["requests"]:
+            if row["id"].endswith("-c4-LAKE_394"):
+                row["result"]["metrics"]["resident_requests_at_admission"] = 1  # дубликат места
+        report = self.api().compare_reports(left, right)
+        self.assertEqual(report["status"], "NEEDS_INVESTIGATION")
+        self.assertFalse([row for row in report["measurements"] if "#admission-" in row["case"]])
+
     def test_comparison_requires_both_five_percent_and_three_ms(self):
         with tempfile.TemporaryDirectory() as root:
             base = self.control(root, groups=["short"]).report

@@ -306,6 +306,32 @@ class LoopbackTests(unittest.TestCase):
         parts = json.loads((output / "parts.json").read_text())
         self.assertEqual(sum(part["size"] for part in parts), len(wire))
 
+    def test_wall_ends_at_last_wire_byte_not_after_local_validation(self):
+        """Разбор и проверки ответа на стороне клиента не входят в wall_ms.
+
+        Регрессия C timing: +19 мс wall короткого JSON возникали после получения
+        полного тела. Время локальной обработки сохраняется отдельно.
+        """
+        wire = json.dumps(chat(), ensure_ascii=False).encode()
+        base = self.start_server([wire], declared_length=len(wire))
+        path = self.root / "input.json"
+        path.write_text(json.dumps(request(), ensure_ascii=False))
+        original = transport._parse_response
+
+        def slow_parse(*args, **kwargs):
+            time.sleep(.3)
+            return original(*args, **kwargs)
+
+        transport._parse_response = slow_parse
+        self.addCleanup(setattr, transport, "_parse_response", original)
+        row = transport.run_request(base, path, self.root / "result")
+        self.assertEqual(row["status"], "PASS")
+        parts = json.loads((self.root / "result" / "parts.json").read_text())
+        self.assertLess(row["wall_ms"] - parts[-1]["elapsed_ms"], 100,
+                        "wall_ms включает локальную обработку после последнего байта")
+        self.assertGreaterEqual(row["client_total_ms"], row["wall_ms"] + 300)
+        self.assertGreaterEqual(row["client_post_wire_ms"], 300)
+
     def test_http400_returns_zero_but_never_pass(self):
         base = self.start_server([b'{"error":{"type":"invalid_request_error","message":"bad"}}'], 400)
         process, row, _, _ = self.launch(base, request(stream=True))

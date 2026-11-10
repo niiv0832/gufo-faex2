@@ -366,6 +366,7 @@ def run_request(base_url, request_path, output, timeout=120, cancel_after_conten
               "intentional_cancel": False, "raw_paths": paths}
     parts, metadata, connection, response = [], [], None, None
     started = time.monotonic()
+    wire_done = None  # Конец передачи: EOF тела либо намеренная отмена.
     raw_path = output / "response.raw"
     raw_path.touch()
     try:
@@ -436,6 +437,7 @@ def run_request(base_url, request_path, output, timeout=120, cancel_after_conten
                             response.close()
                             connection.close()
                             break
+            wire_done = time.monotonic()
             kind = response.getheader("Content-Type", "").split(";", 1)[0].strip().lower()
             require(kind == ("text/event-stream" if streaming else "application/json"),
                     "unexpected response Content-Type: " + kind)
@@ -453,7 +455,13 @@ def run_request(base_url, request_path, output, timeout=120, cancel_after_conten
     finally:
         if response is not None: response.close()
         if connection is not None: connection.close()
-        result["wall_ms"] = (time.monotonic() - started) * 1000
+        # wall_ms — время HTTP-обмена до конца тела. Локальные разбор, проверки и
+        # close не являются задержкой сервера; при ошибке до конца тела границей
+        # остаётся момент отказа.
+        finished = time.monotonic()
+        result["wall_ms"] = ((wire_done if wire_done is not None else finished) - started) * 1000
+        result["client_total_ms"] = (finished - started) * 1000
+        result["client_post_wire_ms"] = result["client_total_ms"] - result["wall_ms"]
         result["response_bytes"] = sum(len(block) for _, block in parts)
         result["raw_sha256"] = hashlib.sha256(raw_path.read_bytes()).hexdigest()
         write_json(output / "parts.json", metadata)

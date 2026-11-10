@@ -208,6 +208,76 @@ def _report(value):
     return result
 
 
+ADMISSION_PHASES = ("ttft_ms", "client_ttfa_ms", "wall_ms")
+
+
+def _batches(cases):
+    """Параллельные группы: запросы одного dispatch имеют общую history и width>1."""
+    batches = {}
+    for case in cases:
+        if case.get("width", 1) > 1:
+            batches.setdefault((case["group"], case["width"], case["history_sha256"]), []).append(case["id"])
+    return [names for names in batches.values() if len(names) > 1]
+
+
+def _batch_order(names, source):
+    """Места допуска 1…N либо None, если сервер не сообщил однозначный порядок."""
+    values = [source[name]["result"].get("metrics", {}).get("resident_requests_at_admission")
+              for name in names]
+    if sorted(value for value in values if type(value) is int) != list(range(1, len(names) + 1)):
+        return None
+    return dict(zip(names, values))
+
+
+def _admission_ranks(cases, sources):
+    """Запросы, чьё место допуска в параллельной группе различается между прогонами.
+
+    Клиент отправляет группу отдельными процессами, поэтому порядок допуска — гонка.
+    Время до первого токена определяется местом, а не именем запроса. Сравнение по
+    имени при перестановке сопоставляет разные условия; такие ячейки помечаются
+    UNMATCHED_ADMISSION и заменяются сравнением одинаковых мест. Без однозначных
+    мест с обеих сторон прежнее строгое сравнение по имени сохраняется.
+    """
+    moved = {}
+    for names in _batches(cases):
+        orders = [_batch_order(names, source) for source in sources]
+        if None in orders or orders[0] == orders[1]:
+            continue
+        for name in names:
+            moved[name] = (orders[0][name], orders[1][name])
+    return moved
+
+
+def _rank_measurements(cases, sources, moved):
+    rows = []
+    for names in _batches(cases):
+        if not any(name in moved for name in names):
+            continue
+        group = next(case["group"] for case in cases if case["id"] == names[0])
+        label = names[0].rsplit("-", 1)[0]
+        for rank in range(1, len(names) + 1):
+            pair = [next(name for name in names if moved[name][side] == rank) for side in (0, 1)]
+            results = [source[name]["result"] for source, name in zip(sources, pair)]
+            metrics = [result.get("metrics", {}) for result in results]
+            same_work = all(metrics[0][field] == metrics[1][field] for field in COUNTERS)
+            for phase in ADMISSION_PHASES:
+                if phase == "wall_ms" and not same_work:
+                    continue  # Полное время зависит от длины ответа другого запроса.
+                values = [result.get(phase) if phase == "wall_ms" else metric.get(phase)
+                          for result, metric in zip(results, metrics)]
+                require(all(type(value) in (int, float) and math.isfinite(value) and value >= 0
+                            for value in values), f"{label}: invalid {phase} at admission {rank}")
+                row = timing_measurement(f"{label}#admission-{rank}", phase, *values,
+                                         request_key=[group, *pair])
+                prompt_work = all(metrics[0][field] == metrics[1][field]
+                                  for field in ("prompt_tokens", "prefill_tokens", "cached_tokens"))
+                row["status"] = ("UNMATCHED_WORK" if not prompt_work else
+                                 "NEEDS_INVESTIGATION" if row["exceeds_margin"] else "PASS")
+                row["paired_requests"] = pair
+                rows.append(row)
+    return rows
+
+
 def compare_reports(base, candidate):
     """Никаких средних или утверждений о регрессии из единственного наблюдения."""
     base, candidate = _report(base), _report(candidate)
@@ -226,6 +296,7 @@ def compare_reports(base, candidate):
         require(all(case["id"] in index for case in cases), "missing request result")
         sources.append(index)
     measurements, changes, output_changes = [], [], []
+    ranks = _admission_ranks(cases, sources)
     for case in cases:
         name = case["id"]
         rows = [source[name] for source in sources]
@@ -259,8 +330,15 @@ def compare_reports(base, candidate):
             row = timing_measurement(name, phase, *values, request_key=[case["group"], name])
             row["status"] = ("UNMATCHED_WORK" if different else
                              "NEEDS_INVESTIGATION" if row["exceeds_margin"] else "PASS")
+            moved = ranks.get(name)
+            if moved and phase in ADMISSION_PHASES and not different:
+                # Один и тот же запрос занял разные места допуска: условия не совпали.
+                row.update(status="UNMATCHED_ADMISSION", baseline_admission_rank=moved[0],
+                           candidate_admission_rank=moved[1])
             measurements.append(row)
-    flagged = any(row["status"] == "NEEDS_INVESTIGATION" for row in measurements)
+    measurements.extend(_rank_measurements(cases, sources, ranks))
+    flagged = any(row["status"] in ("NEEDS_INVESTIGATION", "UNMATCHED_WORK") and "#admission-" in row["case"]
+                  or row["status"] == "NEEDS_INVESTIGATION" for row in measurements)
     return {"status": "NEEDS_INVESTIGATION" if flagged or changes or output_changes else "PASS",
             "slowdown_tolerance": .05, "noise_ms": 3, "measurements": measurements,
             "work_changes": changes, "output_changes": output_changes,
