@@ -28,6 +28,7 @@ ARCHIVE_RECORD = ("Архивная запись: в библиотеке про
                   "по полкам и записали результат в журнал. Новых поручений нет.\n")
 KEYS = {"start": "ЛИПА_274", "middle": "РЕКА_583", "end": "СОВА_916"}
 EDITED_KEYS = {**KEYS, "end": "ЗВЕЗДА_408"}
+BRANCH_KEYS = {**KEYS, "end": "КЕДР_205"}
 SESSIONS = (
     ("OWL_142", 17, [340, 357, 374, 391, 408, 425, 442, 459]),
     ("MOON_853", 23, [460, 483, 506, 529, 552, 575, 598, 621]),
@@ -93,6 +94,20 @@ def _long_expected(edited=False):
     return {"json": deepcopy(EDITED_KEYS if edited else KEYS),
             "excludes": [KEYS["end"] if edited else EDITED_KEYS["end"]],
             "min_prompt_tokens": MIN_DEPTH, "max_prompt_tokens": MAX_DEPTH}
+
+
+def _branch_warmup(records):
+    """Первая развилка учит checkpoint до end; её prefill измеряется отдельно.
+
+    Recurrent snapshot после старого end нельзя обрезать до общего префикса.
+    Эта третья ветка может потребовать полный prefill; целевой EDITED_KEYS
+    ещё не запрашивался и далее обязан пройти строгий reuse gate.
+    """
+    request = _long_request(records)
+    request["body"]["messages"][-3]["content"] = "Конец архива. Ключ end = " + BRANCH_KEYS["end"]
+    expected = {**_long_expected(), "json": deepcopy(BRANCH_KEYS),
+                "excludes": [KEYS["end"], EDITED_KEYS["end"]]}
+    return request, expected
 
 
 def _work(result):
@@ -242,6 +257,12 @@ def _initial(journal, state_path):
                       {**_long_expected(), "min_cached_tokens": depth - 16, "max_prefill_tokens": 256},
                       timeout=LONG_TIMEOUT))
 
+    # Это явная подготовка общей границы, а не cold-control или повтор edit.
+    # Сохраняем всю стоимость первого изменения; lookup остаётся включён.
+    warm_request, warm_expected = _branch_warmup(records)
+    _work(journal.case("family-long-branch-warmup", warm_request, warm_expected,
+                      timeout=LONG_TIMEOUT))
+
     # Редактируем исходную историю до ответа: старого end в replay быть не должно.
     edited = _long_request(records, edited=True)
     edit_result = journal.case("family-long-edit", edited,
@@ -299,7 +320,7 @@ def _run_family(runner, phase, state_path):
             "version": 1, "model": ALIAS, "mode": runner.mode, "transitions": [1, 2, 4, 1],
             "depth_bounds": [MIN_DEPTH, MAX_DEPTH], "target_depth": TARGET_DEPTH,
             "maximum_calibrations": MAX_CALIBRATIONS, "keys": KEYS, "edited_keys": EDITED_KEYS,
-            "sessions": SESSIONS, "reasoning_budget": 512})
+            "branch_warmup_keys": BRANCH_KEYS, "sessions": SESSIONS, "reasoning_budget": 512})
         state = None
     else:
         state = json.loads(state_path.read_text(encoding="utf-8"))

@@ -10,6 +10,35 @@ import unittest
 from faex2_acceptance import Runner, grade
 
 
+class SharedBranchCache:
+    """Recurrent oracle: первая развилка учит границу, следующая её использует.
+
+    Только модельный HTTP заменён: этот fixture не умеет откатывать полное
+    состояние назад до общего префикса. Числовой gate проверяет реальный grade.
+    """
+
+    def __init__(self):
+        self.branches, self.boundaries, self.observations = {}, set(), []
+
+    def apply(self, request, result):
+        messages = request["body"].get("messages", [])
+        marker = "Конец архива. Ключ end = "
+        for index, message in enumerate(messages):
+            if message["role"] == "user" and message["content"].startswith(marker):
+                prefix = json.dumps(messages[:index], ensure_ascii=False, sort_keys=True)
+                value = message["content"][len(marker):]
+                seen = self.branches.setdefault(prefix, set())
+                diverges = bool(seen) and value not in seen
+                if request["body"]["cache_prompt"] and diverges:
+                    if prefix not in self.boundaries:
+                        total = result["metrics"]["prompt_tokens"]
+                        result["metrics"].update(cached_tokens=0, prefill_tokens=total)
+                    self.boundaries.add(prefix)
+                seen.add(value)
+                self.observations.append((value, copy.deepcopy(result["metrics"])))
+                break
+
+
 class RecordingRunner:
     """Подменяет только внешний модельный HTTP; grade остаётся настоящим."""
 
@@ -42,7 +71,8 @@ class RecordingRunner:
             answer = {"squares": [n * n for n in range(1, 21)]}
         else:
             answer = {"start": "ЛИПА_274", "middle": "РЕКА_583",
-                      "end": "ЗВЕЗДА_408" if "ЗВЕЗДА_408" in contents else "СОВА_916"}
+                      "end": "ЗВЕЗДА_408" if "ЗВЕЗДА_408" in contents else
+                      "КЕДР_205" if "КЕДР_205" in contents else "СОВА_916"}
         cached = 0 if body.get("cache_prompt") is False else max(0, total - 8)
         reasoning = body.get("reasoning", {}).get("effort") == "low"
         result = {"status": "CANCELLED" if cancel else "PASS", "http_status": 200,
@@ -146,11 +176,50 @@ class FamilyTest(unittest.TestCase):
         ids = [call[0] for call in runner.calls]
         window = runner.calls[ids.index("family-long-cold") + 1:ids.index("family-long-edit-repeat") + 1]
         self.assertEqual([call[0] for call in window], ["family-long-repeat", "family-long-continue",
-                                                     "family-long-edit", "family-long-edit-repeat"])
+                                                     "family-long-branch-warmup", "family-long-edit",
+                                                     "family-long-edit-repeat"])
         for _, request, expected, _, _ in window:
             self.assertTrue(request["body"]["cache_prompt"])
-            self.assertGreater(expected["min_cached_tokens"], 100000)
-            self.assertLessEqual(expected["max_prefill_tokens"], 256)
+            if "min_cached_tokens" in expected:
+                self.assertGreater(expected["min_cached_tokens"], 100000)
+                self.assertLessEqual(expected["max_prefill_tokens"], 256)
+
+    def test_edit_prepares_shared_checkpoint_and_retains_first_branch_cost(self):
+        cache = SharedBranchCache()
+        runner = RecordingRunner(lambda _, result: cache.apply(runner.calls[-1][1], result))
+        with tempfile.TemporaryDirectory() as root:
+            try:
+                self.run_initial(root, runner)
+            except ValueError as error:
+                self.fail("measured edit lacks a prepared recurrent checkpoint: " + str(error))
+        warm = next(call for call in runner.calls if call[0] == "family-long-branch-warmup")
+        edit = next(call for call in runner.calls if call[0] == "family-long-edit")
+        self.assertEqual(warm[2]["json"], {"start": "ЛИПА_274", "middle": "РЕКА_583", "end": "КЕДР_205"})
+        self.assertEqual(set(warm[2]["excludes"]), {"СОВА_916", "ЗВЕЗДА_408"})
+        self.assertNotIn("ЗВЕЗДА_408", json.dumps(warm[1], ensure_ascii=False))
+        self.assertNotIn("КЕДР_205", json.dumps(edit[1], ensure_ascii=False))
+        for request in (warm[1], edit[1]):
+            self.assertTrue(request["body"]["cache_prompt"])
+        self.assertEqual(warm[1]["body"]["messages"][:-3], edit[1]["body"]["messages"][:-3])
+        prepared = next(metrics for value, metrics in cache.observations if value == "КЕДР_205")
+        measured = next(metrics for value, metrics in cache.observations if value == "ЗВЕЗДА_408")
+        self.assertEqual(prepared["cached_tokens"], 0)
+        self.assertEqual(prepared["prefill_tokens"], prepared["prompt_tokens"])
+        self.assertGreater(measured["cached_tokens"], 110000)
+        self.assertLessEqual(edit[2]["max_prefill_tokens"], 256)
+        self.assertGreater(edit[2]["min_cached_tokens"], 110000)
+
+    def test_prepared_branch_does_not_allow_zero_reuse_on_measured_edit(self):
+        def damage(identifier, result):
+            if identifier == "family-long-edit":
+                total = result["metrics"]["prompt_tokens"]
+                result["metrics"].update(cached_tokens=0, prefill_tokens=total)
+        with tempfile.TemporaryDirectory() as root:
+            runner = RecordingRunner(damage)
+            with self.assertRaisesRegex(ValueError, "insufficient cached_tokens"):
+                self.run_initial(root, runner)
+            self.assertIn("family-long-branch-warmup", [call[0] for call in runner.calls])
+            self.assertFalse((Path(root) / "family-state.json").exists())
 
     def test_bad_cache_accounting_fails_even_when_text_and_depth_are_right(self):
         def damage(identifier, result):

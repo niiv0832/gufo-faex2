@@ -169,6 +169,9 @@ def run_control(runner, records, groups=None):
                 {"role": "user", "content": "Повтори те же три ключа в том же JSON-формате."}]
             long("continue", continued, {**family._long_expected(), "min_cached_tokens": depth - 16,
                                          "max_prefill_tokens": 256})
+            # Полная стоимость первой развилки входит в cases/history и comparison.
+            warm_request, warm_expected = family._branch_warmup(records)
+            long("branch-warmup", warm_request, warm_expected)
             edited = family._long_request(records, edited=True)
             changed = long("edit", edited, {**family._long_expected(True), "min_cached_tokens": depth - 256,
                                             "max_prefill_tokens": 256})

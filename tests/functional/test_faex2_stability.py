@@ -43,7 +43,8 @@ class RecordingRunner:
         contents = json.dumps(body.get("messages", body.get("input", [])), ensure_ascii=False)
         if "Архивная запись" in contents:
             answer = {"start": "ЛИПА_274", "middle": "РЕКА_583",
-                      "end": "ЗВЕЗДА_408" if "ЗВЕЗДА_408" in contents else "СОВА_916"}
+                      "end": "ЗВЕЗДА_408" if "ЗВЕЗДА_408" in contents else
+                      "КЕДР_205" if "КЕДР_205" in contents else "СОВА_916"}
         elif "C1_MTP_742" in contents:
             answer = {"session": "C1_MTP_742", "squares": [1, 4, 9, 16, 25, 36, 49, 64, 81, 100,
                 121, 144, 169, 196, 225, 256, 289, 324, 361, 400, 441, 484, 529, 576, 625,
@@ -130,12 +131,48 @@ class StabilityTests(unittest.TestCase):
                 self.assertEqual(len(expected["excludes"]), 3)
             longs = cases[9:]
             self.assertEqual([case[0] for case in longs], ["control-long-cold", "control-long-repeat",
-                "control-long-continue", "control-long-edit", "control-long-edit-repeat"])
+                "control-long-continue", "control-long-branch-warmup", "control-long-edit",
+                "control-long-edit-repeat"])
             self.assertTrue(all(case[3] == 600 for case in longs))
             self.assertTrue(all(case[2]["min_prompt_tokens"] == 110000 for case in longs))
             self.assertFalse(longs[0][1]["body"]["cache_prompt"])
-            self.assertTrue(all(case[2]["min_cached_tokens"] >= 117744 for case in longs[1:]))
+            self.assertTrue(all(case[2]["min_cached_tokens"] >= 117744 for case in longs[1:]
+                                if case[0] != "control-long-branch-warmup"))
             self.assertEqual(longs[-2][2]["json"]["end"], "ЗВЕЗДА_408")
+
+    def test_control_edit_prepares_shared_checkpoint_and_compares_warmup_cost(self):
+        from test_faex2_family import SharedBranchCache
+        cache = SharedBranchCache()
+        with tempfile.TemporaryDirectory() as root:
+            runner = RecordingRunner(root, damage=lambda _, result: cache.apply(runner.calls[-1][1], result))
+            try:
+                self.api().run_control(runner, 3800, ["long_cache"])
+            except ValueError as error:
+                self.fail("control edit lacks a prepared recurrent checkpoint: " + str(error))
+            runner.report["status"] = "PASS"
+            comparison = self.api().compare_reports(runner.report, deepcopy(runner.report))
+            warm = next(row for row in runner.report["requests"] if row["id"] == "control-long-branch-warmup")
+            metrics = warm["result"]["metrics"]
+            self.assertEqual(metrics["cached_tokens"], 0)
+            self.assertEqual(metrics["prefill_tokens"], metrics["prompt_tokens"])
+            self.assertEqual(warm["expected"]["json"]["end"], "КЕДР_205")
+            self.assertEqual(len([row for row in comparison["measurements"]
+                                  if row["case"] == warm["id"]]), 5)
+            edit = next(row for row in runner.report["requests"] if row["id"] == "control-long-edit")
+            self.assertGreater(edit["result"]["metrics"]["cached_tokens"], 110000)
+            self.assertEqual(edit["expected"]["max_prefill_tokens"], 256)
+
+    def test_control_prepared_branch_does_not_allow_zero_reuse_on_measured_edit(self):
+        def damage(identifier, result):
+            if identifier == "control-long-edit":
+                total = result["metrics"]["prompt_tokens"]
+                result["metrics"].update(cached_tokens=0, prefill_tokens=total)
+        with tempfile.TemporaryDirectory() as root:
+            runner = RecordingRunner(root, damage=damage)
+            with self.assertRaisesRegex(ValueError, "insufficient cached_tokens"):
+                self.api().run_control(runner, 3800, ["long_cache"])
+            self.assertEqual(runner.report["control"]["status"], "FAIL")
+            self.assertIn("control-long-branch-warmup", [call[0] for call in runner.calls])
 
     def test_every_filtered_run_begins_with_a_bounded_sampled_c1_gate(self):
         for groups in (None, ["short"], ["vision"], ["batch"], ["long_cache"]):
