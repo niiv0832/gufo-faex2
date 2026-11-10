@@ -1792,6 +1792,10 @@ std::string HttpRequest::query_param(const std::string& key) const {
 
 struct HttpServer::ConnectionWorker {
   int fd{-1};  // Protected by workers_mutex_, including shutdown and close.
+  // Set after the final response is written. The server reads nothing more,
+  // so the connection only logs and closes and no longer counts toward the
+  // limit.
+  std::atomic<bool> response_sent{false};
   std::atomic<bool> done{false};
   std::jthread thread;
 };
@@ -1994,12 +1998,16 @@ void HttpServer::run(bool handle_signals) {
     bool overloaded = false;
     {
       const std::lock_guard<std::mutex> lock(workers_mutex_);
+      const auto serving = static_cast<std::size_t>(std::ranges::count_if(
+          workers_, [](const std::unique_ptr<ConnectionWorker>& existing) {
+            return !existing->response_sent.load(std::memory_order_acquire);
+          }));
       overloaded = stopped_.load(std::memory_order_acquire) ||
-                   workers_.size() >= options_.max_connections;
+                   serving >= options_.max_connections;
       if (!overloaded) {
         worker_ptr->fd = client_fd;
         worker_ptr->thread = std::jthread([this, worker_ptr, client_fd] {
-          handle_connection(client_fd);
+          handle_connection(client_fd, worker_ptr->response_sent);
           {
             const std::lock_guard<std::mutex> lock(workers_mutex_);
             ::close(worker_ptr->fd);
@@ -2177,7 +2185,8 @@ bool HttpServer::device_lost() {
   return true;
 }
 
-void HttpServer::handle_connection(int client_fd) {
+void HttpServer::handle_connection(int client_fd,
+                                   std::atomic<bool>& response_sent) {
   const struct timeval tv{120, 0};
   ::setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
   ::setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
@@ -2446,6 +2455,7 @@ void HttpServer::handle_connection(int client_fd) {
       response_started = true;
       connected = SendAll(client_fd, payload);
     }
+    response_sent.store(true, std::memory_order_release);
     std::string outcome = connected ? "completed" : "disconnected";
     if (resp.stream_log) {
       resp.log_details = resp.stream_log->details;
@@ -2500,6 +2510,7 @@ void HttpServer::handle_connection(int client_fd) {
     trace_failure(resp);
     if (!response_started)
       (void)SendAll(client_fd, BuildResponse(resp));
+    response_sent.store(true, std::memory_order_release);
   } catch (const std::exception& e) {
     const auto duration_ms = std::chrono::duration<double, std::milli>(
                                  std::chrono::steady_clock::now() - start_time)
@@ -2519,6 +2530,7 @@ void HttpServer::handle_connection(int client_fd) {
     trace_failure(resp);
     if (!response_started)
       (void)SendAll(client_fd, BuildResponse(resp));
+    response_sent.store(true, std::memory_order_release);
   } catch (...) {
     const auto duration_ms = std::chrono::duration<double, std::milli>(
                                  std::chrono::steady_clock::now() - start_time)
@@ -2535,6 +2547,7 @@ void HttpServer::handle_connection(int client_fd) {
     trace_failure(resp);
     if (!response_started)
       (void)SendAll(client_fd, BuildResponse(resp));
+    response_sent.store(true, std::memory_order_release);
   }
   // Act on a loss found by this request now, not at the next health probe.
   (void)device_lost();
