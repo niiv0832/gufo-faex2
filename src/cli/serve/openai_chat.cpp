@@ -1972,7 +1972,11 @@ ParsedGeneration ParseStructuredGeneration(
       raw = AfterReasoningSeparator(raw, markers);
     }
   }
-  const auto content = tool_only ? raw : Trim(raw);
+  const auto trimmed = Trim(raw);
+  const bool held_opener = choice == ChatRequest::ToolChoice::kRequired &&
+                           trimmed.empty() && !raw.empty() &&
+                           ToolMarkerPrefix(raw, markers);
+  const auto content = tool_only || held_opener ? raw : trimmed;
   quotes.Reset(content);
   if (const auto marker = EarliestMarker(content, markers, quotes);
       !tools.empty() && choice != ChatRequest::ToolChoice::kNone &&
