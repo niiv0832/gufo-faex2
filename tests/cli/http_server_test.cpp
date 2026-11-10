@@ -2722,11 +2722,11 @@ void TestConnectionLimitIgnoresClosingConnections() {
     const auto refusal = ReadFramedResponse(refused);
     ExpectStatus(refusal, 503);
     assert(refusal.find("connection limit reached") != std::string::npos);
-    net::CloseSocket(refused);
+    ::close(refused);
 
     const std::string request =
         "POST /echo HTTP/1.1\r\nContent-Length: 4\r\n\r\nping";
-    assert(net::SendNoSignal(answered, request.data(), request.size()) ==
+    assert(::send(answered, request.data(), request.size(), MSG_NOSIGNAL) ==
            static_cast<ssize_t>(request.size()));
     assert(ReadFramedResponse(answered).ends_with("ping"));
     // The response is complete but the server has not closed the connection:
@@ -2736,14 +2736,14 @@ void TestConnectionLimitIgnoresClosingConnections() {
     // A client that reads its response and reconnects at once must be served.
     const int next = server.Connect();
     const std::string health = "GET /health HTTP/1.1\r\n\r\n";
-    assert(net::SendNoSignal(next, health.data(), health.size()) ==
+    assert(::send(next, health.data(), health.size(), MSG_NOSIGNAL) ==
            static_cast<ssize_t>(health.size()));
     ExpectStatus(ReadFramedResponse(next), 200);
 
     gate.Release();
-    net::CloseSocket(next);
-    net::CloseSocket(answered);
-    net::CloseSocket(idle);
+    ::close(next);
+    ::close(answered);
+    ::close(idle);
   }
   std::clog.rdbuf(previous_sink);
 }
