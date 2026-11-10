@@ -31,6 +31,16 @@ constexpr std::size_t kMaxWork = 2000000;
   throw std::invalid_argument("JSON Schema: " + std::string(message));
 }
 
+// Keywords that describe a schema without constraining its values (JSON
+// Schema 2020-12 core 8.1.1/8.3 and meta-data vocabulary 9), accepted even in
+// strict mode. The Vercel AI SDK always sends "$schema" (#1057).
+bool Annotation(std::string_view key) {
+  static constexpr std::array<std::string_view, 9> keys{
+      "title",    "description", "$schema",  "$comment", "default",
+      "examples", "deprecated",  "readOnly", "writeOnly"};
+  return std::ranges::find(keys, key) != keys.end();
+}
+
 // Some unsupported applicators admit fields outside "properties". Ignoring
 // them must not turn a best-effort tool into a closed, empty object.
 bool HasPropertySchemas(const json::Value& schema) {
@@ -748,14 +758,11 @@ private:
       if (!seen.insert(schema).second)
         return nullptr;
       for (const auto& [key, value] : schema->members()) {
-        if (key == "$ref" || key == "$defs" || key == "title" ||
-            key == "description")
+        if (key == "$ref" || key == "$defs" || Annotation(key))
           continue;
         if (strict_)
           return nullptr;
-        if (key == "$schema" || key == "$id" || key == "$comment" ||
-            key == "definitions" || key == "examples" || key == "default" ||
-            key == "deprecated" || key == "readOnly" || key == "writeOnly")
+        if (key == "$id" || key == "definitions")
           continue;
         if (key != "type" || (type && !EqualValue(*type, value)))
           return nullptr;
@@ -919,6 +926,13 @@ private:
         result.append_member(key, value);
     return result;
   }
+  static json::Value Constraints(const json::Value& schema) {
+    auto result = json::Value::object();
+    for (const auto& [key, value] : schema.members())
+      if (!Annotation(key))
+        result.append_member(key, value);
+    return result;
+  }
   json::Value Conjoin(const json::Value& left, const json::Value& right,
                       unsigned depth = 0) {
     if (depth > 64)
@@ -965,7 +979,7 @@ private:
     auto result = left;
     for (const auto& [key, value] : right.members()) {
       const auto* previous = left.find(key);
-      if (key == "title" || key == "description" || !previous) {
+      if (Annotation(key) || !previous) {
         result[key] = value;
         continue;
       }
@@ -1392,8 +1406,6 @@ private:
                                                     "anyOf",
                                                     "$defs",
                                                     "$ref",
-                                                    "title",
-                                                    "description",
                                                     "minimum",
                                                     "maximum",
                                                     "exclusiveMinimum",
@@ -1404,9 +1416,11 @@ private:
                                                     "minLength",
                                                     "maxLength"};
     for (const auto& [key, value] : schema.members()) {
-      if (!allowed.contains(key) && !ignore_unknown_keys_)
+      if (!allowed.contains(key) && !Annotation(key) && !ignore_unknown_keys_)
         Invalid("unsupported keyword: " + key);
-      if ((key == "title" || key == "description") && !value.is_string())
+      if ((key == "title" || key == "description" || key == "$schema" ||
+           key == "$comment") &&
+          !value.is_string())
         Invalid(key + " must be a string");
       if (key == "anyOf" && (!value.is_array() || value.empty()))
         Invalid("anyOf needs at least one branch");
@@ -1460,8 +1474,7 @@ private:
       }
     }
     if (const auto* ref = schema.find("$ref")) {
-      const auto siblings =
-          Without(schema, {"$ref", "$defs", "title", "description"});
+      const auto siblings = Constraints(Without(schema, {"$ref", "$defs"}));
       return siblings.empty()
                  ? Visit(*Reference(*ref), depth)
                  : Visit(Store(Conjoin(*Reference(*ref), siblings)), depth);
@@ -1469,8 +1482,7 @@ private:
     if (const auto* any = schema.find("anyOf")) {
       if (!any->is_array() || any->size() == 0)
         Invalid("anyOf needs at least one branch");
-      const auto siblings =
-          Without(schema, {"anyOf", "$defs", "title", "description"});
+      const auto siblings = Constraints(Without(schema, {"anyOf", "$defs"}));
       Sequence branches;
       for (const auto& value : any->items()) {
         try {
@@ -1485,9 +1497,7 @@ private:
     const auto* type = schema.find("type");
     // An unconstrained leaf is a valid JSON Schema, not a reason to discard
     // the requirements on its containing array/object.
-    if (!type && open_objects_ &&
-        Without(schema, {"title", "description", "default", "examples"})
-            .empty())
+    if (!type && open_objects_ && Constraints(schema).empty())
       return GenericValue(kMaxDepth - depth);
     std::vector<std::string> types;
     if (type && type->is_string())
