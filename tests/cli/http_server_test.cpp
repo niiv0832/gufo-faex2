@@ -2537,6 +2537,22 @@ void TestLoadingResponder() {
   ExpectLoading(SendParts(
       "127.0.0.1", port,
       {"POST /v1/chat/completions HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}"}));
+  // A body the responder leaves unread, whole or arriving after the head,
+  // must not reset the connection before the client reads the answer.
+  ExpectLoading(SendParts(
+      "127.0.0.1", port,
+      {"POST /v1/completions HTTP/1.1\r\nContent-Length: 65536\r\n\r\n" +
+       std::string(65536, 'x')}));
+  ExpectLoading(SendParts(
+      "127.0.0.1", port,
+      {"POST /v1/completions HTTP/1.1\r\nContent-Length: 4096\r\n\r\n",
+       std::string(4096, 'x')}));
+  // A body larger than the socket buffers is still being sent when the
+  // answer is written; closing then breaks the client's send.
+  ExpectLoading(SendParts(
+      "127.0.0.1", port,
+      {"POST /v1/completions HTTP/1.1\r\nContent-Length: 8388608\r\n\r\n" +
+       std::string(8388608, 'x')}));
   // A request head split across segments is answered after it completes.
   ExpectLoading(
       SendParts("127.0.0.1", port, {"GET /hea", "lth HTTP/1.1\r\n", "\r\n"}));

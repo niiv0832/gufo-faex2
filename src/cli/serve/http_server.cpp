@@ -1723,8 +1723,10 @@ void LoadingResponder::serve() {
   loading.headers.emplace_back("Retry-After", "1");
   const std::string reply = BuildResponse(loading);
   // One connection at a time is enough for probes. Read the request head
-  // before replying so closing does not reset an unread request, but bound
-  // the wait: a client that connects and sends nothing must not delay stop().
+  // before replying, and after replying read what the client still sends (a
+  // request body) until it closes: closing with unread data resets the
+  // connection, and the client can lose the reply. Bound both waits: a client
+  // that connects and sends nothing must not delay stop().
   constexpr auto kRequestWait = std::chrono::milliseconds(500);
   while (!stopped_.load(std::memory_order_acquire)) {
     pollfd listener{.fd = listen_fd_, .events = POLLIN, .revents = 0};
@@ -1733,26 +1735,36 @@ void LoadingResponder::serve() {
     const int client_fd = ::accept(listen_fd_, nullptr, nullptr);
     if (client_fd < 0)
       continue;
-    std::string head;
-    const auto deadline = std::chrono::steady_clock::now() + kRequestWait;
-    while (head.find("\r\n\r\n") == std::string::npos && head.size() < 8192 &&
-           !stopped_.load(std::memory_order_acquire)) {
+    // Appends one read to `into` (when set); false once the deadline passes,
+    // the client closes or stop() runs.
+    const auto receive = [&](std::chrono::steady_clock::time_point deadline,
+                             std::string* into) {
       const auto remaining =
           std::chrono::duration_cast<std::chrono::milliseconds>(
               deadline - std::chrono::steady_clock::now())
               .count();
       pollfd client{.fd = client_fd, .events = POLLIN, .revents = 0};
-      if (remaining <= 0 ||
+      if (stopped_.load(std::memory_order_acquire) || remaining <= 0 ||
           ::poll(&client, 1, static_cast<int>(remaining)) <= 0)
-        break;
-      char buffer[2048];
+        return false;
+      char buffer[4096];
       const ssize_t received = ::recv(client_fd, buffer, sizeof(buffer), 0);
       if (received <= 0)
-        break;
-      head.append(buffer, static_cast<std::size_t>(received));
+        return false;
+      if (into != nullptr)
+        into->append(buffer, static_cast<std::size_t>(received));
+      return true;
+    };
+    std::string head;
+    const auto head_deadline = std::chrono::steady_clock::now() + kRequestWait;
+    while (head.find("\r\n\r\n") == std::string::npos && head.size() < 8192 &&
+           receive(head_deadline, &head)) {
     }
     (void)SendAll(client_fd, reply);
     ::shutdown(client_fd, SHUT_WR);
+    const auto drain_deadline = std::chrono::steady_clock::now() + kRequestWait;
+    while (receive(drain_deadline, nullptr)) {
+    }
     ::close(client_fd);
   }
 }
