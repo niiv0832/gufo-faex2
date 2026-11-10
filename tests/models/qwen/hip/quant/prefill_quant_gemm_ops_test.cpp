@@ -434,6 +434,118 @@ void RunCase(std::size_t batch, std::size_t m, std::size_t k, bool dual,
   HIP_CHECK(hipFree(d_y2));
 }
 
+// Two sessions on one scheduler thread launch the BF16-input wrapper on their
+// own streams without synchronizing in between. Each result must be bitwise
+// equal to its serial reference: the quantized-activation scratch belongs to a
+// launch, not to the calling thread. The interleaved control synchronizes after
+// every launch and proves that repeated launches are bitwise stable.
+void RunTwoStreamWrapperCase(std::size_t batch, std::size_t m, std::size_t k,
+                             int rounds) {
+  std::cout << "prefill quant GEMM wrapper on two streams: batch=" << batch
+            << " m=" << m << " k=" << k << " rounds=" << rounds << std::endl;
+  const std::size_t num_blocks = k / 32;
+  Rng rng(0x51ED270BU ^ static_cast<std::uint32_t>((batch * 7) + m + k));
+  std::vector<HostQ8_0Block> h_w(m * num_blocks);
+  for (auto& block : h_w) {
+    block.d = FloatToFp16(rng.Uniform(-0.05F, 0.05F));
+    for (auto& code : block.qs) {
+      code = rng.Int8();
+    }
+  }
+  constexpr int kSessions = 2;
+  std::vector<std::uint16_t> h_x[kSessions];
+  void* d_x[kSessions] = {};
+  float* d_y[kSessions] = {};
+  hipStream_t streams[kSessions] = {};
+  void* d_w = nullptr;
+  HIP_CHECK(hipMalloc(&d_w, h_w.size() * sizeof(HostQ8_0Block)));
+  HIP_CHECK(hipMemcpy(d_w, h_w.data(), h_w.size() * sizeof(HostQ8_0Block),
+                      hipMemcpyHostToDevice));
+  for (int s = 0; s < kSessions; ++s) {
+    h_x[s].resize(batch * k);
+    // Different magnitudes make a foreign scratch visibly wrong.
+    const float range = s == 0 ? 1.5F : 0.25F;
+    for (auto& value : h_x[s]) {
+      value = gufo::test::FloatToBf16Bits(rng.Uniform(-range, range));
+    }
+    HIP_CHECK(hipMalloc(&d_x[s], h_x[s].size() * sizeof(std::uint16_t)));
+    HIP_CHECK(hipMalloc(&d_y[s], batch * m * sizeof(float)));
+    HIP_CHECK(hipMemcpy(d_x[s], h_x[s].data(),
+                        h_x[s].size() * sizeof(std::uint16_t),
+                        hipMemcpyHostToDevice));
+    HIP_CHECK(hipStreamCreateWithFlags(&streams[s], hipStreamNonBlocking));
+  }
+  const auto launch = [&](int s) {
+    gufo::hip::LaunchBatchedQuantGEMM(gufo::core::GgmlType::kQ8_0, d_w, d_x[s],
+                                      d_y[s], batch, m, k, streams[s]);
+  };
+  const auto read = [&](int s) {
+    std::vector<float> out(batch * m);
+    HIP_CHECK(hipMemcpy(out.data(), d_y[s], out.size() * sizeof(float),
+                        hipMemcpyDeviceToHost));
+    return out;
+  };
+  std::vector<float> reference[kSessions];
+  for (int s = 0; s < kSessions; ++s) {
+    launch(s);
+    HIP_CHECK(hipStreamSynchronize(streams[s]));
+    reference[s] = read(s);
+  }
+  const auto differs = [&](int s) {
+    const auto got = read(s);
+    return std::memcmp(got.data(), reference[s].data(),
+                       got.size() * sizeof(float)) != 0;
+  };
+  int control_mismatches = 0;
+  int mismatches = 0;
+  for (int round = 0; round < rounds; ++round) {
+    for (int s = 0; s < kSessions; ++s) {
+      HIP_CHECK(
+          hipMemsetAsync(d_y[s], 0, batch * m * sizeof(float), streams[s]));
+      launch(s);
+      HIP_CHECK(hipStreamSynchronize(streams[s]));
+    }
+    for (int s = 0; s < kSessions; ++s) {
+      control_mismatches += differs(s) ? 1 : 0;
+    }
+  }
+  for (int round = 0; round < rounds; ++round) {
+    for (int s = 0; s < kSessions; ++s) {
+      HIP_CHECK(
+          hipMemsetAsync(d_y[s], 0, batch * m * sizeof(float), streams[s]));
+    }
+    // Several launches per session keep both hardware queues busy, as the 41
+    // MoE layers of one prefill chunk do.
+    for (int repeat = 0; repeat < 8; ++repeat) {
+      for (int s = 0; s < kSessions; ++s) {
+        launch(s);
+      }
+    }
+    for (int s = 0; s < kSessions; ++s) {
+      HIP_CHECK(hipStreamSynchronize(streams[s]));
+    }
+    for (int s = 0; s < kSessions; ++s) {
+      mismatches += differs(s) ? 1 : 0;
+    }
+  }
+  std::cout << "  synchronized control mismatches=" << control_mismatches
+            << " unsynchronized mismatches=" << mismatches << " of "
+            << rounds * kSessions << std::endl;
+  for (int s = 0; s < kSessions; ++s) {
+    HIP_CHECK(hipStreamDestroy(streams[s]));
+    HIP_CHECK(hipFree(d_x[s]));
+    HIP_CHECK(hipFree(d_y[s]));
+  }
+  HIP_CHECK(hipFree(d_w));
+  if (control_mismatches != 0) {
+    throw std::runtime_error("synchronized wrapper launches are not stable");
+  }
+  if (mismatches != 0) {
+    throw std::runtime_error(
+        "wrapper result depends on another stream's launch");
+  }
+}
+
 // opt-c192-swiglu-epilogue: the up projection's fused SwiGLU + Q8_1 epilogue
 // consumes the same accumulator value the FP32 store would have round-tripped
 // exactly and reduces the block max and the code sum with order-independent
@@ -699,9 +811,13 @@ int main(int argc, char** argv) try {
       argc == 2 && std::strcmp(argv[1], "--guarded-control") == 0;
   const bool wrapper_allocation =
       argc == 2 && std::strcmp(argv[1], "--wrapper-allocation") == 0;
-  if (!full && !guarded_tail && !guarded_control && !wrapper_allocation) {
+  const bool two_streams =
+      argc == 2 && std::strcmp(argv[1], "--two-streams") == 0;
+  if (!full && !guarded_tail && !guarded_control && !wrapper_allocation &&
+      !two_streams) {
     std::cerr << "usage: " << argv[0]
-              << " [--guarded-tail|--guarded-control|--wrapper-allocation]\n";
+              << " [--guarded-tail|--guarded-control|--wrapper-allocation|"
+                 "--two-streams]\n";
     return 2;
   }
   const int device_status =
@@ -718,6 +834,15 @@ int main(int argc, char** argv) try {
     RunCase(64, 512, 2048, false, GemmMode::kWrapperAllocation);
     if (wrapper_allocation) {
       std::cout << "Wrapper allocation regression passed.\n";
+      return 0;
+    }
+  }
+
+  if (full || two_streams) {
+    // The MoE shared-expert shapes of a 128-token prefill chunk.
+    RunTwoStreamWrapperCase(128, 512, 2048, 50);
+    if (two_streams) {
+      std::cout << "Two-stream wrapper regression passed.\n";
       return 0;
     }
   }

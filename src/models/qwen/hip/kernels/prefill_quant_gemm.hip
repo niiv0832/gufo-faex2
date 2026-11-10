@@ -1,4 +1,7 @@
 #if defined(ENGINE_ENABLE_HIP)
+#include <mutex>
+#include <unordered_map>
+
 #include "src/models/qwen/hip/kernels/prefill_quant_gemm.hpp"
 
 namespace gufo::hip {
@@ -1630,6 +1633,37 @@ void LaunchBatchedDualQuantGEMMSwiGLUQuantizeQ8_1(
   LaunchZeroQ8ActTail<true>(q8_1_out, batch, m, stream);
 }
 
+namespace {
+
+// Device scratch for LaunchBatchedQuantGEMM's Q8_1 activations, one per
+// stream. Work on a stream is ordered, so consecutive launches may share it.
+// A larger request first drains the stream: queued kernels still read the old
+// buffer. Buffers are kept for the life of the process, as the per-thread
+// scratch they replace was.
+void* StreamQ8ActivationScratch(hipStream_t stream, std::size_t bytes) {
+  struct Scratch {
+    void* data = nullptr;
+    std::size_t bytes = 0;
+  };
+  static std::mutex mutex;
+  static std::unordered_map<hipStream_t, Scratch> scratch_by_stream;
+  const std::lock_guard lock(mutex);
+  auto& scratch = scratch_by_stream[stream];
+  if (scratch.bytes < bytes) {
+    if (scratch.data != nullptr) {
+      HIP_CHECK(stream != nullptr ? hipStreamSynchronize(stream)
+                                  : hipDeviceSynchronize());
+      HIP_CHECK(hipFree(scratch.data));
+      scratch = {};
+    }
+    HIP_CHECK(hipMalloc(&scratch.data, bytes));
+    scratch.bytes = bytes;
+  }
+  return scratch.data;
+}
+
+}  // namespace
+
 void LaunchBatchedQuantGEMM(core::GgmlType type, const void* w,
                             const void* bf16_x, float* y, std::size_t batch,
                             std::size_t m, std::size_t k, hipStream_t stream) {
@@ -1640,21 +1674,15 @@ void LaunchBatchedQuantGEMM(core::GgmlType type, const void* w,
     return;
   }
   if (type == core::GgmlType::kQ8_0) {
-    static thread_local void* s_act_q8_scratch = nullptr;
-    static thread_local std::size_t s_act_q8_scratch_bytes = 0;
-
-    const std::size_t req_bytes = QuantizedActivationBytes(batch, k);
-    if (s_act_q8_scratch_bytes < req_bytes) {
-      if (s_act_q8_scratch != nullptr) {
-        (void)hipFree(s_act_q8_scratch);
-      }
-      HIP_CHECK(hipMalloc(&s_act_q8_scratch, req_bytes));
-      s_act_q8_scratch_bytes = req_bytes;
-    }
-
-    LaunchQuantizeActivationQ8_1(bf16_x, s_act_q8_scratch, batch, k, stream);
-    LaunchBatchedQuantGEMMPreQuantized(type, w, s_act_q8_scratch, y, batch, m,
-                                       k, stream);
+    // The quantized activations live until the GEMM queued behind them has
+    // run, so the scratch belongs to the stream. One scheduler thread drives
+    // every session: a scratch per thread let a second session's launch
+    // overwrite activations the first session's queued kernels still read.
+    void* const act_q8_scratch =
+        StreamQ8ActivationScratch(stream, QuantizedActivationBytes(batch, k));
+    LaunchQuantizeActivationQ8_1(bf16_x, act_q8_scratch, batch, k, stream);
+    LaunchBatchedQuantGEMMPreQuantized(type, w, act_q8_scratch, y, batch, m, k,
+                                       stream);
     return;
   }
 
