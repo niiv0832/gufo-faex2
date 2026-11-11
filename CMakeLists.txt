@@ -424,6 +424,11 @@ if (BUILD_TESTING)
   add_test(NAME json_test COMMAND json_test)
   set_tests_properties(json_test PROPERTIES LABELS "cpu;json")
 
+  add_executable(heap_placement_test tests/core/heap_placement_test.cpp)
+  target_link_libraries(heap_placement_test PRIVATE gufo_core)
+  add_test(NAME heap_placement_test COMMAND heap_placement_test)
+  set_tests_properties(heap_placement_test PROPERTIES LABELS "cpu;hip;core")
+
   add_executable(sampling_test tests/core/sampling_test.cpp)
   target_link_libraries(sampling_test PRIVATE gufo_core)
   add_test(NAME sampling_test COMMAND sampling_test)
