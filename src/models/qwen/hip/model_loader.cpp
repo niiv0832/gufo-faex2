@@ -41,7 +41,7 @@ void ReleaseWeightRegions(std::vector<QwenGpuWeightRegion>& regions) noexcept {
 /// Calls visit(worker, offset, chunk, size) for every chunk of the mapping
 /// from up to `workers` threads, populating each chunk first and dropping its
 /// pages afterwards. A visitor returning false stops the walk.
-template <typename Visit>
+template<typename Visit>
 void VisitMappedChunks(const core::GgufMappedRegion& source,
                        std::size_t chunk_bytes, std::size_t workers,
                        Visit&& visit) {
@@ -228,8 +228,7 @@ void CopyMappedWeights(const core::GgufMappedRegion& source, void* copy) {
       ReleaseWeightRegions(weight_regions);
       if (error_msg != nullptr) {
         *error_msg = "Failed to make GGUF shard " + std::to_string(i) +
-                     " GPU-visible: " +
-                     hipGetErrorString(map_error);
+                     " GPU-visible: " + hipGetErrorString(map_error);
       }
       return false;
     }
