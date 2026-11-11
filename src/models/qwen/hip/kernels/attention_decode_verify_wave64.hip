@@ -13,12 +13,14 @@
 namespace gufo::hip::detail {
 namespace {
 
-// Verification rows > 1 in wave64: two KV heads, twelve query heads of
-// sixteen lanes, four heads per wave, 192 threads per block. The per-head
-// arithmetic and scratch layout are SplitKAttentionHead's, as in
-// QwenDecodeSplitKAttentionHalfPartialsKernel<true, 16>; the score tree
+// Split-K partials in wave64: two KV heads and their HeadsPerKv query heads
+// each, sixteen lanes per head, four heads per wave; 192 threads per block for
+// six heads per KV head and 256 for eight. The per-head arithmetic and scratch
+// layout are SplitKAttentionHead's, as in
+// QwenDecodeSplitKAttentionHalfPartialsKernel<6, 16>; the score tree
 // runs on DPP row exchanges because a 16-lane head is one DPP row.
-__launch_bounds__(192) __global__
+template<unsigned HeadsPerKv>
+__launch_bounds__(HeadsPerKv * 32) __global__
     void QwenVerifySplitKAttentionHalfPartialsWave64Kernel(
         const float* __restrict__ q, const __half* __restrict__ k_cache,
         const __half* __restrict__ v_cache, float* __restrict__ scratch,
@@ -30,7 +32,7 @@ __launch_bounds__(192) __global__
   // converting first (see DotHalf4); the products are unchanged.
   using Head = SplitKAttentionHead<lanes, true>;
   constexpr std::uint32_t head_dim = Head::kHeadDim;
-  constexpr std::uint32_t heads_per_kv = 6;
+  constexpr std::uint32_t heads_per_kv = HeadsPerKv;
   constexpr std::uint32_t kv_heads_per_block = 2;
   constexpr std::uint32_t heads_per_block = heads_per_kv * kv_heads_per_block;
   constexpr unsigned tile = 4;
@@ -68,7 +70,7 @@ __launch_bounds__(192) __global__
     state.Accumulate(score, value, lane);
   };
 
-  // Stage both KV heads of a four-token tile once for the twelve heads.
+  // Stage both KV heads of a four-token tile once for every head.
   __shared__ __align__(16) __half keys[kv_heads_per_block][tile][head_dim];
   __shared__ __align__(16) __half values[kv_heads_per_block][tile][head_dim];
   constexpr unsigned vectors_per_token = kv_heads_per_block * head_dim / 8;
@@ -113,12 +115,19 @@ void LaunchVerifySplitKAttentionHalfPartialsWave64(
     unsigned rows, std::uint32_t max_context, std::uint32_t num_heads,
     std::uint32_t num_kv_heads, std::uint32_t splits, hipStream_t stream) {
   assert(num_kv_heads % 2 == 0 && "wave64 verification pairs KV heads");
-  assert(num_heads == 6 * num_kv_heads && "twelve query heads per block");
-  assert(rows > 1 && "single rows keep the 32-lane kernel");
-  QwenVerifySplitKAttentionHalfPartialsWave64Kernel<<<
-      dim3(num_kv_heads / 2, rows, splits), 192, 0, stream>>>(
-      q, k_cache, v_cache, scratch, layer_idx, start_pos, max_context,
-      num_heads, num_kv_heads, splits);
+  const dim3 grid(num_kv_heads / 2, rows, splits);
+  if (num_heads == 6 * num_kv_heads) {
+    QwenVerifySplitKAttentionHalfPartialsWave64Kernel<6>
+        <<<grid, 192, 0, stream>>>(q, k_cache, v_cache, scratch, layer_idx,
+                                   start_pos, max_context, num_heads,
+                                   num_kv_heads, splits);
+  } else {
+    assert(num_heads == 8 * num_kv_heads && "six or eight heads per KV head");
+    QwenVerifySplitKAttentionHalfPartialsWave64Kernel<8>
+        <<<grid, 256, 0, stream>>>(q, k_cache, v_cache, scratch, layer_idx,
+                                   start_pos, max_context, num_heads,
+                                   num_kv_heads, splits);
+  }
 }
 
 }  // namespace gufo::hip::detail

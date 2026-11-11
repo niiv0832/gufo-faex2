@@ -612,14 +612,18 @@ __launch_bounds__(32) __global__ void QwenDecodeSplitKAttentionPartialsKernel(
   }
 }
 
-template<bool ShareKv = false, unsigned Lanes = 32>
-__launch_bounds__(ShareKv ? 6 * Lanes : 32) __global__
+// Group is the number of query heads that share one staged KV tile in a
+// workgroup: 1 reads the cache directly, 6 holds every query head of a KV head
+// for 24 heads over 4.
+template<unsigned Group = 1, unsigned Lanes = 32>
+__launch_bounds__(Group > 1 ? Group * Lanes : 32) __global__
     void QwenDecodeSplitKAttentionHalfPartialsKernel(
         const float* __restrict__ q, const __half* __restrict__ k_cache,
         const __half* __restrict__ v_cache, float* __restrict__ scratch,
         std::uint32_t layer_idx, std::uint32_t pos, std::uint32_t max_context,
         std::uint32_t num_heads, std::uint32_t num_kv_heads,
         std::uint32_t split_count) {
+  constexpr bool ShareKv = Group > 1;
   static_assert(Lanes == 32 || (ShareKv && Lanes == 16));
   // Per-head arithmetic is shared with the wave64 verification kernel.
   using Head = detail::SplitKAttentionHead<Lanes, false>;
@@ -631,7 +635,7 @@ __launch_bounds__(ShareKv ? 6 * Lanes : 32) __global__
              (head_dim + 2);
   pos += blockIdx.y;
 
-  constexpr std::uint32_t heads_per_block = ShareKv ? 6 : 1;
+  constexpr std::uint32_t heads_per_block = Group;
   const std::uint32_t head = blockIdx.x * heads_per_block + threadIdx.x / Lanes;
   const std::uint32_t split = blockIdx.z;
   const std::uint32_t lane = threadIdx.x % Lanes;
@@ -666,8 +670,8 @@ __launch_bounds__(ShareKv ? 6 * Lanes : 32) __global__
     state.Accumulate(__shfl(score, 0, Lanes) * scale, value, lane);
   };
   if constexpr (ShareKv) {
-    // Six query heads share each KV head. Stage the encoded KV once without
-    // changing any head's score, softmax or value accumulation order.
+    // The query heads of one KV head share it. Stage the encoded KV once
+    // without changing any head's score, softmax or value accumulation order.
     constexpr unsigned tile = 4;
     __shared__ __align__(16) __half keys[tile][head_dim];
     __shared__ __align__(16) __half values[tile][head_dim];
@@ -913,22 +917,33 @@ static void LaunchSplitKAttentionHalfPartials(
     float* scratch, std::uint32_t layer_idx, std::uint32_t start_pos,
     unsigned rows, std::uint32_t max_context, std::uint32_t num_heads,
     std::uint32_t num_kv_heads, std::uint32_t splits, hipStream_t stream) {
-  // Share each KV tile across its six query heads in both scalar decoding
-  // and verification. Rows retain independent causal endpoints and scratch.
-  if (num_heads == 6 * num_kv_heads &&
-      static_cast<std::size_t>(start_pos) + 1 >= 512) {
-    if (rows > 1 && num_kv_heads % 2 == 0) {
+  // Share each KV tile across the query heads of its KV head in both scalar
+  // decoding and verification. Rows retain independent causal endpoints and
+  // scratch.
+  const bool deep = static_cast<std::size_t>(start_pos) + 1 >= 512;
+  const bool paired_kv = num_kv_heads % 2 == 0;
+  if (num_heads == 8 * num_kv_heads && paired_kv && deep) {
+    // Sixteen query heads over two KV heads (Qwen3.6-35B-A3B): four wave64 per
+    // pair of KV heads for one row as well as for verification rows. At 67,600
+    // tokens a layer takes 0.69 ms here against 0.75 ms for two 16-lane heads
+    // per wave32, 0.86 ms for 32-lane heads on a shared tile and 1.19 ms for
+    // one workgroup per head.
+    detail::LaunchVerifySplitKAttentionHalfPartialsWave64(
+        q, k_cache, v_cache, scratch, layer_idx, start_pos, rows, max_context,
+        num_heads, num_kv_heads, splits, stream);
+  } else if (num_heads == 6 * num_kv_heads && deep) {
+    if (rows > 1 && paired_kv) {
       // Three wave64 per pair of KV heads; same arithmetic and scratch.
       detail::LaunchVerifySplitKAttentionHalfPartialsWave64(
           q, k_cache, v_cache, scratch, layer_idx, start_pos, rows, max_context,
           num_heads, num_kv_heads, splits, stream);
     } else if (rows > 1) {
-      QwenDecodeSplitKAttentionHalfPartialsKernel<true, 16>
+      QwenDecodeSplitKAttentionHalfPartialsKernel<6, 16>
           <<<dim3(num_kv_heads, rows, splits), 96, 0, stream>>>(
               q, k_cache, v_cache, scratch, layer_idx, start_pos, max_context,
               num_heads, num_kv_heads, splits);
     } else {
-      QwenDecodeSplitKAttentionHalfPartialsKernel<true>
+      QwenDecodeSplitKAttentionHalfPartialsKernel<6>
           <<<dim3(num_kv_heads, rows, splits), 192, 0, stream>>>(
               q, k_cache, v_cache, scratch, layer_idx, start_pos, max_context,
               num_heads, num_kv_heads, splits);
