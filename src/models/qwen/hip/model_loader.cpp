@@ -14,7 +14,9 @@
 #include <system_error>
 #include <thread>
 #include <utility>
+#include <vector>
 
+#include "src/core/hip/heap_placement.hpp"
 #include "src/core/hip/hip_utils.hpp"
 #include "src/models/qwen/chat_template.hpp"
 #include "src/models/qwen/hip/executor.hpp"
@@ -26,7 +28,9 @@ namespace {
 
 void ReleaseWeightRegions(std::vector<QwenGpuWeightRegion>& regions) noexcept {
   for (auto& region : regions) {
-    if (region.host_copy != nullptr) {
+    if (region.owns_device_allocation && region.device_data != nullptr) {
+      (void)hipFree(region.device_data);
+    } else if (region.host_copy != nullptr) {
       (void)hipHostUnregister(region.host_copy);
       (void)munmap(region.host_copy, region.size);
     }
@@ -34,19 +38,26 @@ void ReleaseWeightRegions(std::vector<QwenGpuWeightRegion>& regions) noexcept {
   }
 }
 
-void CopyMappedWeights(const core::GgufMappedRegion& source, void* copy) {
-  constexpr std::size_t kChunkBytes = 16ULL << 20;
+/// Calls visit(worker, offset, chunk, size) for every chunk of the mapping
+/// from up to `workers` threads, populating each chunk first and dropping its
+/// pages afterwards. A visitor returning false stops the walk.
+template <typename Visit>
+void VisitMappedChunks(const core::GgufMappedRegion& source,
+                       std::size_t chunk_bytes, std::size_t workers,
+                       Visit&& visit) {
   const auto chunks =
-      source.size / kChunkBytes + (source.size % kChunkBytes != 0);
+      source.size / chunk_bytes + (source.size % chunk_bytes != 0);
   std::atomic<std::size_t> next{0};
   std::atomic<int> failure{0};
-  auto copy_chunk = [&] {
-    while (failure.load(std::memory_order_relaxed) == 0) {
+  std::atomic<bool> stopped{false};
+  auto visit_chunks = [&](std::size_t worker) {
+    while (failure.load(std::memory_order_relaxed) == 0 &&
+           !stopped.load(std::memory_order_relaxed)) {
       const auto index = next.fetch_add(1, std::memory_order_relaxed);
       if (index >= chunks)
         break;
-      const auto offset = index * kChunkBytes;
-      const auto bytes = std::min(kChunkBytes, source.size - offset);
+      const auto offset = index * chunk_bytes;
+      const auto bytes = std::min(chunk_bytes, source.size - offset);
       auto* input = const_cast<std::uint8_t*>(
                         static_cast<const std::uint8_t*>(source.data)) +
                     offset;
@@ -54,21 +65,95 @@ void CopyMappedWeights(const core::GgufMappedRegion& source, void* copy) {
         failure.store(errno, std::memory_order_relaxed);
         break;
       }
-      std::memcpy(static_cast<std::uint8_t*>(copy) + offset, input, bytes);
-      // The immutable copy now owns these resident bytes. Keep the original
+      const bool keep_going = visit(worker, offset, input, bytes);
+      // The visitor owns a copy of these bytes now. Keep the original
       // mapping valid for the reader without retaining its populated PTEs.
       (void)madvise(input, bytes, MADV_DONTNEED);
+      if (!keep_going) {
+        stopped.store(true, std::memory_order_relaxed);
+        break;
+      }
     }
   };
   {
-    std::vector<std::jthread> workers;
-    for (std::size_t i = 1; i < std::min<std::size_t>(16, chunks); ++i)
-      workers.emplace_back(copy_chunk);
-    copy_chunk();
+    std::vector<std::jthread> threads;
+    const auto count = std::clamp<std::size_t>(workers, 1, chunks);
+    for (std::size_t worker = 1; worker < count; ++worker)
+      threads.emplace_back(visit_chunks, worker);
+    visit_chunks(0);
   }
   if (const auto error = failure.load(); error != 0)
     throw std::system_error(error, std::generic_category(),
                             "cannot read mapped Qwen weights");
+}
+
+void CopyMappedWeights(const core::GgufMappedRegion& source, void* copy) {
+  constexpr std::size_t kChunkBytes = 16ULL << 20;
+  VisitMappedChunks(source, kChunkBytes, 16,
+                    [&](std::size_t, std::size_t offset, const void* chunk,
+                        std::size_t bytes) {
+                      std::memcpy(static_cast<std::uint8_t*>(copy) + offset,
+                                  chunk, bytes);
+                      return true;
+                    });
+}
+
+/// Device-resident placement: one hipMalloc copy. Device memory is not on the
+/// kernel's page LRU, so memory compaction never migrates it.
+[[nodiscard]] hipError_t AllocateDeviceRegion(
+    const core::GgufMappedRegion& source, QwenGpuWeightRegion& destination) {
+  void* device_data = nullptr;
+  const auto status = hipMalloc(&device_data, source.size);
+  if (status != hipSuccess)
+    return status;
+  destination = {.host_data = source.data,
+                 .device_data = device_data,
+                 .host_copy = nullptr,
+                 .size = source.size,
+                 .owns_device_allocation = true};
+  return hipSuccess;
+}
+
+/// Streams one region from the read-only mapping into device memory. Eight
+/// workers each copy 64 MiB chunks through their own pinned staging buffer,
+/// so a shard in the page cache uploads at memory speed; a hipMemcpy straight
+/// from the pageable mapping pins it page by page.
+[[nodiscard]] hipError_t CopyMappedRegion(const core::GgufMappedRegion& source,
+                                          void* device_data) {
+  constexpr std::size_t kChunkBytes = 64ULL << 20;
+  constexpr std::size_t kWorkers = 8;
+  const auto free_staging = [](void* pointer) { (void)hipHostFree(pointer); };
+  using Staging = std::unique_ptr<void, decltype(free_staging)>;
+  std::vector<Staging> staging;
+  staging.reserve(kWorkers);
+  for (std::size_t i = 0; i < kWorkers; ++i)
+    staging.emplace_back(nullptr, free_staging);
+  std::atomic<hipError_t> failure{hipSuccess};
+  VisitMappedChunks(
+      source, kChunkBytes, kWorkers,
+      [&](std::size_t worker, std::size_t offset, const void* chunk,
+          std::size_t bytes) {
+        auto& buffer = staging[worker];
+        if (!buffer) {
+          void* pointer = nullptr;
+          if (const auto status = hipHostMalloc(&pointer, kChunkBytes);
+              status != hipSuccess) {
+            failure.store(status, std::memory_order_relaxed);
+            return false;
+          }
+          buffer.reset(pointer);
+        }
+        std::memcpy(buffer.get(), chunk, bytes);
+        const auto status =
+            hipMemcpy(static_cast<std::uint8_t*>(device_data) + offset,
+                      buffer.get(), bytes, hipMemcpyHostToDevice);
+        if (status != hipSuccess) {
+          failure.store(status, std::memory_order_relaxed);
+          return false;
+        }
+        return true;
+      });
+  return failure.load();
 }
 
 [[nodiscard]] hipError_t MapRegisteredRegion(
@@ -118,18 +203,32 @@ void CopyMappedWeights(const core::GgufMappedRegion& source, void* copy) {
     auto& destination = weight_regions[i];
     hipError_t map_error;
     try {
-      map_error = MapRegisteredRegion(source, destination);
+      // A registered anonymous copy is on the kernel's page LRU: every
+      // compaction migration makes the driver evict and restore the GPU
+      // mapping, and kernels reading it stall. Prefer device memory while the
+      // heap keeps its dispatch reserve; otherwise keep the registered copy.
+      std::size_t free_bytes = 0;
+      std::size_t total_bytes = 0;
+      if (hipMemGetInfo(&free_bytes, &total_bytes) == hipSuccess &&
+          HeapFitsAboveReserve(free_bytes, source.size) &&
+          AllocateDeviceRegion(source, destination) == hipSuccess) {
+        map_error = CopyMappedRegion(source, destination.device_data);
+      } else {
+        (void)hipGetLastError();
+        destination = {};
+        map_error = MapRegisteredRegion(source, destination);
+      }
     } catch (const std::exception& e) {
       ReleaseWeightRegions(weight_regions);
       if (error_msg)
         *error_msg = e.what();
       return false;
     }
-    if (destination.device_data == nullptr) {
+    if (map_error != hipSuccess || destination.device_data == nullptr) {
       ReleaseWeightRegions(weight_regions);
       if (error_msg != nullptr) {
         *error_msg = "Failed to make GGUF shard " + std::to_string(i) +
-                     " GPU-visible through mapped registration: " +
+                     " GPU-visible: " +
                      hipGetErrorString(map_error);
       }
       return false;
