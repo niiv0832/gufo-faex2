@@ -327,7 +327,10 @@ tokenization::TokenId QwenMtpGpuExecutor::Run(tokenization::TokenId input_token,
   LaunchGEMV(weights.output.data, weights.output.type, d_feedback_hidden_,
              d_logits_, scored, hidden, stream_,
              models::qwen::QwenGemmMode::kHipMtp);
-  LaunchGPUArgmax(d_logits_, d_out_token_, scored, stream_);
+  // The feed-forward output is dead after the residual add: its buffer holds
+  // the per-tile maxima, so the vocabulary is scanned by parallel workgroups.
+  LaunchBatchedGPUArgmax(d_logits_, d_out_token_, 1, scored,
+                         std::span<float>(d_ffn_out_, hidden), stream_);
   tokenization::TokenId result = 0;
   const auto copy_error = hipMemcpyAsync(&result, d_out_token_, sizeof(result),
                                          hipMemcpyDeviceToHost, stream_);

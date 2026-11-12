@@ -1381,12 +1381,12 @@ void LaunchGPUSampling(const float* logits, std::uint32_t* out_token,
         parameters.presence_penalty);
   }
 
-  if (parameters.temperature <= 0.0F) {
-    LaunchGPUArgmax(sampling_logits, out_token, vocab_size, stream);
-    return;
-  }
-  if (parameters.top_k == 1 && parameters.min_keep <= 1) {
-    LaunchGPUArgmax(sampling_logits, out_token, vocab_size, stream);
+  // The sorted row is unused on the greedy paths; it holds the tile maxima.
+  if (parameters.temperature <= 0.0F ||
+      (parameters.top_k == 1 && parameters.min_keep <= 1)) {
+    LaunchBatchedGPUArgmax(
+        sampling_logits, out_token, 1, vocab_size,
+        std::span<float>(workspace->sorted_logits, vocab_size), stream);
     return;
   }
   if (!needs_ordering) {
