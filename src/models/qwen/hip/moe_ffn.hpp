@@ -10,15 +10,19 @@
 
 namespace gufo::hip {
 
-/// Simple, correctness-first GPU Mixture-of-Experts feed-forward for one token.
-///
-/// Router softmax and top-k run on the device; the selected experts execute as
-/// per-expert loops over the existing quantized GEMV and fused SwiGLU kernels.
-/// The routed sum and the gated shared expert are accumulated into `out`. This
-/// is the milestone-1 path; the vectorized MoE kernels replace it later.
-void MoeFfnForwardSingleToken(const models::QwenLayerWeights& layer,
-                              const core::ModelConfig& config, const float* x,
-                              float* out, hipStream_t stream);
+/// Rows the arena's MoE scratch holds: eight sessions each verifying eight
+/// draft tokens.
+inline constexpr std::size_t kMoeFfnScratchRows = 64;
+
+/// MoE feed-forward for `rows` independent rows of `hidden` floats on the
+/// arena's stream, with no host involvement: one router launch, device top-k,
+/// the expert vector kernels in chunks of eight rows, the shared expert and
+/// one combine pass, in pieces of kMoeFfnScratchRows rows. Each row gets the
+/// arithmetic of MoeFfnDecodeToken. Batched verification and prompt chunks too
+/// short for the grouped-expert prefill use it.
+void MoeFfnRows(const models::QwenLayerWeights& layer,
+                const core::ModelConfig& config, QwenGpuArena& arena,
+                const float* x, float* out, std::size_t rows);
 
 /// MoE feed-forward for one token with no host involvement: device top-k, the
 /// quantized expert vector kernels addressed by the device ids, a gated shared

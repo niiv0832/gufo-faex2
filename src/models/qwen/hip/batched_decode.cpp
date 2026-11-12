@@ -11,6 +11,7 @@
 #include "src/models/qwen/hip/detail/attention_policy.hpp"
 #include "src/models/qwen/hip/detail/decode_step.hpp"
 #include "src/models/qwen/hip/executor.hpp"
+#include "src/models/qwen/hip/moe_ffn.hpp"
 #include "src/models/qwen/hip/ops.hpp"
 #include "src/models/qwen/hip/ops/moe.hpp"
 #include "src/models/qwen/hip/ops/moe_vec.hpp"
@@ -110,16 +111,12 @@ void LaunchMoeFfnRows(const models::QwenLayerWeights& layer,
   const int hidden = static_cast<int>(config.hidden_size);
   const std::size_t shared_ff = config.shared_expert_ff;
   hipStream_t stream = arena.stream;
-  // The same GEMV kernel as single-token decode, so a row routes exactly as it
-  // would alone.
-  for (std::size_t row = 0; row < rows; ++row) {
-    const float* row_x = x + (row * hidden);
-    LaunchMoeRouterLogits(layer.ffn_gate_inp.data, layer.ffn_gate_inp.type,
-                          layer.ffn_gate_inp_shexp.data,
-                          layer.ffn_gate_inp_shexp.type, row_x,
-                          s.router_logits + (row * experts),
-                          s.shared_logit + row, experts, hidden, stream);
-  }
+  // The same GEMV kernel as single-token decode, one grid row per input row,
+  // so a row routes exactly as it would alone.
+  LaunchMoeRouterLogits(layer.ffn_gate_inp.data, layer.ffn_gate_inp.type,
+                        layer.ffn_gate_inp_shexp.data,
+                        layer.ffn_gate_inp_shexp.type, x, s.router_logits,
+                        s.shared_logit, experts, hidden, stream, rows);
   LaunchMoeRouterTopK(s.router_logits, s.shared_logit, s.ids, s.weights,
                       s.shared_weight, static_cast<std::uint32_t>(experts),
                       static_cast<std::uint32_t>(used),
@@ -195,6 +192,17 @@ SsmControls LaunchSsmControls(const models::QwenLayerWeights& layer,
 }
 
 }  // namespace
+
+void MoeFfnRows(const models::QwenLayerWeights& layer,
+                const core::ModelConfig& config, QwenGpuArena& arena,
+                const float* x, float* out, std::size_t rows) {
+  const std::size_t hidden = config.hidden_size;
+  for (std::size_t first = 0; first < rows; first += kMoeFfnScratchRows) {
+    const std::size_t count = std::min(kMoeFfnScratchRows, rows - first);
+    LaunchMoeFfnRows(layer, config, arena, x + (first * hidden),
+                     out + (first * hidden), count);
+  }
+}
 
 std::vector<tokenization::TokenId> QwenGpuExecutor::ForwardTokenBatch(
     std::span<const QwenGpuBatchItem> items) {

@@ -13,6 +13,7 @@
 #include "src/core/hip/snapshot_transfer.hpp"
 #include "src/models/qwen/hip/detail/attention_policy.hpp"
 #include "src/models/qwen/hip/executor.hpp"
+#include "src/models/qwen/hip/moe_ffn.hpp"
 #include "src/models/qwen/hip/ops/gemm.hpp"
 #include "src/models/qwen/hip/ops/moe.hpp"
 
@@ -752,8 +753,7 @@ QwenGpuArena::QwenGpuArena(const core::ModelConfig& config,
       const std::size_t used = config_.num_experts_used;
       const std::size_t ff = config_.expert_ff;
       const std::size_t shared_ff = config_.shared_expert_ff;
-      // Room for 64 rows: eight sessions each verifying eight draft tokens.
-      constexpr std::size_t kRows = 64;
+      constexpr std::size_t kRows = kMoeFfnScratchRows;
       const std::size_t total =
           kRows * (experts + 1 + used + used + 1 + (used * ff) +
                    (used * hidden_size) + (3 * shared_ff) + hidden_size) +

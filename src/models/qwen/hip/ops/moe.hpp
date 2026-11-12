@@ -24,12 +24,14 @@ void LaunchMoeRouterTopK(const float* router_logits, const float* shared_logit,
                          hipStream_t stream = nullptr);
 
 /// Router logits of `experts` expert rows and the shared-expert gate in one
-/// launch, bit-identical to a GEMV per tensor.
+/// launch, bit-identical to a GEMV per tensor. With `rows` inputs of `hidden`
+/// floats, row r writes router_logits[r * experts ...] and shared_logit[r].
 void LaunchMoeRouterLogits(const void* router, core::GgmlType router_type,
                            const void* shared, core::GgmlType shared_type,
                            const float* x, float* router_logits,
                            float* shared_logit, std::size_t experts,
-                           std::size_t hidden, hipStream_t stream = nullptr);
+                           std::size_t hidden, hipStream_t stream = nullptr,
+                           std::size_t rows = 1);
 
 /// out[r] = [a[r], b[r]] for rows of `cols` floats.
 void LaunchConcatRows(const float* a, const float* b, float* out,

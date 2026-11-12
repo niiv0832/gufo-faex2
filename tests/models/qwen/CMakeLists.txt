@@ -156,6 +156,15 @@ if (ENGINE_ENABLE_HIP)
   set_tests_properties(qwen_mtp_half_kv_test PROPERTIES
     RUN_SERIAL TRUE TIMEOUT 900)
 
+  # MoE feed-forward for several rows equals the single-token decode path bit
+  # for bit. Skipped without the model.
+  add_qwen_hip_test(qwen_moe_rows_test
+    tests/models/qwen/hip/moe_rows_test.cpp
+    "gpu;hip;qwen;moe;external-model")
+  target_link_libraries(qwen_moe_rows_test PRIVATE gufo_qwen38_flash_next)
+  set_tests_properties(qwen_moe_rows_test PROPERTIES
+    RUN_SERIAL TRUE TIMEOUT 900)
+
   if (GUFO_BUILD_TOOLS)
     add_executable(qwen35moe_gpu_logits_tool
       ${PROJECT_SOURCE_DIR}/tests/models/qwen/hip/qwen35moe_gpu_logits_tool.cpp)

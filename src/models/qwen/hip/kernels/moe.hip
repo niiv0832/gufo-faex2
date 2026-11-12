@@ -245,13 +245,18 @@ __device__ float RouterRowDot(const void* A, core::GgmlType a_type,
   return block_sum;
 }
 
-// One block per expert row plus a last block for the shared-expert gate.
+// One block per expert row plus a last block for the shared-expert gate, for
+// every input row (grid y). A row computes exactly what it would alone.
 __global__ void MoeRouterLogitsKernel(
     const void* __restrict__ router, core::GgmlType router_type,
     const void* __restrict__ shared, core::GgmlType shared_type,
-    const float* __restrict__ x, float* __restrict__ router_logits,
-    float* __restrict__ shared_logit, std::size_t experts, std::size_t K) {
+    const float* __restrict__ rows_x, float* __restrict__ rows_router_logits,
+    float* __restrict__ rows_shared_logit, std::size_t experts, std::size_t K) {
   __shared__ float s_warp_sums[16];
+  const std::size_t row = blockIdx.y;
+  const float* const x = rows_x + (row * K);
+  float* const router_logits = rows_router_logits + (row * experts);
+  float* const shared_logit = rows_shared_logit + row;
   const std::size_t m = blockIdx.x;
   const bool is_shared = m == experts;
   const float sum = RouterRowDot(is_shared ? shared : router,
@@ -328,8 +333,11 @@ void LaunchMoeRouterLogits(const void* router, core::GgmlType router_type,
                            const void* shared, core::GgmlType shared_type,
                            const float* x, float* router_logits,
                            float* shared_logit, std::size_t experts,
-                           std::size_t hidden, hipStream_t stream) {
-  MoeRouterLogitsKernel<<<dim3(experts + 1), 256, 0, stream>>>(
+                           std::size_t hidden, hipStream_t stream,
+                           std::size_t rows) {
+  MoeRouterLogitsKernel<<<dim3(static_cast<unsigned>(experts + 1),
+                               static_cast<unsigned>(rows)),
+                          256, 0, stream>>>(
       router, router_type, shared, shared_type, x, router_logits, shared_logit,
       experts, hidden);
 }
