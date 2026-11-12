@@ -1,5 +1,4 @@
 #if defined(ENGINE_ENABLE_HIP)
-#include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
 #include <cmath>
@@ -11,15 +10,6 @@
 
 namespace gufo::hip {
 
-// block_q8_1 of the matrix library: the scale and the scaled sum of the
-// quants as halves, then 32 quants.
-struct NormQ8Block {
-  __half d;
-  __half sum;
-  std::int8_t qs[32];
-};
-static_assert(sizeof(NormQ8Block) == 36);
-
 /// a += b followed by out = RMSNorm(a), one block per row of `dim` floats;
 /// the sums and their order match ResidualAddKernel followed by the generic
 /// RMSNormKernel (and their batched forms).
@@ -27,8 +17,7 @@ __global__ void ResidualAddRMSNormKernel(float* __restrict__ rows_a,
                                          const float* __restrict__ rows_b,
                                          const float* __restrict__ weight,
                                          float* __restrict__ rows_out,
-                                         std::size_t dim, float eps,
-                                         NormQ8Block* __restrict__ rows_q8) {
+                                         std::size_t dim, float eps) {
   __shared__ float s_val[kStagedNormDim];
   __shared__ float s_sum[256];
   const std::size_t tid = threadIdx.x;
@@ -52,38 +41,7 @@ __global__ void ResidualAddRMSNormKernel(float* __restrict__ rows_a,
   const float inv_rms = StagedRowInvRms(s_val, s_sum, sum_sq, dim, eps, staged);
   for (std::size_t i = tid; i < dim; i += blockDim.x) {
     const float w = (weight != nullptr) ? weight[i] : 1.0F;
-    const float normed = ((staged ? s_val[i] : a[i]) * inv_rms) * w;
-    out[i] = normed;
-    if (rows_q8 != nullptr) {
-      s_val[i] = normed;
-    }
-  }
-  if (rows_q8 == nullptr) {
-    return;
-  }
-  // The row as block_q8_1, each block of 32 values with quantize_q8_1's
-  // expressions: d = max|x| / 127, q = round(x / d), sum = d * sum(q).
-  __syncthreads();
-  NormQ8Block* const q8 = rows_q8 + (blockIdx.x * (dim / 32));
-  for (std::size_t i = tid; i < dim; i += blockDim.x) {
-    const std::size_t base = i & ~std::size_t{31};
-    float amax = 0.0F;
-    for (std::size_t j = 0; j < 32; ++j) {
-      amax = fmaxf(amax, fabsf(s_val[base + j]));
-    }
-    const float d = amax / 127.0f;
-    const auto quant = [amax, d](float value) -> std::int8_t {
-      return amax == 0.0f ? 0 : roundf(value / d);
-    };
-    q8[i / 32].qs[i % 32] = quant(s_val[i]);
-    if (i == base) {
-      int sum = 0;
-      for (std::size_t j = 0; j < 32; ++j) {
-        sum += static_cast<int>(quant(s_val[base + j]));
-      }
-      q8[i / 32].d = __float2half(d);
-      q8[i / 32].sum = __float2half(d * sum);
-    }
+    out[i] = ((staged ? s_val[i] : a[i]) * inv_rms) * w;
   }
 }
 
@@ -190,12 +148,10 @@ void LaunchRMSNorm(const float* x, const float* weight, float* out,
 }
 void LaunchResidualAddRMSNorm(float* a, const float* b, const float* weight,
                               float* out, std::size_t dim, float eps,
-                              hipStream_t stream, std::size_t rows, void* q8) {
+                              hipStream_t stream, std::size_t rows) {
   ResidualAddRMSNormKernel<<<static_cast<unsigned>(rows),
                              StagedNormBlockThreads(dim), 0, stream>>>(
-      a, b, weight, out, dim, eps,
-      ResidualAddRMSNormQuantizes(dim) ? static_cast<NormQ8Block*>(q8)
-                                       : nullptr);
+      a, b, weight, out, dim, eps);
 }
 void LaunchPerHeadRMSNorm(const float* x, const float* weight, float* out,
                           std::uint32_t num_heads, std::uint32_t head_dim,

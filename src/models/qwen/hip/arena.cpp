@@ -16,7 +16,6 @@
 #include "src/models/qwen/hip/moe_ffn.hpp"
 #include "src/models/qwen/hip/ops/gemm.hpp"
 #include "src/models/qwen/hip/ops/moe.hpp"
-#include "src/models/qwen/hip/ops/norm_residual.hpp"
 
 namespace gufo::hip {
 namespace {
@@ -757,8 +756,7 @@ QwenGpuArena::QwenGpuArena(const core::ModelConfig& config,
       constexpr std::size_t kRows = kMoeFfnScratchRows;
       const std::size_t total =
           kRows * (experts + 1 + used + used + 1 + (used * ff) +
-                   (used * hidden_size) + (3 * shared_ff) + hidden_size +
-                   ((Q8_1RowBytes(hidden_size) + 3) / 4)) +
+                   (used * hidden_size) + (3 * shared_ff) + hidden_size) +
           8;
       HIP_CHECK(hipMalloc(&d_moe_buf_, total * sizeof(float)));
       float* cursor = d_moe_buf_;
@@ -778,7 +776,6 @@ QwenGpuArena::QwenGpuArena(const core::ModelConfig& config,
       moe.shared_up = take(kRows * shared_ff);
       moe.shared_act = take(kRows * shared_ff);
       moe.shared_out = take(kRows * hidden_size);
-      moe.x_q8 = take(kRows * ((Q8_1RowBytes(hidden_size) + 3) / 4));
 
       const std::size_t rows = batch;
       const std::size_t sff = shared_ff;

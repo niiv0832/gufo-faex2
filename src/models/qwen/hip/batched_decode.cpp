@@ -100,12 +100,9 @@ void LaunchFfnActivation(const models::QwenLayerWeights& layer,
 // qwen35moe feed-forward for `rows` independent token rows: batched router,
 // device top-k, the expert vector kernels in chunks of eight rows, the shared
 // expert through the exact shared projections, and one combine pass.
-// With `x_quantized`, the arena's MoE scratch already holds the rows of x as
-// block_q8_1 (the norm before the layer wrote them).
 void LaunchMoeFfnRows(const models::QwenLayerWeights& layer,
                       const core::ModelConfig& config, QwenGpuArena& arena,
-                      const float* x, float* out, std::size_t rows,
-                      bool x_quantized = false) {
+                      const float* x, float* out, std::size_t rows) {
   constexpr std::size_t kChunkRows = 8;
   const auto& s = arena.moe;
   const int experts = static_cast<int>(config.num_experts);
@@ -129,19 +126,10 @@ void LaunchMoeFfnRows(const models::QwenLayerWeights& layer,
     const float* chunk_x = x + (first * hidden);
     const std::int32_t* chunk_ids = s.ids + (first * used);
     float* chunk_act = s.act + (first * used * ff);
-    const int gated =
-        x_quantized
-            ? qfn_mmq_moe_gated_vec_preq(
-                  static_cast<int>(layer.ffn_gate_exps.type),
-                  layer.ffn_gate_exps.data, layer.ffn_up_exps.data,
-                  static_cast<const std::uint8_t*>(s.x_q8) +
-                      (first * Q8_1RowBytes(config.hidden_size)),
-                  chunk_ids, chunk_act, ff, hidden, n, experts, used, stream)
-            : qfn_mmq_moe_gated_vec(
-                  static_cast<int>(layer.ffn_gate_exps.type),
-                  layer.ffn_gate_exps.data, layer.ffn_up_exps.data, chunk_x,
-                  chunk_ids, chunk_act, ff, hidden, n, experts, used, stream);
-    if (gated != 0 ||
+    if (qfn_mmq_moe_gated_vec(static_cast<int>(layer.ffn_gate_exps.type),
+                              layer.ffn_gate_exps.data, layer.ffn_up_exps.data,
+                              chunk_x, chunk_ids, chunk_act, ff, hidden, n,
+                              experts, used, stream) != 0 ||
         qfn_mmq_moe_vec(static_cast<int>(layer.ffn_down_exps.type),
                         layer.ffn_down_exps.data, chunk_act, chunk_ids,
                         s.down_out + (first * used * hidden), hidden, ff,
@@ -329,9 +317,6 @@ std::vector<tokenization::TokenId> QwenGpuExecutor::ForwardTokenBatch(
   // Rows at most the MoE scratch holds end each MoE layer in one launch.
   const bool fused_moe_tail =
       config.IsMoe() && hidden_size != 5120 && batch_size <= kMoeFfnScratchRows;
-  // The MoE feed-forward reads its input as block_q8_1: the norm writes it.
-  const bool ffn_input_q8 =
-      fused_moe_tail && ResidualAddRMSNormQuantizes(hidden_size);
   for (std::uint32_t layer_index = 0; layer_index < config.num_layers;
        ++layer_index) {
     const auto& layer = weights.layers[layer_index];
@@ -439,11 +424,11 @@ std::vector<tokenization::TokenId> QwenGpuExecutor::ForwardTokenBatch(
 
     if (fused_moe_tail) {
       // The residual add and the FFN pre-norm in one launch.
-      LaunchResidualAddRMSNorm(
-          scratch.decode.hidden.data(), scratch.attention.output.data(),
-          static_cast<const float*>(layer.ffn_norm.data),
-          scratch.decode.normed.data(), hidden_size, 1e-6F, arena.stream,
-          batch_size, ffn_input_q8 ? arena.moe.x_q8 : nullptr);
+      LaunchResidualAddRMSNorm(scratch.decode.hidden.data(),
+                               scratch.attention.output.data(),
+                               static_cast<const float*>(layer.ffn_norm.data),
+                               scratch.decode.normed.data(), hidden_size, 1e-6F,
+                               arena.stream, batch_size);
     } else {
       LaunchBatchedResidualAdd(
           scratch.decode.hidden.data(), scratch.attention.output.data(),
@@ -458,7 +443,7 @@ std::vector<tokenization::TokenId> QwenGpuExecutor::ForwardTokenBatch(
       // Combine the experts, add the residual and normalize for the next
       // layer, or for the head, in one launch.
       LaunchMoeFfnRows(layer, config, arena, scratch.decode.normed.data(),
-                       nullptr, batch_size, ffn_input_q8);
+                       nullptr, batch_size);
       MoeFfnFinishRows(config, arena.moe, scratch.decode.hidden.data(),
                        static_cast<const float*>(
                            layer_index + 1 < config.num_layers
@@ -680,9 +665,6 @@ QwenGpuExecutor::ForwardVerificationBatch(
   // Rows at most the MoE scratch holds end each MoE layer in one launch.
   const bool fused_moe_tail =
       config.IsMoe() && hidden_size != 5120 && batch_size <= kMoeFfnScratchRows;
-  // The MoE feed-forward reads its input as block_q8_1: the norm writes it.
-  const bool ffn_input_q8 =
-      fused_moe_tail && ResidualAddRMSNormQuantizes(hidden_size);
   for (std::uint32_t layer_index = 0; layer_index < config.num_layers;
        ++layer_index) {
     const auto& layer = weights_.layers[layer_index];
@@ -874,11 +856,11 @@ QwenGpuExecutor::ForwardVerificationBatch(
 
     if (fused_moe_tail) {
       // The residual add and the FFN pre-norm in one launch.
-      LaunchResidualAddRMSNorm(
-          scratch.decode.hidden.data(), scratch.attention.output.data(),
-          static_cast<const float*>(layer.ffn_norm.data),
-          scratch.decode.normed.data(), hidden_size, 1e-6F, arena_.stream,
-          batch_size, ffn_input_q8 ? arena_.moe.x_q8 : nullptr);
+      LaunchResidualAddRMSNorm(scratch.decode.hidden.data(),
+                               scratch.attention.output.data(),
+                               static_cast<const float*>(layer.ffn_norm.data),
+                               scratch.decode.normed.data(), hidden_size, 1e-6F,
+                               arena_.stream, batch_size);
     } else {
       LaunchBatchedResidualAdd(
           scratch.decode.hidden.data(), scratch.attention.output.data(),
@@ -893,7 +875,7 @@ QwenGpuExecutor::ForwardVerificationBatch(
       // Combine the experts, add the residual and normalize for the next
       // layer, or for the head, in one launch.
       LaunchMoeFfnRows(layer, config, arena_, scratch.decode.normed.data(),
-                       nullptr, batch_size, ffn_input_q8);
+                       nullptr, batch_size);
       MoeFfnFinishRows(config, arena_.moe, scratch.decode.hidden.data(),
                        static_cast<const float*>(
                            layer_index + 1 < config.num_layers

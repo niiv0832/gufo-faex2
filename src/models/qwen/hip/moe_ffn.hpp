@@ -35,14 +35,11 @@ void MoeFfnFinishRows(const core::ModelConfig& config,
 /// MoE feed-forward for one token with no host involvement: device top-k, the
 /// quantized expert vector kernels addressed by the device ids, a gated shared
 /// expert and one combine pass. Safe to capture in a HIP graph. A null `out`
-/// leaves the expert outputs in `scratch` for MoeFfnFinishRows. With
-/// `x_quantized`, scratch.x_q8 already holds x as block_q8_1 and the expert
-/// gate/up kernels skip their own quantization pass.
+/// leaves the expert outputs in `scratch` for MoeFfnFinishRows.
 void MoeFfnDecodeToken(const models::QwenLayerWeights& layer,
                        const core::ModelConfig& config,
                        const QwenMoeScratch& scratch, const float* x,
-                       float* out, hipStream_t stream,
-                       bool x_quantized = false);
+                       float* out, hipStream_t stream);
 
 /// Runs every layer's expert kernels once outside graph capture so the matrix
 /// library's workspace pool is sized before the decode graph is captured.

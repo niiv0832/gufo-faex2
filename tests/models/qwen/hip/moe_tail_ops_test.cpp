@@ -1,8 +1,7 @@
 // The fused end of a MoE layer against the launches it replaces, bit for bit:
 // LaunchMoeCombineResidualAddRMSNorm against LaunchMoeCombine, a residual add
-// and an RMSNorm; the row form of LaunchResidualAddRMSNorm against the
-// batched residual add and RMSNorm; and the block_q8_1 rows it writes against
-// the matrix library's quantization of the same rows.
+// and an RMSNorm; and the row form of LaunchResidualAddRMSNorm against the
+// batched residual add and RMSNorm.
 
 #include <cstdint>
 #include <cstdlib>
@@ -15,7 +14,6 @@
 
 #include "src/core/hip/hip_utils.hpp"
 #include "src/models/qwen/hip/ops/moe.hpp"
-#include "src/models/qwen/hip/ops/moe_vec.hpp"
 #include "src/models/qwen/hip/ops/norm_residual.hpp"
 #include "tests/models/qwen/hip/support/device.hpp"
 
@@ -23,7 +21,6 @@ namespace {
 
 constexpr std::uint32_t kUsed = 8;
 constexpr std::size_t kMaxRows = 9;
-std::size_t quantized_checks = 0;
 
 struct Generator {
   std::uint64_t state;
@@ -95,10 +92,6 @@ void TestHidden(std::size_t hidden) {
   float* const combined = Upload(host_hidden);
   float* const normed_a = Upload(host_hidden);
   float* const normed_b = Upload(host_hidden);
-  std::uint8_t* q8_fused = nullptr;
-  std::uint8_t* q8_library = nullptr;
-  HIP_CHECK(hipMalloc(&q8_fused, kMaxRows * hidden * 2));
-  HIP_CHECK(hipMalloc(&q8_library, kMaxRows * hidden * 2));
 
   for (const std::size_t rows :
        {std::size_t{1}, std::size_t{2}, std::size_t{5}, kMaxRows}) {
@@ -147,28 +140,9 @@ void TestHidden(std::size_t hidden) {
                                         hidden);
     gufo::hip::LaunchBatchedRMSNorm(hidden_a, norm, normed_a, nullptr, rows,
                                     hidden);
-    const bool quantizes = gufo::hip::ResidualAddRMSNormQuantizes(hidden);
-    const std::size_t q8_bytes = rows * gufo::hip::Q8_1RowBytes(hidden);
-    HIP_CHECK(hipMemset(q8_fused, 0xAA, kMaxRows * hidden * 2));
-    HIP_CHECK(hipMemset(q8_library, 0x55, kMaxRows * hidden * 2));
     gufo::hip::LaunchResidualAddRMSNorm(hidden_b, attention, norm, normed_b,
-                                        hidden, 1e-6F, nullptr, rows, q8_fused);
+                                        hidden, 1e-6F, nullptr, rows);
     HIP_CHECK(hipDeviceSynchronize());
-    if (quantizes) {
-      Expect(qfn_mmq_quantize_q8_1(normed_b, q8_library, static_cast<int>(rows),
-                                   static_cast<int>(hidden), nullptr) == 0,
-             "the matrix library refused to quantize", hidden, rows);
-      HIP_CHECK(hipDeviceSynchronize());
-      std::vector<std::uint8_t> fused_bytes(q8_bytes), library_bytes(q8_bytes);
-      HIP_CHECK(hipMemcpy(fused_bytes.data(), q8_fused, q8_bytes,
-                          hipMemcpyDeviceToHost));
-      HIP_CHECK(hipMemcpy(library_bytes.data(), q8_library, q8_bytes,
-                          hipMemcpyDeviceToHost));
-      Expect(fused_bytes == library_bytes,
-             "the norm's block_q8_1 rows differ from the matrix library's",
-             hidden, rows);
-      ++quantized_checks;
-    }
     Expect(Same(Download(hidden_a, count), Download(hidden_b, count)) &&
                Same(Download(normed_a, count), Download(normed_b, count)),
            "row residual add and norm differ from the batched launches", hidden,
@@ -183,8 +157,6 @@ void TestHidden(std::size_t hidden) {
         hidden_b, combined, normed_a, normed_b}) {
     HIP_CHECK(hipFree(buffer));
   }
-  HIP_CHECK(hipFree(q8_fused));
-  HIP_CHECK(hipFree(q8_library));
 }
 
 }  // namespace
@@ -202,10 +174,6 @@ int main() {
   for (const std::size_t hidden : {std::size_t{2048}, std::size_t{1536},
                                    std::size_t{1000}, std::size_t{2560}}) {
     TestHidden(hidden);
-  }
-  if (quantized_checks == 0) {
-    std::cerr << "no size exercised the quantized rows\n";
-    return 1;
   }
   std::cout << "Qwen MoE tail ops test passed on gfx1151.\n";
   return 0;

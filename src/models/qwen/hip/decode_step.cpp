@@ -238,15 +238,11 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
                  arena.stream);
     }
 
-    // The MoE feed-forward reads its input as block_q8_1: the norm writes it.
-    const bool ffn_input_q8 =
-        fused_moe_tail && ResidualAddRMSNormQuantizes(hidden_size);
     if (hidden_size != kRowCachedHidden) {
       LaunchResidualAddRMSNorm(
           decode_scratch.hidden.data(), attention_scratch.output.data(),
           static_cast<const float*>(layer.ffn_norm.data),
-          decode_scratch.normed.data(), hidden_size, 1e-6F, arena.stream, 1,
-          ffn_input_q8 ? arena.moe.x_q8 : nullptr);
+          decode_scratch.normed.data(), hidden_size, 1e-6F, arena.stream);
     } else {
       gufo::models::qwen::ResidualAdd(module_ctx, decode_scratch.hidden,
                                       attention_scratch.output);
@@ -265,13 +261,13 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
     const bool fuse_tail = fused_moe_tail && next_norm != nullptr;
     if (fuse_tail) {
       MoeFfnDecodeToken(layer, config, arena.moe, decode_scratch.normed.data(),
-                        nullptr, arena.stream, ffn_input_q8);
+                        nullptr, arena.stream);
       MoeFfnFinishRows(config, arena.moe, decode_scratch.hidden.data(),
                        next_norm, decode_scratch.normed.data(), 1,
                        arena.stream);
     } else if (config.IsMoe()) {
       MoeFfnDecodeToken(layer, config, arena.moe, decode_scratch.normed.data(),
-                        ffn_scratch.out.data(), arena.stream, ffn_input_q8);
+                        ffn_scratch.out.data(), arena.stream);
     } else {
       // Non-fused FFN, routed through the module. Same fused SwiGLU kernel +
       // same down GEMV as the former inline calls; behavior identical. The

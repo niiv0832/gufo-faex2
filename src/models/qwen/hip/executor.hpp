@@ -302,9 +302,6 @@ struct QwenMoeScratch {
   float* shared_up{nullptr};
   float* shared_act{nullptr};
   float* shared_out{nullptr};
-  /// The feed-forward input rows as block_q8_1 when the norm before the
-  /// layer wrote them (ResidualAddRMSNormQuantizes).
-  void* x_q8{nullptr};
 };
 
 /// Device scratch of the batched qwen35moe prefill feed-forward.
