@@ -6,7 +6,9 @@
 // qwen_layered_prefill_test [MODEL.gguf]
 // Without an argument GUFO_QWEN_LAYERED_PREFILL_MODEL names the weights; the
 // test is skipped without it. A model with an embedded MTP head also runs the
-// speculative mode, with one and with two batched decoders.
+// speculative mode, with one and with two batched decoders. One more case
+// lets a further session prefill a short prompt inside a yield, as serving
+// does for a short request that arrives during a pass.
 
 #include <algorithm>
 #include <cstdint>
@@ -311,6 +313,52 @@ bool RunMode(const std::string& mode,
     std::cout << name << ",yields=" << yields
               << ",prompt_items=" << prompt_trace.items.size()
               << ",decoder_items=" << decoder_trace.items.size() << ','
+              << (ok ? "PASS" : "FAIL") << '\n';
+    passed = passed && ok;
+  }
+  // A guest prefills a short prompt in the third yield and decodes in the
+  // following ones; the first decoder keeps stepping.
+  {
+    auto guest = Create(model, mtp);
+    const auto guest_prompt = tokenizer.Encode(Ledger(18));
+    Trace guest_lone;
+    Prefill(guest, guest_prompt, 1, {}, guest_lone);
+    for (std::size_t i = 0; i < steps; ++i)
+      Step(guest, guest_lone);
+    Trace decoder_trace, second_trace, guest_trace, prompt_trace;
+    Prefill(decoder, first, 1, {}, decoder_trace);
+    if (pair)
+      Prefill(second, other, 1, {}, second_trace);
+    std::size_t yields = 0;
+    Prefill(
+        prompt_session, prompt, 8,
+        [&] {
+          ++yields;
+          if (yields == 3)
+            Prefill(guest, guest_prompt, 1, {}, guest_trace);
+          else if (yields > 3)
+            Step(guest, guest_trace);
+          if (pair)
+            StepPair(decoder, second, decoder_trace, second_trace);
+          else
+            Step(decoder, decoder_trace);
+        },
+        prompt_trace);
+    for (std::size_t i = 0; i < kPromptSteps; ++i)
+      Step(prompt_session, prompt_trace);
+    const std::string name = mode + ",8_groups_guest_prefill";
+    bool ok = Same(prompt_trace, lone.prompt, lone.prompt.items.size(),
+                   name + " prompt");
+    ok = Same(decoder_trace, lone.decoder, decoder_trace.items.size(),
+              name + " decoder") &&
+         ok;
+    ok = Same(guest_trace, guest_lone, guest_trace.items.size(),
+              name + " guest") &&
+         ok;
+    ok = guest_trace.items.size() > 8 && ok;
+    std::cout << name << ",yields=" << yields
+              << ",guest_tokens=" << guest_prompt.size()
+              << ",guest_items=" << guest_trace.items.size() << ','
               << (ok ? "PASS" : "FAIL") << '\n';
     passed = passed && ok;
   }

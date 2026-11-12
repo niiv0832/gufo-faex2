@@ -1450,6 +1450,47 @@ void TestLayeredPrefillYieldsBetweenLayerGroups(bool multi_token, bool batched,
          "a prompt without decoders runs unsplit");
 }
 
+// A short prompt that arrives during a layered pass is admitted, prefilled
+// and decoded between that pass's layer groups instead of after it.
+void TestLayeredPrefillAdmitsShortArrivals() {
+  auto control = std::make_shared<FakeControl>();
+  control->block_prefill_label = 2;
+  control->layered_prefill_pass_tokens = 16;
+  control->max_prefill_layer_groups = 16;
+  auto scheduler = MakeScheduler(control, 3, {.decode_active_tokens = 2});
+
+  auto request_a = scheduler->Submit({1}, 40, 0.0F);
+  // Twelve tokens beside a decoder: one pass of six layer groups.
+  auto request_b = scheduler->Submit(
+      {2, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30}, 2, 0.0F);
+  control->WaitForPrefill(2);
+  auto request_c = scheduler->Submit({3, 31}, 3, 0.0F);
+  control->ReleasePrefill();
+
+  const auto result_a = request_a.Wait();
+  const auto result_b = request_b.Wait();
+  const auto result_c = request_c.Wait();
+  Expect(result_a.tokens == ExpectedTokens(1, 40) &&
+             result_b.tokens == ExpectedTokens(2, 2) &&
+             result_c.tokens == ExpectedTokens(3, 3),
+         "an arrival inside a layered pass keeps every trajectory isolated");
+
+  const auto events = control->Events();
+  const std::size_t pass = EventIndex(events, EventKind::kPrefill, 2);
+  const std::size_t last_yield = EventIndex(events, EventKind::kYield, 2, 4);
+  const std::size_t arrival = EventIndex(events, EventKind::kPrefill, 3);
+  const std::size_t first_token = EventIndex(events, EventKind::kAdvance, 3);
+  Expect(last_yield != events.size() &&
+             EventIndex(events, EventKind::kPrefill, 2, 1) == events.size(),
+         "the long prompt runs as one pass of six groups");
+  Expect(pass < arrival && arrival < last_yield,
+         "a short arrival is prefilled between layer groups");
+  Expect(first_token < last_yield,
+         "a short arrival decodes before the pass ends");
+  Expect(result_b.prefill_chunks == 1 && result_b.max_prefill_layer_groups == 6,
+         "the arrival does not split the long prompt's pass");
+}
+
 void TestNonIncrementalRunnerFallsBackSafely() {
   auto control = std::make_shared<FakeControl>();
   control->incremental_prefill = false;
@@ -3126,6 +3167,7 @@ int main() {
       TestLayeredPrefillYieldsBetweenLayerGroups(multi_token, batched, 2);
     }
   }
+  TestLayeredPrefillAdmitsShortArrivals();
   TestNonIncrementalRunnerFallsBackSafely();
   TestPendingLimitsRejectBeforeStateAdmission();
   TestPendingClientsAreRoundRobinAndIndividuallyBounded();

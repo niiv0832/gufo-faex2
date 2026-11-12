@@ -1857,20 +1857,19 @@ struct TextGenerationScheduler::Impl {
     }
   }
 
-  /// Between two layer groups of a prompt pass, the prompt's request is in no
-  /// queue: this round only decodes. Every decoder steps once, as every due
-  /// decoder does between bounded prefill chunks. Nothing is admitted or
-  /// prefilled. A decoder whose capture has finished rejoins the round; a
-  /// prompt's capture waits until the pass ends.
-  void RunYieldRound(
-      std::deque<std::shared_ptr<ScheduledRequest>>& decoding,
-      std::deque<std::shared_ptr<ScheduledRequest>>& capturing) noexcept {
+  /// Between two layer groups of `in_pass`'s prompt pass, which stays in
+  /// `prefilling` so admission still counts it and can share its prefix. The
+  /// round does what the loop does between bounded chunks, except for long
+  /// prompts: it resumes finished captures, admits arrivals, gives one short
+  /// waiting prompt its bounded chunk, and steps every decoder once.
+  void RunYieldRound(const std::shared_ptr<ScheduledRequest>& in_pass,
+                     std::deque<std::shared_ptr<ScheduledRequest>>& prefilling,
+                     std::deque<std::shared_ptr<ScheduledRequest>>& decoding,
+                     std::deque<std::shared_ptr<ScheduledRequest>>& capturing,
+                     std::deque<std::shared_ptr<ScheduledRequest>>& waiting,
+                     const std::stop_token& stop_token) noexcept {
     try {
-      ResumeCaptured(capturing, decoding, nullptr);
-      if (decoding.empty())
-        return;
-      progress.fetch_add(1, std::memory_order_relaxed);
-      ++yield_rounds;
+      const auto start = Clock::now();
       struct AddTime {
         Clock::time_point start;
         double& total;
@@ -1879,13 +1878,48 @@ struct TextGenerationScheduler::Impl {
               std::chrono::duration<double, std::milli>(Clock::now() - start)
                   .count();
         }
-      } add_time{Clock::now(), yield_ms};
-      MarkAllDecodersDue(decoding);
-      while (!decoding.empty() && HasDueDecoder(decoding))
-        RunDecodeUnit(true, decoding, capturing);
+      } add_time{start, yield_ms};
+      ResumeCaptured(capturing, decoding, &prefilling);
+      Admit(prefilling, decoding, capturing, waiting, stop_token);
+      // A prompt one bounded chunk finishes does not wait for the pass.
+      const auto short_peer =
+          std::ranges::find_if(prefilling, [&](const auto& peer) {
+            return peer != in_pass &&
+                   peer->runner_request.prompt_tokens() -
+                           peer->runner_request.prefill_position() <=
+                       prefill_policy.decode_active_tokens;
+          });
+      bool worked = false;
+      if (short_peer != prefilling.end()) {
+        auto peer = std::move(*short_peer);
+        prefilling.erase(short_peer);
+        StepPrefill(peer, true);
+        // Arrivals still take their first turn before this pass's prompt.
+        last_prefill_request_id = in_pass->id;
+        if (!IsTerminal(peer)) {
+          if (peer->runner_request.SnapshotPending()) {
+            capturing.push_back(std::move(peer));
+          } else if (peer->runner_request.prefill_complete()) {
+            decoding.push_back(std::move(peer));
+          } else {
+            prefilling.push_back(std::move(peer));
+          }
+        }
+        worked = true;
+      }
+      if (!decoding.empty()) {
+        MarkAllDecodersDue(decoding);
+        while (!decoding.empty() && HasDueDecoder(decoding))
+          RunDecodeUnit(true, decoding, capturing);
+        worked = true;
+      }
+      if (worked) {
+        progress.fetch_add(1, std::memory_order_relaxed);
+        ++yield_rounds;
+      }
     } catch (...) {
-      // Decode failures complete their own requests; nothing reaches the
-      // prompt's pass.
+      // Failures complete their own requests; nothing reaches the prompt's
+      // pass.
     }
   }
 
@@ -2002,10 +2036,14 @@ struct TextGenerationScheduler::Impl {
                       });
       if (!prefilling.empty() && !decoding.empty() &&
           (!due_decoder || assemble_initial_batch)) {
-        auto request = std::move(prefilling.front());
-        prefilling.pop_front();
-        StepPrefill(request, true, false,
-                    [&] { RunYieldRound(decoding, capturing); });
+        // The request stays queued during its pass: a layered pass admits
+        // arrivals between its layer groups.
+        auto request = prefilling.front();
+        StepPrefill(request, true, false, [&] {
+          RunYieldRound(request, prefilling, decoding, capturing, waiting,
+                        stop_token);
+        });
+        prefilling.erase(std::ranges::find(prefilling, request));
         if (!IsTerminal(request)) {
           if (request->runner_request.SnapshotPending()) {
             capturing.push_back(std::move(request));
