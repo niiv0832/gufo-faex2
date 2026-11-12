@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <limits>
 #include <span>
@@ -656,6 +657,105 @@ void TestFullVocabularyQuantiles() {
   }
 }
 
+// The selected head of the sorted row must equal the full radix sort's head
+// bit for bit: values, token ids and the order of equal values.
+void TestSelectedCandidatesMatchSort() {
+  std::uint64_t state = 0x13198A2E03707344ULL;
+  const auto next = [&state] {
+    state = state * 6364136223846793005ULL + 1442695040888963407ULL;
+    return static_cast<std::uint32_t>(state >> 33);
+  };
+  for (const std::size_t vocab :
+       {std::size_t{16384}, std::size_t{151936}, std::size_t{248320}}) {
+    float* device_logits = nullptr;
+    CheckHip(hipMalloc(&device_logits, vocab * sizeof(float)),
+             "allocate logits");
+    gufo::hip::GpuSamplingWorkspace workspace;
+    gufo::hip::AllocateGpuSamplingWorkspace(&workspace, vocab, 0);
+    for (int round = 0; round < 6; ++round) {
+      std::vector<float> logits(vocab);
+      for (auto& value : logits) {
+        switch (round) {
+          case 0:  // spread values
+            value = (static_cast<float>(next() % 4000001) / 100000.0F) - 20.0F;
+            break;
+          case 1:  // heavy ties around every cut
+            value = static_cast<float>(next() % 7) - 3.0F;
+            break;
+          case 2:  // all equal
+            value = 1.5F;
+            break;
+          case 3:  // signed zeros and a few distinct values
+            value = next() % 3 == 0 ? -0.0F : (next() % 5 == 0 ? 0.25F : 0.0F);
+            break;
+          case 4:  // mostly masked
+            value = next() % 1000 == 0 ? static_cast<float>(next() % 50)
+                                       : -INFINITY;
+            break;
+          default:  // winners packed at the end of the vocabulary
+            value = -5.0F;
+            break;
+        }
+      }
+      if (round == 5) {
+        for (std::size_t i = 0; i < 70; ++i)
+          logits[vocab - 1 - i] = static_cast<float>(i % 9);
+        logits[3] = NAN;
+      }
+      CheckHip(hipMemcpy(device_logits, logits.data(), vocab * sizeof(float),
+                         hipMemcpyHostToDevice),
+               "upload logits");
+      gufo::hip::LaunchGPUSortLogits(device_logits, &workspace);
+      CheckHip(hipDeviceSynchronize(), "sort");
+      std::vector<float> sorted(64);
+      std::vector<std::uint32_t> sorted_ids(64);
+      CheckHip(hipMemcpy(sorted.data(), workspace.sorted_logits,
+                         sorted.size() * sizeof(float), hipMemcpyDeviceToHost),
+               "download sorted logits");
+      CheckHip(hipMemcpy(sorted_ids.data(), workspace.sorted_token_ids,
+                         sorted_ids.size() * sizeof(std::uint32_t),
+                         hipMemcpyDeviceToHost),
+               "download sorted ids");
+      for (const std::int32_t top_k : {2, 20, 40, 64}) {
+        for (const std::size_t min_keep : {std::size_t{0}, std::size_t{33}}) {
+          gufo::hip::GpuSamplingParameters parameters;
+          parameters.temperature = 1.0F;
+          parameters.top_k = top_k;
+          parameters.min_keep = min_keep;
+          const std::size_t picks = std::max<std::size_t>(
+              static_cast<std::size_t>(top_k), std::max<std::size_t>(min_keep, 1));
+          // Poison the head so stale sorted entries cannot pass.
+          CheckHip(hipMemset(workspace.sorted_logits, 0xFF, 64 * sizeof(float)),
+                   "poison logits");
+          CheckHip(hipMemset(workspace.sorted_token_ids, 0xFF,
+                             64 * sizeof(std::uint32_t)),
+                   "poison ids");
+          gufo::hip::LaunchGPUOrderLeadingLogits(device_logits, &workspace,
+                                                 parameters);
+          CheckHip(hipDeviceSynchronize(), "select");
+          std::vector<float> selected(picks);
+          std::vector<std::uint32_t> selected_ids(picks);
+          CheckHip(hipMemcpy(selected.data(), workspace.sorted_logits,
+                             picks * sizeof(float), hipMemcpyDeviceToHost),
+                   "download selected logits");
+          CheckHip(hipMemcpy(selected_ids.data(), workspace.sorted_token_ids,
+                             picks * sizeof(std::uint32_t),
+                             hipMemcpyDeviceToHost),
+                   "download selected ids");
+          Expect(std::equal(selected_ids.begin(), selected_ids.end(),
+                            sorted_ids.begin()),
+                 "selected candidates keep the sorted token ids");
+          Expect(std::memcmp(selected.data(), sorted.data(),
+                             picks * sizeof(float)) == 0,
+                 "selected candidates keep the sorted logits bit for bit");
+        }
+      }
+    }
+    gufo::hip::FreeGpuSamplingWorkspace(&workspace);
+    CheckHip(hipFree(device_logits), "free logits");
+  }
+}
+
 void TestBatchedArgmaxTiles() {
   for (const std::size_t vocab : {4095U, 4096U, 4097U, 248323U}) {
     constexpr std::size_t rows = 8;
@@ -756,6 +856,7 @@ int main() {
   TestSamplingBoundaryValues();
   TestExactNucleusBoundaryAndGreedyTies();
   TestFullVocabularyQuantiles();
+  TestSelectedCandidatesMatchSort();
   TestBatchedArgmaxTiles();
   std::cout << "All Qwen GPU sampling tests passed.\n";
   return 0;

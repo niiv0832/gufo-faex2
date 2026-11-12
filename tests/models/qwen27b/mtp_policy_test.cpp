@@ -1,6 +1,8 @@
 #include "src/models/qwen/mtp_policy.hpp"
 
+#include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <iostream>
 #include <numeric>
@@ -36,6 +38,57 @@ void TestTopKDistribution() {
   Expect(ids.size() == logits.size(), "k never exceeds the scored vocabulary");
 }
 
+// The one-pass selection must return exactly what sorting every id did:
+// the same ids in the same order and bit-identical probabilities, with ties
+// and rows shorter than k.
+void TestTopKMatchesFullSort() {
+  using gufo::speculative::MtpTopKDistribution;
+  using gufo::tokenization::TokenId;
+  std::uint64_t state = 0x243F6A8885A308D3ULL;
+  const auto next = [&state] {
+    state = state * 6364136223846793005ULL + 1442695040888963407ULL;
+    return static_cast<std::uint32_t>(state >> 33);
+  };
+  for (const std::size_t size :
+       {std::size_t{1}, std::size_t{31}, std::size_t{32}, std::size_t{33},
+        std::size_t{5000}, std::size_t{248320}}) {
+    for (int round = 0; round < 4; ++round) {
+      std::vector<float> logits(size);
+      // Coarse values on odd rounds force many exact ties around the cut.
+      for (auto& value : logits)
+        value = round % 2 == 0
+                    ? (static_cast<float>(next() % 2000001) / 50000.0F) - 20.0F
+                    : static_cast<float>(next() % 9) - 4.0F;
+      for (const float temperature : {1.0F, 0.7F}) {
+        std::vector<TokenId> ids, reference_ids(size);
+        std::vector<float> probs, reference_probs;
+        MtpTopKDistribution(logits, temperature, 32, &ids, &probs);
+        std::iota(reference_ids.begin(), reference_ids.end(), TokenId{0});
+        const std::size_t k = std::min<std::size_t>(32, size);
+        std::partial_sort(
+            reference_ids.begin(),
+            reference_ids.begin() + static_cast<std::ptrdiff_t>(k),
+            reference_ids.end(), [&](TokenId a, TokenId b) {
+              return logits[a] > logits[b] || (logits[a] == logits[b] && a < b);
+            });
+        reference_ids.resize(k);
+        const double top = logits[reference_ids[0]];
+        std::vector<double> weights(k);
+        double sum = 0.0;
+        for (std::size_t i = 0; i < k; ++i) {
+          weights[i] = std::exp((logits[reference_ids[i]] - top) / temperature);
+          sum += weights[i];
+        }
+        for (std::size_t i = 0; i < k; ++i)
+          reference_probs.push_back(static_cast<float>(weights[i] / sum));
+        Expect(ids == reference_ids, "one-pass top-k keeps the sorted ids");
+        Expect(probs == reference_probs,
+               "one-pass top-k keeps the sorted probabilities bit for bit");
+      }
+    }
+  }
+}
+
 void TestSampleRow() {
   using gufo::speculative::MtpSampleRow;
   const std::vector<gufo::tokenization::TokenId> ids{7, 8, 9};
@@ -66,6 +119,7 @@ void TestMoeCohortGate() {
 int main() {
   try {
     TestTopKDistribution();
+    TestTopKMatchesFullSort();
     TestSampleRow();
     TestMoeCohortGate();
   } catch (const std::exception& e) {

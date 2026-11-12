@@ -1144,6 +1144,202 @@ void LaunchGPUSortLogits(const float* logits, GpuSamplingWorkspace* workspace,
       static_cast<int>(sizeof(float) * 8U), stream));
 }
 
+// --- Leading candidates without a full sort ---------------------------------
+// With top-k the sorted samplers read only the first max(top_k, min_keep)
+// entries of the sorted row. Two kernels select exactly those entries, in the
+// order the radix sort gives them (descending value, ascending token id among
+// equal bit patterns), instead of sorting the whole vocabulary.
+
+constexpr std::size_t kSelectBlockKeys = 4096;
+constexpr std::size_t kSelectScratchOffset = 2 * kSelectBlockKeys;
+
+// The radix sort's ascending key of a float: order of the values, with the
+// sign bit separating -0 from +0.
+__device__ __forceinline__ std::uint32_t CandidateOrderKey(float value) {
+  const std::uint32_t bits = __float_as_uint(value);
+  return (bits & 0x80000000U) != 0U ? ~bits : (bits | 0x80000000U);
+}
+
+// Picks the largest remaining key of `keys[0, count)` (ties: the smallest
+// `ids` entry, or the lowest slot without ids), clears it and returns its
+// slot through shared memory. A zero key is an empty slot.
+template<bool WithIds>
+__device__ __forceinline__ void PickLargestKey(std::uint32_t* keys,
+                                               const std::uint32_t* ids,
+                                               std::size_t count,
+                                               std::uint32_t* reduce_key,
+                                               std::uint32_t* reduce_slot) {
+  const std::size_t tid = threadIdx.x;
+  std::uint32_t best_key = 0;
+  std::uint32_t best_slot = 0xFFFFFFFFU;
+  for (std::size_t slot = tid; slot < count; slot += kSamplingThreads) {
+    const std::uint32_t key = keys[slot];
+    if (key == 0U)
+      continue;
+    const bool better =
+        key > best_key ||
+        (key == best_key &&
+         (WithIds ? ids[slot] < ids[best_slot] : slot < best_slot));
+    if (best_slot == 0xFFFFFFFFU || better) {
+      best_key = key;
+      best_slot = static_cast<std::uint32_t>(slot);
+    }
+  }
+  reduce_key[tid] = best_key;
+  reduce_slot[tid] = best_slot;
+  __syncthreads();
+  for (std::size_t stride = kSamplingThreads / 2; stride != 0; stride /= 2) {
+    if (tid < stride) {
+      const std::uint32_t other_key = reduce_key[tid + stride];
+      const std::uint32_t other_slot = reduce_slot[tid + stride];
+      const std::uint32_t own_key = reduce_key[tid];
+      const std::uint32_t own_slot = reduce_slot[tid];
+      const bool take =
+          other_slot != 0xFFFFFFFFU &&
+          (own_slot == 0xFFFFFFFFU || other_key > own_key ||
+           (other_key == own_key &&
+            (WithIds ? ids[other_slot] < ids[own_slot]
+                     : other_slot < own_slot)));
+      if (take) {
+        reduce_key[tid] = other_key;
+        reduce_slot[tid] = other_slot;
+      }
+    }
+    __syncthreads();
+  }
+  if (tid == 0 && reduce_slot[0] != 0xFFFFFFFFU)
+    keys[reduce_slot[0]] = 0U;
+  __syncthreads();
+}
+
+// One block per kSelectBlockKeys tokens: its `picks` leading candidates.
+__global__ void SelectBlockCandidatesKernel(
+    const float* __restrict__ logits, std::uint32_t* __restrict__ out_keys,
+    std::uint32_t* __restrict__ out_ids, std::size_t vocab_size,
+    std::uint32_t picks) {
+  __shared__ std::uint32_t keys[kSelectBlockKeys];
+  __shared__ std::uint32_t reduce_key[kSamplingThreads];
+  __shared__ std::uint32_t reduce_slot[kSamplingThreads];
+  const std::size_t tid = threadIdx.x;
+  const std::size_t begin =
+      static_cast<std::size_t>(blockIdx.x) * kSelectBlockKeys;
+  for (std::size_t slot = tid; slot < kSelectBlockKeys;
+       slot += kSamplingThreads) {
+    const std::size_t index = begin + slot;
+    keys[slot] = index < vocab_size ? CandidateOrderKey(logits[index]) : 0U;
+  }
+  __syncthreads();
+  for (std::uint32_t pick = 0; pick < picks; ++pick) {
+    PickLargestKey<false>(keys, nullptr, kSelectBlockKeys, reduce_key,
+                          reduce_slot);
+    if (tid == 0) {
+      const std::size_t out =
+          static_cast<std::size_t>(blockIdx.x) * picks + pick;
+      const std::uint32_t slot = reduce_slot[0];
+      out_keys[out] = slot != 0xFFFFFFFFU ? reduce_key[0] : 0U;
+      out_ids[out] = slot != 0xFFFFFFFFU
+                         ? static_cast<std::uint32_t>(begin + slot)
+                         : 0xFFFFFFFFU;
+    }
+    __syncthreads();
+  }
+}
+
+// The `picks` leading candidates of all blocks, as the head of the sorted row.
+__global__ void MergeBlockCandidatesKernel(
+    const float* __restrict__ logits, const std::uint32_t* __restrict__ in_keys,
+    const std::uint32_t* __restrict__ in_ids,
+    float* __restrict__ sorted_logits,
+    std::uint32_t* __restrict__ sorted_token_ids, std::uint32_t candidates,
+    std::uint32_t picks) {
+  __shared__ std::uint32_t keys[kSelectBlockKeys];
+  __shared__ std::uint32_t ids[kSelectBlockKeys];
+  __shared__ std::uint32_t reduce_key[kSamplingThreads];
+  __shared__ std::uint32_t reduce_slot[kSamplingThreads];
+  const std::size_t tid = threadIdx.x;
+  for (std::size_t slot = tid; slot < candidates; slot += kSamplingThreads) {
+    keys[slot] = in_keys[slot];
+    ids[slot] = in_ids[slot];
+  }
+  __syncthreads();
+  for (std::uint32_t pick = 0; pick < picks; ++pick) {
+    PickLargestKey<true>(keys, ids, candidates, reduce_key, reduce_slot);
+    if (tid == 0 && reduce_slot[0] != 0xFFFFFFFFU) {
+      const std::uint32_t id = ids[reduce_slot[0]];
+      sorted_token_ids[pick] = id;
+      sorted_logits[pick] = logits[id];
+    }
+    __syncthreads();
+  }
+}
+
+namespace {
+
+// Entries of the sorted row the ordered samplers read, or zero when they may
+// read all of it.
+std::size_t LeadingCandidateCount(std::size_t vocab_size,
+                                  const GpuSamplingParameters& parameters) {
+  if (parameters.top_k <= 0)
+    return 0;
+  const std::size_t minimum =
+      std::min(vocab_size, std::max(parameters.min_keep, std::size_t{1}));
+  return std::min(
+      vocab_size,
+      std::max(static_cast<std::size_t>(parameters.top_k), minimum));
+}
+
+// Fills the head of workspace.sorted_logits/sorted_token_ids that the ordered
+// samplers read from workspace.adjusted_logits.
+void LaunchOrderCandidates(GpuSamplingWorkspace* workspace,
+                           std::size_t vocab_size,
+                           const GpuSamplingParameters& parameters,
+                           hipStream_t stream) {
+  const std::size_t picks = LeadingCandidateCount(vocab_size, parameters);
+  const std::size_t blocks =
+      (vocab_size + kSelectBlockKeys - 1U) / kSelectBlockKeys;
+  // The block candidates live past the head of the sorted ids, which only
+  // the full sort writes.
+  if (picks != 0 && picks <= kMaxSelectedSamplingCandidates &&
+      blocks * picks <= kSelectBlockKeys &&
+      vocab_size >= kSelectScratchOffset + 2 * kSelectBlockKeys) {
+    std::uint32_t* const keys =
+        workspace->sorted_token_ids + kSelectScratchOffset;
+    std::uint32_t* const ids = keys + kSelectBlockKeys;
+    SelectBlockCandidatesKernel<<<static_cast<unsigned>(blocks),
+                                  kSamplingThreads, 0, stream>>>(
+        workspace->adjusted_logits, keys, ids, vocab_size,
+        static_cast<std::uint32_t>(picks));
+    MergeBlockCandidatesKernel<<<1, kSamplingThreads, 0, stream>>>(
+        workspace->adjusted_logits, keys, ids, workspace->sorted_logits,
+        workspace->sorted_token_ids,
+        static_cast<std::uint32_t>(blocks * picks),
+        static_cast<std::uint32_t>(picks));
+    return;
+  }
+  HIP_CHECK(hipcub::DeviceRadixSort::SortPairsDescending(
+      workspace->sort_temp_storage, workspace->sort_temp_storage_bytes,
+      workspace->adjusted_logits, workspace->sorted_logits,
+      workspace->token_ids, workspace->sorted_token_ids, vocab_size, 0,
+      static_cast<int>(sizeof(float) * 8U), stream));
+}
+
+}  // namespace
+
+void LaunchGPUOrderLeadingLogits(const float* logits,
+                                 GpuSamplingWorkspace* workspace,
+                                 const GpuSamplingParameters& parameters,
+                                 hipStream_t stream) {
+  if (logits == nullptr || workspace == nullptr || workspace->vocab_size == 0) {
+    throw std::invalid_argument("invalid GPU candidate selection");
+  }
+  const auto size = workspace->vocab_size;
+  PrepareSamplingKernel<<<
+      static_cast<unsigned>((size + kSamplingThreads - 1) / kSamplingThreads),
+      kSamplingThreads, 0, stream>>>(logits, workspace->adjusted_logits,
+                                     workspace->token_ids, size);
+  LaunchOrderCandidates(workspace, size, parameters, stream);
+}
+
 void LaunchGPUSampling(const float* logits, std::uint32_t* out_token,
                        std::size_t vocab_size,
                        const GpuSamplingParameters& parameters,
@@ -1200,11 +1396,7 @@ void LaunchGPUSampling(const float* logits, std::uint32_t* out_token,
     return;
   }
 
-  HIP_CHECK(hipcub::DeviceRadixSort::SortPairsDescending(
-      workspace->sort_temp_storage, workspace->sort_temp_storage_bytes,
-      workspace->adjusted_logits, workspace->sorted_logits,
-      workspace->token_ids, workspace->sorted_token_ids, vocab_size, 0,
-      static_cast<int>(sizeof(float) * 8U), stream));
+  LaunchOrderCandidates(workspace, vocab_size, parameters, stream);
   SortedSamplingKernel<<<1, kSamplingThreads, 0, stream>>>(
       workspace->sorted_logits, workspace->sorted_token_ids, out_token,
       vocab_size, parameters.temperature, parameters.top_k, parameters.top_p,
@@ -1274,11 +1466,7 @@ void LaunchGPUSpeculativeSampling(
   }
 
   if (needs_ordering) {
-    HIP_CHECK(hipcub::DeviceRadixSort::SortPairsDescending(
-        workspace->sort_temp_storage, workspace->sort_temp_storage_bytes,
-        workspace->adjusted_logits, workspace->sorted_logits,
-        workspace->token_ids, workspace->sorted_token_ids, vocab_size, 0,
-        static_cast<int>(sizeof(float) * 8U), stream));
+    LaunchOrderCandidates(workspace, vocab_size, parameters, stream);
   }
   // The unsorted token IDs are dead after sorting. Reuse that buffer for q;
   // residual evaluation then makes one lookup per vocabulary token.

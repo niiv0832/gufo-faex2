@@ -72,6 +72,19 @@ void FreeGpuSamplingWorkspace(GpuSamplingWorkspace* workspace) noexcept;
 void LaunchGPUSortLogits(const float* logits, GpuSamplingWorkspace* workspace,
                          hipStream_t stream = nullptr);
 
+/// Most leading entries the ordered samplers select without sorting the row.
+inline constexpr std::size_t kMaxSelectedSamplingCandidates = 64;
+
+/// Fills the entries of workspace.sorted_logits/sorted_token_ids that
+/// sampling with `parameters` reads: with top-k, its leading
+/// max(top_k, min_keep) entries, bit-identical to LaunchGPUSortLogits and
+/// selected without a sort when they are at most
+/// kMaxSelectedSamplingCandidates; the whole sorted row otherwise.
+void LaunchGPUOrderLeadingLogits(const float* logits,
+                                 GpuSamplingWorkspace* workspace,
+                                 const GpuSamplingParameters& parameters,
+                                 hipStream_t stream = nullptr);
+
 /// Samples one device-resident logit row and writes a single device token.
 ///
 /// No finite target value yields kInvalidSampleToken; the host must reject it.

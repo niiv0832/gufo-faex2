@@ -24,22 +24,35 @@ inline void MtpTopKDistribution(std::span<const float> logits,
                                 std::vector<tokenization::TokenId>* ids,
                                 std::vector<float>* probs) {
   k = std::min(k, logits.size());
-  ids->resize(logits.size());
-  std::iota(ids->begin(), ids->end(), tokenization::TokenId{0});
-  const auto by_logit = [&](tokenization::TokenId a, tokenization::TokenId b) {
-    return logits[a] > logits[b] || (logits[a] == logits[b] && a < b);
-  };
-  std::partial_sort(ids->begin(), ids->begin() + static_cast<std::ptrdiff_t>(k),
-                    ids->end(), by_logit);
+  // One pass with the k best so far, kept in descending order (ties: the
+  // lower id first). Almost every logit fails the single comparison against
+  // the current k-th value, so a row of the full vocabulary costs one scan
+  // rather than a sort of its ids. Equal logits keep the earlier id, as ids
+  // are visited in ascending order.
   ids->resize(k);
+  std::vector<float>& best = *probs;
+  best.resize(k);
+  std::size_t kept = 0;
+  for (std::size_t id = 0; id < logits.size() && k != 0; ++id) {
+    const float value = logits[id];
+    if (kept == k && !(value > best[k - 1]))
+      continue;
+    std::size_t slot = kept < k ? kept++ : k - 1;
+    for (; slot != 0 && value > best[slot - 1]; --slot) {
+      best[slot] = best[slot - 1];
+      (*ids)[slot] = (*ids)[slot - 1];
+    }
+    best[slot] = value;
+    (*ids)[slot] = static_cast<tokenization::TokenId>(id);
+  }
   probs->resize(k);
   if (k == 0)
     return;
-  const double top = logits[(*ids)[0]];
+  const double top = best[0];
   std::vector<double> weights(k);
   double sum = 0.0;
   for (std::size_t i = 0; i < k; ++i) {
-    weights[i] = std::exp((logits[(*ids)[i]] - top) / temperature);
+    weights[i] = std::exp((best[i] - top) / temperature);
     sum += weights[i];
   }
   for (std::size_t i = 0; i < k; ++i)
