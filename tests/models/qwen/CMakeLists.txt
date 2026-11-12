@@ -147,6 +147,15 @@ if (ENGINE_ENABLE_HIP)
   set_tests_properties(qwen_layered_prefill_test PROPERTIES
     RUN_SERIAL TRUE TIMEOUT 1800)
 
+  # MTP head with an FP16-only K/V cache: a restored snapshot reproduces the
+  # draft logits bit for bit. Skipped without the model.
+  add_qwen_hip_test(qwen_mtp_half_kv_test
+    tests/models/qwen/hip/mtp_half_kv_test.cpp
+    "gpu;hip;qwen;mtp;external-model")
+  target_link_libraries(qwen_mtp_half_kv_test PRIVATE gufo_qwen38_flash_next)
+  set_tests_properties(qwen_mtp_half_kv_test PROPERTIES
+    RUN_SERIAL TRUE TIMEOUT 900)
+
   if (GUFO_BUILD_TOOLS)
     add_executable(qwen35moe_gpu_logits_tool
       ${PROJECT_SOURCE_DIR}/tests/models/qwen/hip/qwen35moe_gpu_logits_tool.cpp)

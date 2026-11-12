@@ -128,7 +128,8 @@ void QwenMtpGpuExecutor::Allocate() {
   AllocateBuffer(d_ffn_out_, hidden);
   AllocateBuffer(d_feedback_hidden_, hidden);
   AllocateBuffer(d_logits_, config.vocab_size);
-  AllocateBuffer(d_kv_cache_, 2 * total_kv);
+  if (!KeepsHalfKvOnly(config))
+    AllocateBuffer(d_kv_cache_, 2 * total_kv);
   d_kv_cache_f16_ =
       detail::AllocateDevice(2 * total_kv * sizeof(std::uint16_t));
   AllocateBuffer(d_split_k_scratch_,
@@ -259,7 +260,8 @@ tokenization::TokenId QwenMtpGpuExecutor::Run(tokenization::TokenId input_token,
              config.head_dim, config.rotary_dim, position, config.rope_theta,
              stream_, vision_input_ ? vision_input_->rope() : nullptr);
   LaunchAttention(
-      d_q_, d_k_, d_v_, d_gate_, d_kv_cache_, d_kv_cache_ + total_kv,
+      d_q_, d_k_, d_v_, d_gate_, d_kv_cache_,
+      d_kv_cache_ != nullptr ? d_kv_cache_ + total_kv : nullptr,
       d_kv_cache_f16_, static_cast<std::uint16_t*>(d_kv_cache_f16_) + total_kv,
       d_context_, 0, position, max_context_, config.num_attention_heads,
       config.num_key_value_heads, config.head_dim, stream_, d_split_k_scratch_);
@@ -400,7 +402,8 @@ void QwenMtpGpuExecutor::PrimeBatch(
     LaunchBatchedFusedQKNormRoPEKvWrite(
         q, k, v, static_cast<const float*>(layer.attn_q_norm.data),
         static_cast<const float*>(layer.attn_k_norm.data), q_out, k_out,
-        d_kv_cache_, d_kv_cache_ + total_kv, d_kv_cache_f16_,
+        d_kv_cache_, d_kv_cache_ != nullptr ? d_kv_cache_ + total_kv : nullptr,
+        d_kv_cache_f16_,
         static_cast<std::uint16_t*>(d_kv_cache_f16_) + total_kv, 0, position, n,
         max_context_, config.num_attention_heads, config.num_key_value_heads,
         config.head_dim, config.rotary_dim, config.rope_theta, 1.0e-6F, stream_,
@@ -411,10 +414,17 @@ void QwenMtpGpuExecutor::PrimeBatch(
 }
 
 std::size_t QwenMtpGpuExecutor::StateBytes() const noexcept {
-  const auto& config = model_->GetConfig();
-  return sizeof(std::uint32_t) +
-         static_cast<std::size_t>(next_position_) * config.num_key_value_heads *
-             config.head_dim * 2 * (sizeof(float) + sizeof(std::uint16_t));
+  return StateBytesAt(model_->GetConfig(), next_position_);
+}
+
+std::size_t QwenMtpGpuExecutor::StateBytesAt(const core::ModelConfig& config,
+                                             std::uint32_t position) noexcept {
+  const std::size_t value_bytes = KeepsHalfKvOnly(config)
+                                      ? sizeof(std::uint16_t)
+                                      : sizeof(float) + sizeof(std::uint16_t);
+  return sizeof(std::uint32_t) + static_cast<std::size_t>(position) *
+                                     config.num_key_value_heads *
+                                     config.head_dim * 2 * value_bytes;
 }
 
 void QwenMtpGpuExecutor::SaveState(std::span<std::uint8_t> destination) const {
@@ -431,6 +441,20 @@ void QwenMtpGpuExecutor::SaveState(std::span<std::uint8_t> destination) const {
   std::memcpy(out, &next_position_, sizeof(next_position_));
   out += sizeof(next_position_);
   HIP_CHECK(hipStreamSynchronize(stream_));
+  if (d_kv_cache_ == nullptr) {
+    // The FP16 cache is token-major: the valid prefix of each plane is one
+    // contiguous run of positions.
+    const std::size_t plane_values = config.num_key_value_heads * head_values;
+    for (std::size_t plane = 0; plane < 2; ++plane) {
+      HIP_CHECK(hipMemcpy(out,
+                          static_cast<const std::uint16_t*>(d_kv_cache_f16_) +
+                              (plane * total_kv),
+                          plane_values * sizeof(std::uint16_t),
+                          hipMemcpyDeviceToHost));
+      out += plane_values * sizeof(std::uint16_t);
+    }
+    return;
+  }
   for (std::size_t plane = 0; plane < 2; ++plane) {
     for (std::size_t head = 0; head < config.num_key_value_heads; ++head) {
       const std::size_t offset = (plane * total_kv) + (head * head_stride);
@@ -457,10 +481,7 @@ void QwenMtpGpuExecutor::LoadState(std::span<const std::uint8_t> source) {
   std::uint32_t position = 0;
   std::memcpy(&position, source.data(), sizeof(position));
   const auto& config = model_->GetConfig();
-  const std::size_t expected =
-      sizeof(std::uint32_t) + static_cast<std::size_t>(position) *
-                                  config.num_key_value_heads * config.head_dim *
-                                  2 * (sizeof(float) + sizeof(std::uint16_t));
+  const std::size_t expected = StateBytesAt(config, position);
   if (position > max_context_ || source.size() != expected) {
     throw std::invalid_argument("MTP state payload does not match the cache");
   }
@@ -471,6 +492,17 @@ void QwenMtpGpuExecutor::LoadState(std::span<const std::uint8_t> source) {
   const std::size_t total_kv = config.num_key_value_heads * head_stride;
   const std::uint8_t* in = source.data() + sizeof(position);
   HIP_CHECK(hipStreamSynchronize(stream_));
+  if (d_kv_cache_ == nullptr) {
+    const std::size_t plane_values = config.num_key_value_heads * head_values;
+    for (std::size_t plane = 0; plane < 2; ++plane) {
+      HIP_CHECK(hipMemcpy(
+          static_cast<std::uint16_t*>(d_kv_cache_f16_) + (plane * total_kv), in,
+          plane_values * sizeof(std::uint16_t), hipMemcpyHostToDevice));
+      in += plane_values * sizeof(std::uint16_t);
+    }
+    next_position_ = position;
+    return;
+  }
   for (std::size_t plane = 0; plane < 2; ++plane) {
     for (std::size_t head = 0; head < config.num_key_value_heads; ++head) {
       const std::size_t offset = (plane * total_kv) + (head * head_stride);
@@ -504,7 +536,9 @@ QwenGpuMemoryUsage QwenMtpGpuExecutor::EstimateMemoryUsage(
            (2 * attention)) +
       config.vocab_size + (32 * hidden);
   return {.request_state_bytes =
-              kv_values * (sizeof(float) + sizeof(std::uint16_t)),
+              kv_values * (KeepsHalfKvOnly(config)
+                               ? sizeof(std::uint16_t)
+                               : sizeof(float) + sizeof(std::uint16_t)),
           .temporary_scratch_bytes =
               (scratch_floats * sizeof(float)) +
               (kPrimeChunk * 2 * hidden * sizeof(std::uint16_t))};

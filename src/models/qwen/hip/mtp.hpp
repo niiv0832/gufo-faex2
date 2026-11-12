@@ -100,8 +100,11 @@ public:
                   std::span<const float> hidden, std::uint32_t start_position);
 
   /// Serialized cache state for snapshots: positions, then the K/V planes of
-  /// the valid prefix in both precisions.
+  /// the valid prefix: both precisions, or FP16 alone when that is the only
+  /// cache this head keeps (KeepsHalfKvOnly).
   [[nodiscard]] std::size_t StateBytes() const noexcept;
+  [[nodiscard]] static std::size_t StateBytesAt(
+      const core::ModelConfig& config, std::uint32_t position) noexcept;
   void SaveState(std::span<std::uint8_t> destination) const;
   void LoadState(std::span<const std::uint8_t> source);
   [[nodiscard]] QwenGpuMemoryUsage GetMemoryUsage() const noexcept;
@@ -128,6 +131,14 @@ public:
   }
   [[nodiscard]] bool IsMoe() const noexcept {
     return model_->GetConfig().IsMoe();
+  }
+  /// Eight query heads per KV head (Qwen3.6-35B-A3B): the head keeps its K/V
+  /// in FP16 alone, as the target does, and its attention stages each KV tile
+  /// once for the whole head group instead of once per query head from FP32.
+  [[nodiscard]] static bool KeepsHalfKvOnly(
+      const core::ModelConfig& config) noexcept {
+    return config.num_key_value_heads != 0 &&
+           config.num_attention_heads == 8 * config.num_key_value_heads;
   }
 
 private:
