@@ -156,6 +156,15 @@ if (ENGINE_ENABLE_HIP)
   set_tests_properties(qwen_mtp_half_kv_test PROPERTIES
     RUN_SERIAL TRUE TIMEOUT 900)
 
+  # The MTP draft vocabulary: its logits equal the whole LM head's bit for
+  # bit. Skipped without the model.
+  add_qwen_hip_test(qwen_mtp_draft_vocab_test
+    tests/models/qwen/hip/mtp_draft_vocab_test.cpp
+    "gpu;hip;qwen;mtp;external-model")
+  target_link_libraries(qwen_mtp_draft_vocab_test PRIVATE gufo_qwen38_flash_next)
+  set_tests_properties(qwen_mtp_draft_vocab_test PROPERTIES
+    RUN_SERIAL TRUE TIMEOUT 900)
+
   # The fused end of a MoE layer equals the launches it replaces bit for bit.
   add_qwen_hip_test(qwen_moe_tail_ops_test
     tests/models/qwen/hip/moe_tail_ops_test.cpp

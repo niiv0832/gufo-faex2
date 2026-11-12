@@ -1,9 +1,9 @@
 #if defined(ENGINE_ENABLE_HIP)
 #include <algorithm>
 #include <cmath>
-#include <cstdlib>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -12,6 +12,7 @@
 
 #include "src/core/sampling.hpp"
 #include "src/models/qwen/hip/mtp.hpp"
+#include "src/models/qwen/mtp_draft_vocab.hpp"
 #include "src/models/qwen/mtp_policy.hpp"
 
 namespace gufo::hip {
@@ -194,6 +195,13 @@ speculative::DraftProposal QwenMtpGpuDraftBackend::ProposeImpl(
   proposed_tokens_.clear();
   proposed_tokens_.reserve(count);
 
+  // A text in a script the draft vocabulary lacks is drafted from the whole
+  // vocabulary; the choice holds for every row of this proposal.
+  const auto& draft_vocab = executor_->GetDraftVocab();
+  executor_->ScoreWholeVocabulary(!draft_vocab.ids.empty() &&
+                                  speculative::MtpDraftNeedsWholeVocabulary(
+                                      prompt_tokens, draft_vocab.listed));
+
   const bool sampled = temperature > 0.0F;
   std::vector<tokenization::TokenId> row_ids;
   std::vector<float> row_probs;
@@ -209,11 +217,13 @@ speculative::DraftProposal QwenMtpGpuDraftBackend::ProposeImpl(
   const auto choose = [&](tokenization::TokenId argmax) {
     if (!sampled)
       return argmax;
-    const auto logits =
-        executor_->CopyLastLogits().first(executor_->ScoredVocab());
+    const auto logits = executor_->CopyLastLogits();
     speculative::MtpTopKDistribution(logits, temperature,
                                      proposal.candidates_per_token, &row_ids,
                                      &row_probs);
+    for (auto& id : row_ids) {
+      id = executor_->ScoredTokenId(static_cast<std::size_t>(id));
+    }
     proposal.candidate_ids.insert(proposal.candidate_ids.end(),
                                   row_ids.begin(), row_ids.end());
     proposal.candidate_probabilities.insert(

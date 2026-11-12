@@ -12,6 +12,7 @@
 #include "src/core/quant/ggml_dequant.hpp"
 #include "src/models/qwen/hip/mtp.hpp"
 #include "src/models/qwen/hip/mtp/detail/allocation.hpp"
+#include "src/models/qwen/mtp_draft_vocab.hpp"
 
 namespace gufo::hip {
 namespace {
@@ -208,6 +209,59 @@ QwenMtpGpuModel::~QwenMtpGpuModel() {
   ReleaseAllocations(allocations_);
 }
 
+void QwenMtpGpuModel::GatherDraftVocab() {
+  const auto& config = weights_.config;
+  const auto& output = weights_.output;
+  const std::size_t hidden = config.hidden_size;
+  const std::size_t row_bytes = quant::QuantizedRowBytes(output.type, hidden);
+  if (row_bytes == 0) {
+    return;  // rows of this type are not separable
+  }
+  const auto& tokenizer = target_model_->GetTokenizer();
+  std::vector<tokenization::TokenId> ids;
+  for (std::size_t id = 0; id < config.vocab_size; ++id) {
+    const auto token = static_cast<tokenization::TokenId>(id);
+    if (speculative::MtpDraftScoresToken(tokenizer.DecodeToken(token))) {
+      ids.push_back(token);
+    }
+  }
+  if (ids.empty() || ids.size() == config.vocab_size) {
+    return;
+  }
+  const std::size_t bytes = ids.size() * row_bytes;
+  auto* const device =
+      static_cast<std::uint8_t*>(detail::AllocateDevice(bytes));
+  allocations_.push_back(device);
+  const auto* const source = static_cast<const std::uint8_t*>(output.data);
+  // Runs of consecutive ids move in one copy each.
+  for (std::size_t begin = 0; begin < ids.size();) {
+    std::size_t end = begin + 1;
+    while (end < ids.size() && ids[end] == ids[end - 1] + 1) {
+      ++end;
+    }
+    const auto error =
+        hipMemcpy(device + (begin * row_bytes),
+                  source + (static_cast<std::size_t>(ids[begin]) * row_bytes),
+                  (end - begin) * row_bytes, hipMemcpyDeviceToDevice);
+    if (error != hipSuccess) {
+      throw std::runtime_error(std::string("MTP draft vocabulary copy: ") +
+                               hipGetErrorString(error));
+    }
+    begin = end;
+  }
+  packed_weight_bytes_ += bytes;
+  draft_vocab_.output = {
+      .data = device,
+      .type = output.type,
+      .num_elements = ids.size() * hidden,
+  };
+  draft_vocab_.listed.assign(config.vocab_size, false);
+  for (const tokenization::TokenId id : ids) {
+    draft_vocab_.listed[static_cast<std::size_t>(id)] = true;
+  }
+  draft_vocab_.ids = std::move(ids);
+}
+
 std::shared_ptr<const QwenMtpGpuModel> QwenMtpGpuModel::Create(
     std::shared_ptr<const core::GgufReader> mtp_reader,
     std::shared_ptr<const QwenGpuModel> target_model, std::string* error_msg) {
@@ -274,8 +328,20 @@ std::shared_ptr<const QwenMtpGpuModel> QwenMtpGpuModel::CreateEmbedded(
   weights.fusion_projection = mtp.fusion_projection;
   weights.shared_head_norm = mtp.shared_head_norm;
   weights.layer = mtp.layer;
-  return std::shared_ptr<const QwenMtpGpuModel>(new QwenMtpGpuModel(
+  const bool is_moe = weights.config.IsMoe();
+  std::shared_ptr<QwenMtpGpuModel> model(new QwenMtpGpuModel(
       nullptr, std::move(target_model), std::move(weights), {}, 0, 0.0));
+  if (is_moe) {
+    try {
+      model->GatherDraftVocab();
+    } catch (const std::exception& exception) {
+      if (error_msg != nullptr) {
+        *error_msg = exception.what();
+      }
+      return nullptr;
+    }
+  }
+  return model;
 }
 
 }  // namespace gufo::hip

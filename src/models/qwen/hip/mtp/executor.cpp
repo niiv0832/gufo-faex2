@@ -324,9 +324,11 @@ tokenization::TokenId QwenMtpGpuExecutor::Run(tokenization::TokenId input_token,
     return 0;
   }
   const std::size_t scored = ScoredVocab();
-  LaunchGEMV(weights.output.data, weights.output.type, d_feedback_hidden_,
-             d_logits_, scored, hidden, stream_,
-             models::qwen::QwenGemmMode::kHipMtp);
+  const auto& head = scored == config.vocab_size
+                         ? weights.output
+                         : model_->GetDraftVocab().output;
+  LaunchGEMV(head.data, head.type, d_feedback_hidden_, d_logits_, scored,
+             hidden, stream_, models::qwen::QwenGemmMode::kHipMtp);
   // The feed-forward output is dead after the residual add: its buffer holds
   // the per-tile maxima, so the vocabulary is scanned by parallel workgroups.
   LaunchBatchedGPUArgmax(d_logits_, d_out_token_, 1, scored,
@@ -337,7 +339,7 @@ tokenization::TokenId QwenMtpGpuExecutor::Run(tokenization::TokenId input_token,
   if (copy_error != hipSuccess || hipStreamSynchronize(stream_) != hipSuccess) {
     throw std::runtime_error("MTP GPU result synchronization failed");
   }
-  return CheckedSampleToken(result, config.vocab_size);
+  return ScoredTokenId(CheckedSampleToken(result, scored));
 }
 
 void QwenMtpGpuExecutor::EnsurePrimeScratch() {
@@ -593,31 +595,29 @@ std::span<const float> QwenMtpGpuExecutor::CopyLastHidden() {
 }
 
 std::size_t QwenMtpGpuExecutor::ScoredVocab() const noexcept {
-  // Scoring only the most frequent token ids (the BPE vocabulary is ordered by
-  // merge rank) reads a fraction of the output matrix, but it drops most
-  // non-Latin tokens: on Russian prose Qwen3.6-35B-A3B accepted 36% of MTP
-  // drafts with 65536 ids and 70% with all of them (gfx1151, 2026-11-09).
-  // GUFO_MTP_VOCAB=N restores the truncation for MoE targets; 0 or unset
-  // scores the whole vocabulary.
-  static const std::size_t kDraftVocab = [] {
-    const char* v = std::getenv("GUFO_MTP_VOCAB");
-    return v != nullptr ? static_cast<std::size_t>(std::atoll(v))
-                        : std::size_t{0};
-  }();
-  const auto& config = model_->GetConfig();
-  return (kDraftVocab == 0 || !config.IsMoe())
-             ? static_cast<std::size_t>(config.vocab_size)
-             : std::min<std::size_t>(kDraftVocab, config.vocab_size);
+  const auto& ids = model_->GetDraftVocab().ids;
+  return (whole_vocab_ || ids.empty())
+             ? static_cast<std::size_t>(model_->GetConfig().vocab_size)
+             : ids.size();
+}
+
+tokenization::TokenId QwenMtpGpuExecutor::ScoredTokenId(
+    std::size_t index) const noexcept {
+  const auto& ids = model_->GetDraftVocab().ids;
+  return (whole_vocab_ || ids.empty())
+             ? static_cast<tokenization::TokenId>(index)
+             : ids[index];
 }
 
 std::span<const float> QwenMtpGpuExecutor::CopyLastLogits() {
-  const auto error = hipMemcpyAsync(h_logits_.data(), d_logits_,
-                                    h_logits_.size() * sizeof(float),
-                                    hipMemcpyDeviceToHost, stream_);
+  const std::size_t scored = ScoredVocab();
+  const auto error =
+      hipMemcpyAsync(h_logits_.data(), d_logits_, scored * sizeof(float),
+                     hipMemcpyDeviceToHost, stream_);
   if (error != hipSuccess || hipStreamSynchronize(stream_) != hipSuccess) {
     throw std::runtime_error("MTP logit synchronization failed");
   }
-  return h_logits_;
+  return std::span<const float>(h_logits_).first(scored);
 }
 
 }  // namespace gufo::hip

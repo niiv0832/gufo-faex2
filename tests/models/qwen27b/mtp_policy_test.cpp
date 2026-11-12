@@ -10,6 +10,8 @@
 #include <string>
 #include <vector>
 
+#include "src/models/qwen/mtp_draft_vocab.hpp"
+
 namespace {
 
 void Expect(bool condition, const std::string& message) {
@@ -116,8 +118,54 @@ void TestMoeCohortGate() {
 
 }  // namespace
 
+void TestDraftVocabularyRule() {
+  using gufo::speculative::MtpDraftScoresToken;
+  for (const char* kept :
+       {"", " the", "\n\n", "<|im_end|>", "naïve", "Привет", " ёж", "π", "—",
+        "→", "≈", "\xF0\x9F\x98\x80", "\xD0", "\x82", "\xF0"}) {
+    Expect(MtpDraftScoresToken(kept), std::string("draft drops: ") + kept);
+  }
+  // Chinese, Japanese, Korean, Arabic, Hebrew, Hindi, Thai, fullwidth forms,
+  // a CJK extension character, and a lead byte of a CJK sequence.
+  for (const char* dropped :
+       {"今天", "こんにちは", "한국", "مرحبا", "שלום", "नमस्ते", "สวัสดี", "，",
+        "\xF0\xA0\x80\x80", "\xE4", " a\xE4\xBB"}) {
+    Expect(!MtpDraftScoresToken(dropped),
+           std::string("draft keeps: ") + dropped);
+  }
+}
+
+void TestDraftScriptWindow() {
+  using gufo::speculative::kMtpDraftScriptWindow;
+  using gufo::speculative::MtpDraftNeedsWholeVocabulary;
+  using gufo::tokenization::TokenId;
+  // ids 0..9 are listed except 7.
+  std::vector<bool> listed(10, true);
+  listed[7] = false;
+  std::vector<TokenId> history(200, 3);
+  Expect(!MtpDraftNeedsWholeVocabulary(history, listed),
+         "a listed history drafts from the draft vocabulary");
+  Expect(!MtpDraftNeedsWholeVocabulary({}, listed), "an empty history too");
+  history.back() = 7;
+  Expect(MtpDraftNeedsWholeVocabulary(history, listed),
+         "an unlisted last token switches to the whole vocabulary");
+  history.back() = 3;
+  history[history.size() - kMtpDraftScriptWindow] = 7;
+  Expect(MtpDraftNeedsWholeVocabulary(history, listed),
+         "the window covers its oldest token");
+  history[history.size() - kMtpDraftScriptWindow] = 3;
+  history[history.size() - kMtpDraftScriptWindow - 1] = 7;
+  Expect(!MtpDraftNeedsWholeVocabulary(history, listed),
+         "a token older than the window is forgotten");
+  const std::vector<TokenId> beyond{3, 42};
+  Expect(MtpDraftNeedsWholeVocabulary(beyond, listed),
+         "an id beyond the vocabulary counts as unlisted");
+}
+
 int main() {
   try {
+    TestDraftVocabularyRule();
+    TestDraftScriptWindow();
     TestTopKDistribution();
     TestTopKMatchesFullSort();
     TestSampleRow();

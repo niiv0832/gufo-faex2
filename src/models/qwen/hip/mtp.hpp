@@ -54,7 +54,22 @@ public:
     return pack_time_seconds_;
   }
 
+  /// The LM-head rows a draft scores (speculative::MtpDraftScoresToken),
+  /// gathered into a matrix of their own, their token ids in ascending
+  /// order, and the same set indexed by token id. Without ids a draft scores
+  /// the whole vocabulary through the target's head.
+  struct DraftVocab {
+    models::QwenTensorRef output;
+    std::vector<tokenization::TokenId> ids;
+    std::vector<bool> listed;
+  };
+  [[nodiscard]] const DraftVocab& GetDraftVocab() const noexcept {
+    return draft_vocab_;
+  }
+
 private:
+  void GatherDraftVocab();
+
   QwenMtpGpuModel(std::shared_ptr<const core::GgufReader> mtp_reader,
                   std::shared_ptr<const QwenGpuModel> target_model,
                   speculative::QwenMtpWeights weights,
@@ -67,6 +82,7 @@ private:
   std::vector<void*> allocations_;
   std::size_t packed_weight_bytes_{0};
   double pack_time_seconds_{0.0};
+  DraftVocab draft_vocab_;
 };
 
 /// Mutable single-session executor for the Qwen3.8 layer-64 MTP graph.
@@ -124,9 +140,20 @@ public:
                           std::uint32_t position);
 
   [[nodiscard]] std::span<const float> CopyLastHidden();
+  /// The ScoredVocab() logits of the last forward pass.
   [[nodiscard]] std::span<const float> CopyLastLogits();
-  /// Leading vocabulary ids whose logits the last forward pass computed.
+  /// Number of logits a forward pass computes, and the token id of logit
+  /// `index`: the draft vocabulary, or every id in order without one or
+  /// after ScoreWholeVocabulary(true).
   [[nodiscard]] std::size_t ScoredVocab() const noexcept;
+  [[nodiscard]] tokenization::TokenId ScoredTokenId(
+      std::size_t index) const noexcept;
+  [[nodiscard]] const QwenMtpGpuModel::DraftVocab& GetDraftVocab()
+      const noexcept {
+    return model_->GetDraftVocab();
+  }
+  /// Chooses the vocabulary of the following forward passes.
+  void ScoreWholeVocabulary(bool whole) noexcept { whole_vocab_ = whole; }
 
   [[nodiscard]] std::uint32_t GetNextPosition() const noexcept {
     return next_position_;
@@ -164,6 +191,7 @@ private:
   std::shared_ptr<const QwenMtpGpuModel> model_;
   std::uint32_t max_context_;
   std::uint32_t next_position_{0};
+  bool whole_vocab_{false};
   hipStream_t stream_{nullptr};
 
   float* d_target_hidden_{nullptr};
