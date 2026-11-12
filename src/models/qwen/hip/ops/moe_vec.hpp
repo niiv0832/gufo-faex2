@@ -14,6 +14,15 @@ int qfn_mmq_moe_gated_vec(int weight_type, const void* gate, const void* up,
                           const float* x, const std::int32_t* ids, float* out,
                           int m, int k, int tokens, int experts,
                           int experts_used, hipStream_t stream);
+/// The same with x_t already quantized to block_q8_1 rows.
+int qfn_mmq_moe_gated_vec_preq(int weight_type, const void* gate,
+                               const void* up, const void* x_q8,
+                               const std::int32_t* ids, float* out, int m,
+                               int k, int tokens, int experts, int experts_used,
+                               hipStream_t stream);
+/// X[n][k] as block_q8_1 rows.
+int qfn_mmq_quantize_q8_1(const float* x, void* x_q8, int n, int k,
+                          hipStream_t stream);
 /// out[t][s][m] = W_e . x_t (x_t per row) with e = ids[t][s].
 int qfn_mmq_moe_vec(int weight_type, const void* w, const float* x,
                     const std::int32_t* ids, float* out, int m, int k,

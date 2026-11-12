@@ -16,7 +16,7 @@ namespace gufo::hip {
 void MoeFfnDecodeToken(const models::QwenLayerWeights& layer,
                        const core::ModelConfig& config,
                        const QwenMoeScratch& scratch, const float* x,
-                       float* out, hipStream_t stream) {
+                       float* out, hipStream_t stream, bool x_quantized) {
   const int experts = static_cast<int>(config.num_experts);
   const int used = static_cast<int>(config.num_experts_used);
   const int ff = static_cast<int>(config.expert_ff);
@@ -32,10 +32,16 @@ void MoeFfnDecodeToken(const models::QwenLayerWeights& layer,
                       static_cast<std::uint32_t>(experts),
                       static_cast<std::uint32_t>(used), 1, stream);
   // activation[s] = SiLU(gate_e x) * (up_e x) for the selected experts e.
-  if (qfn_mmq_moe_gated_vec(static_cast<int>(layer.ffn_gate_exps.type),
-                            layer.ffn_gate_exps.data, layer.ffn_up_exps.data, x,
-                            scratch.ids, scratch.act, ff, hidden, 1, experts,
-                            used, stream) != 0) {
+  if ((x_quantized
+           ? qfn_mmq_moe_gated_vec_preq(
+                 static_cast<int>(layer.ffn_gate_exps.type),
+                 layer.ffn_gate_exps.data, layer.ffn_up_exps.data, scratch.x_q8,
+                 scratch.ids, scratch.act, ff, hidden, 1, experts, used, stream)
+           : qfn_mmq_moe_gated_vec(static_cast<int>(layer.ffn_gate_exps.type),
+                                   layer.ffn_gate_exps.data,
+                                   layer.ffn_up_exps.data, x, scratch.ids,
+                                   scratch.act, ff, hidden, 1, experts, used,
+                                   stream)) != 0) {
     throw std::runtime_error("qwen35moe expert gate/up projection failed");
   }
   // Each slot row multiplies its own expert's down matrix: used rows, one
