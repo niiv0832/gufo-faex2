@@ -10,8 +10,11 @@
 
 namespace gufo::hip {
 namespace {
-// Below this many rows the per-expert buckets are too thin for grouped GEMMs.
-constexpr std::size_t kMinGroupedRows = 64;
+// Below this many rows the per-expert buckets are too thin for grouped GEMMs:
+// the row-wise device path (MoeFfnRows) is faster. Qwen3.6-35B-A3B on gfx1151,
+// whole prompt of N tokens: 8 tokens 36 ms row-wise against 43 ms grouped, 16
+// tokens 53 against 48, 63 tokens 133 against 65 (2026-11-12).
+constexpr std::size_t kMinGroupedRows = 16;
 }  // namespace
 
 bool QwenGpuExecutor::MoePrefillFfn(const models::QwenLayerWeights& layer,
