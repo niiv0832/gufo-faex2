@@ -14,7 +14,33 @@ void QwenGpuExecutor::CheckPrefillCancellation() const {
     throw std::runtime_error("Qwen prefill cancelled");
 }
 
+void QwenGpuExecutor::SetPrefillYield(std::size_t groups,
+                                      std::function<void()> yield) {
+  yield_layers_.clear();
+  yield_ = {};
+  if (groups < 2 || !yield)
+    return;
+  const std::uint32_t layers = weights_.config.num_layers;
+  for (std::size_t k = 1; k < groups; ++k) {
+    const auto layer = static_cast<std::uint32_t>(k * layers / groups);
+    if (layer != 0 && layer < layers &&
+        (yield_layers_.empty() || yield_layers_.back() != layer))
+      yield_layers_.push_back(layer);
+  }
+  yield_ = std::move(yield);
+}
+
 void QwenGpuExecutor::PrefillLayerCheckpoint(std::uint32_t layer) {
+  // Every buffer this pass carries across layers is in this executor's
+  // arena or keyed by its stream, which no other session's decode touches.
+  // Draining the queued layers first keeps them from sharing the GPU with
+  // the decode round. A lock-step chunk pair keeps a second chunk suspended
+  // mid-layer on shared NPU buffers, so it never yields.
+  if (yield_ && !paired_prefill_ &&
+      std::ranges::binary_search(yield_layers_, layer)) {
+    HIP_CHECK(hipStreamSynchronize(arena_.stream));
+    yield_();
+  }
   CheckPrefillCancellation();
   // Keep one four-layer group ahead of the GPU. Without backpressure, AR
   // can enqueue the whole prompt before the client disconnects; checking

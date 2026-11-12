@@ -69,6 +69,7 @@ void Expect(bool condition, std::string_view message) {
 enum class EventKind : std::uint8_t {
   kPrefill,
   kAdvance,
+  kYield,
 };
 
 struct Event {
@@ -168,6 +169,8 @@ struct FakeControl {
   std::atomic<std::size_t> batch_preparations{0};
   std::atomic<std::int64_t> first_request_advance_ns{0};
   bool incremental_prefill{true};
+  std::size_t layered_prefill_pass_tokens{0};
+  std::size_t max_prefill_layer_groups{1};
   std::size_t prefill_capacity{std::numeric_limits<std::size_t>::max()};
   bool supports_batched_advance{false};
   bool final_token_advance_required{true};
@@ -244,6 +247,9 @@ public:
                     control_->batched_multi_token_decode,
                 .batched_multi_token_decode_max_width = 4,
                 .prefix_reuse = control_->prefix_reuse,
+                .layered_prefill_pass_tokens =
+                    control_->layered_prefill_pass_tokens,
+                .max_prefill_layer_groups = control_->max_prefill_layer_groups,
             },
         .persistence = std::nullopt,
     };
@@ -356,6 +362,15 @@ public:
           throw std::runtime_error("prefill gate timed out");
         }
       }
+    }
+
+    // A layered pass lets the host decode between its layer groups.
+    for (std::size_t group = 1; group < state.prefill_yield_groups(); ++group) {
+      state.YieldPrefill();
+      control_->Log({.kind = EventKind::kYield,
+                     .label = fake.label,
+                     .index = group,
+                     .count = state.prefill_yield_groups()});
     }
 
     fake.position += consumed;
@@ -1360,6 +1375,79 @@ void TestPrefillYieldsToEveryDueDecoder(bool multi_token, bool batched) {
   }
   Expect(result_c.max_consecutive_active_prefill_chunks == 1,
          "scheduler never runs consecutive chunks while decode is due");
+}
+
+// A runner with layered prefill keeps one wide pass beside decoders and
+// every decoder steps between its layer groups.
+void TestLayeredPrefillYieldsBetweenLayerGroups(bool multi_token, bool batched,
+                                                std::size_t max_groups) {
+  auto control = std::make_shared<FakeControl>();
+  control->multi_token_decode = multi_token;
+  control->batched_multi_token_decode = batched;
+  control->supports_batched_advance = multi_token;
+  control->block_advance_label = 2;
+  control->layered_prefill_pass_tokens = 8;
+  control->max_prefill_layer_groups = max_groups;
+  auto scheduler = MakeScheduler(control, 3, {.decode_active_tokens = 2});
+
+  const std::size_t output_tokens = multi_token ? 30 : 10;
+  auto request_a = scheduler->Submit({1}, output_tokens, 0.0F);
+  auto request_b = scheduler->Submit({2}, output_tokens, 0.0F);
+  control->WaitForAdvance(2);
+  auto request_c = scheduler->Submit({3, 30, 31, 32, 33, 34, 35}, 2, 0.0F);
+  control->ReleaseAdvance();
+
+  const auto result_a = request_a.Wait();
+  const auto result_b = request_b.Wait();
+  const auto result_c = request_c.Wait();
+  Expect(result_a.tokens == ExpectedTokens(1, output_tokens) &&
+             result_b.tokens == ExpectedTokens(2, output_tokens) &&
+             result_c.tokens == ExpectedTokens(3, 2),
+         "layered prefill keeps every trajectory isolated");
+
+  // Seven tokens at two per decode round ask for four groups.
+  const std::size_t groups = std::min<std::size_t>(4, max_groups);
+  const auto events = control->Events();
+  std::size_t prefills = 0;
+  std::size_t yields = 0;
+  std::size_t previous = events.size();
+  for (std::size_t index = 0; index < events.size(); ++index) {
+    if (events[index].label != 3)
+      continue;
+    if (events[index].kind == EventKind::kPrefill) {
+      ++prefills;
+      Expect(events[index].count == 7, "a layered pass keeps its full width");
+      previous = index;
+      continue;
+    }
+    // The fake logs a yield when the host's decode round has returned.
+    if (events[index].kind != EventKind::kYield)
+      continue;
+    bool a_advanced = false;
+    bool b_advanced = false;
+    for (std::size_t between = previous + 1; between < index; ++between) {
+      if (events[between].kind == EventKind::kAdvance) {
+        a_advanced = a_advanced || events[between].label == 1;
+        b_advanced = b_advanced || events[between].label == 2;
+      }
+    }
+    Expect(a_advanced && b_advanced,
+           "every decoder advances between two layer groups");
+    Expect(events[index].count == groups, "the runner's group limit applies");
+    ++yields;
+    previous = index;
+  }
+  Expect(prefills == 1 && yields == groups - 1,
+         "one pass yields between its layer groups");
+  Expect(result_c.prefill_chunks == 1 && result_c.prefill_tokens == 7 &&
+             result_c.active_decode_prefill_chunks == 1 &&
+             result_c.max_prefill_chunk_tokens == 7 &&
+             result_c.max_prefill_layer_groups == groups &&
+             result_c.prefill_yield_rounds == groups - 1,
+         "metrics report the layered pass");
+  Expect(result_a.max_prefill_layer_groups == 1 &&
+             result_a.prefill_yield_rounds == 0,
+         "a prompt without decoders runs unsplit");
 }
 
 void TestNonIncrementalRunnerFallsBackSafely() {
@@ -3034,6 +3122,8 @@ int main() {
         continue;
       TestDecodeActivePrefillIsBounded(multi_token, batched);
       TestPrefillYieldsToEveryDueDecoder(multi_token, batched);
+      TestLayeredPrefillYieldsBetweenLayerGroups(multi_token, batched, 16);
+      TestLayeredPrefillYieldsBetweenLayerGroups(multi_token, batched, 2);
     }
   }
   TestNonIncrementalRunnerFallsBackSafely();

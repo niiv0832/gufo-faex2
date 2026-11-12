@@ -1397,7 +1397,9 @@ void TextRunnerPool::Request::PrepareBatchExecution() {
       dynamic_cast<TextRunnerState&>(impl_->lease.state()));
 }
 
-TextPrefillStep TextRunnerPool::Request::Prefill(std::size_t max_input_tokens) {
+TextPrefillStep TextRunnerPool::Request::Prefill(std::size_t max_input_tokens,
+                                                 std::size_t yield_every_tokens,
+                                                 const PrefillYield& yield) {
   if (!*this) {
     throw std::logic_error("text runner request is empty");
   }
@@ -1479,6 +1481,24 @@ TextPrefillStep TextRunnerPool::Request::Prefill(std::size_t max_input_tokens) {
   const auto model_prompt =
       std::span<const TextRunnerToken>(impl_->prompt).first(frontier);
   std::unique_ptr<TextRunnerSnapshot> captured;
+  // One layer group per `yield_every_tokens` of this pass, so the other
+  // sessions get the decode rounds that many bounded chunks would give them.
+  // The yield lives for this step only.
+  const std::size_t pass_tokens =
+      std::min(max_input_tokens, model_prompt.size() - impl_->prefill_offset);
+  const std::size_t layer_groups =
+      yield && yield_every_tokens != 0
+          ? std::min(
+                impl_->runner->Descriptor()
+                    .capabilities.max_prefill_layer_groups,
+                (pass_tokens + yield_every_tokens - 1) / yield_every_tokens)
+          : 1;
+  struct ClearYield {
+    TextRunnerState& state;
+    ~ClearYield() { state.SetPrefillYield(1, {}); }
+  } clear_yield{state};
+  if (layer_groups > 1)
+    state.SetPrefillYield(layer_groups, yield);
   auto step =
       in_pass
           ? impl_->runner->PrefillThrough(
@@ -1486,6 +1506,7 @@ TextPrefillStep TextRunnerPool::Request::Prefill(std::size_t max_input_tokens) {
                 snapshot_position, &captured, impl_->disk_store != nullptr)
           : impl_->runner->Prefill(state, model_prompt, impl_->prefill_offset,
                                    max_input_tokens);
+  step.layer_groups = layer_groups;
   const std::size_t maximum_consumed = std::min(remaining, max_input_tokens);
   if (step.consumed_tokens == 0 || step.consumed_tokens > maximum_consumed) {
     throw std::runtime_error(

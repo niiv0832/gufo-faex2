@@ -1003,6 +1003,30 @@ private:
   mutable bool probe_pending_{false};
 };
 
+// Arms the session's layer hook from the host's yield for one prefill step.
+class QwenPrefillYieldScope {
+public:
+  QwenPrefillYieldScope(hip::QwenGpuExecutor& executor,
+                        const TextRunnerState& state)
+      : executor_(executor) {
+    if (state.prefill_yield_groups() > 1)
+      executor_.SetPrefillYield(state.prefill_yield_groups(),
+                                [&state] { state.YieldPrefill(); });
+  }
+  ~QwenPrefillYieldScope() { executor_.SetPrefillYield(1, {}); }
+  QwenPrefillYieldScope(const QwenPrefillYieldScope&) = delete;
+  QwenPrefillYieldScope& operator=(const QwenPrefillYieldScope&) = delete;
+
+private:
+  hip::QwenGpuExecutor& executor_;
+};
+
+// Beside decoders, prompts keep the full-width pass and split it into layer
+// groups instead of short passes.
+constexpr std::size_t kQwenMaxPrefillLayerGroups = 16;
+// Rows of one Qwen prompt pass (QwenGpuArena's prompt batch).
+constexpr std::size_t kQwenPromptPassTokens = 4096;
+
 class QwenTextRunner final : public HipTextModelRunner {
 public:
   sampling::JsonConstraint::ToolFormat ToolFormat() const override {
@@ -1051,6 +1075,12 @@ public:
                 .batched_multi_token_decode_max_width =
                     speculative_enabled ? MaximumDecodeBatchWidth() : 0,
                 .prefix_reuse = true,
+                // Each session owns its executor and stream, so the decodes
+                // of a yield, batched ones included, share no buffer with
+                // the pass they interrupt.
+                .layered_prefill_pass_tokens =
+                    std::min<std::size_t>(max_context_, kQwenPromptPassTokens),
+                .max_prefill_layer_groups = kQwenMaxPrefillLayerGroups,
             },
         .persistence = persistence_,
     };
@@ -1208,6 +1238,7 @@ public:
     }
     max_input_tokens = std::min<std::size_t>(
         max_input_tokens, qwen.executor().GetMaxPromptBatch());
+    const QwenPrefillYieldScope yield(qwen.executor(), state);
     if (max_input_tokens != 0 && offset != 0 &&
         qwen.ResumeGeneratedToken(prompt[offset],
                                   offset + 1 == prompt.size())) {

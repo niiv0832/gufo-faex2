@@ -92,6 +92,11 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunkPair(
         npu->SetPaired(false);
     }
   } paired_flag{pair_npu};
+  struct NoYield {
+    bool& paired;
+    explicit NoYield(bool& flag) : paired(flag) { paired = true; }
+    ~NoYield() { paired = false; }
+  } no_yield{paired_prefill_};
   auto first = PrefillChunkTask(first_tokens, start_pos, false, 1);
   auto second = PrefillChunkTask(
       second_tokens,

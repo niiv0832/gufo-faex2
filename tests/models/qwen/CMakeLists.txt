@@ -137,6 +137,16 @@ if (ENGINE_ENABLE_HIP)
     tests/models/qwen/hip/integration_test.cpp
     "hip;gpu;kernels;qwen;module;l2")
 
+  # Layered prefill (SetPrefillYield) against lone unsplit runs, AR and MTP;
+  # skipped without GUFO_QWEN_LAYERED_PREFILL_MODEL.
+  add_qwen_hip_test(qwen_layered_prefill_test
+    tests/models/qwen/hip/layered_prefill_test.cpp
+    "gpu;hip;qwen;external-model")
+  target_link_libraries(qwen_layered_prefill_test PRIVATE
+    gufo_qwen38_flash_next)
+  set_tests_properties(qwen_layered_prefill_test PROPERTIES
+    RUN_SERIAL TRUE TIMEOUT 1800)
+
   if (GUFO_BUILD_TOOLS)
     add_executable(qwen35moe_gpu_logits_tool
       ${PROJECT_SOURCE_DIR}/tests/models/qwen/hip/qwen35moe_gpu_logits_tool.cpp)

@@ -122,7 +122,19 @@ struct TextRunnerCapabilities {
   /// whose prefill chunks are wider should match them, so a checkpoint lands
   /// on a chunk edge instead of forcing a short pass.
   std::size_t prefill_grid_tokens{2048};
+  /// Prompt tokens of one pass beside other sessions' decoding when the
+  /// runner can split that pass into layer groups and let them decode in
+  /// between (TextRunnerState::SetPrefillYield). Zero keeps such passes
+  /// bounded by the host's decode-active budget instead.
+  std::size_t layered_prefill_pass_tokens{0};
+  /// Most layer groups one such pass may be split into.
+  std::size_t max_prefill_layer_groups{1};
 };
+
+/// Runs the host's decode round between two layer groups of a prefill pass.
+/// It decodes only other sessions, never touches the prefilling state and
+/// does not throw.
+using PrefillYield = std::function<void()>;
 
 /// Model-owned compatibility identity for restart-safe snapshots.
 ///
@@ -174,6 +186,8 @@ struct TextPrefillStep {
   std::size_t consumed_tokens{0};
   bool decode_ready{false};
   double checkpoint_ms{0};
+  /// Layer groups the host asked this pass to be split into; one is unsplit.
+  std::size_t layer_groups{1};
 };
 
 struct TextDecodeSelection {
@@ -211,6 +225,25 @@ public:
   /// keep the default no-op behavior.
   virtual void SetCancellationCheck(const CancellationCheck&) {}
 
+  /// Set by the host for the next Prefill or PrefillThrough call only. A
+  /// runner that advertises layered prefill splits the pass into about
+  /// `groups` layer groups and calls YieldPrefill() between them. Every layer
+  /// keeps the arithmetic of an unsplit pass. While yielding, the runner
+  /// holds no lock or scratch its decode paths take.
+  void SetPrefillYield(std::size_t groups, PrefillYield yield) {
+    prefill_yield_groups_ = yield ? std::max<std::size_t>(groups, 1) : 1;
+    prefill_yield_ = std::move(yield);
+  }
+  /// One when the host asked for an unsplit pass.
+  [[nodiscard]] std::size_t prefill_yield_groups() const noexcept {
+    return prefill_yield_groups_;
+  }
+  /// Runs the host's decode round between two layer groups.
+  void YieldPrefill() const {
+    if (prefill_yield_)
+      prefill_yield_();
+  }
+
   /// Actual request-owned allocations when the provider can measure them.
   [[nodiscard]] virtual TextRunnerMeasuredResources MeasuredResources()
       const noexcept {
@@ -219,6 +252,8 @@ public:
 
 private:
   bool stop_at_eos_{true};
+  std::size_t prefill_yield_groups_{1};
+  PrefillYield prefill_yield_;
 };
 
 /// Immutable model-owned continuation payload.
@@ -537,7 +572,12 @@ public:
     static constexpr std::size_t kSharedPrefixMinTokens = 512;
 
     void PrepareBatchExecution();
-    [[nodiscard]] TextPrefillStep Prefill(std::size_t max_input_tokens);
+    /// With `yield`, a runner that advertises layered prefill splits the pass
+    /// into one layer group per `yield_every_tokens` of the tokens it will
+    /// consume, at most its own maximum, and runs `yield` between groups.
+    [[nodiscard]] TextPrefillStep Prefill(std::size_t max_input_tokens,
+                                          std::size_t yield_every_tokens = 0,
+                                          const PrefillYield& yield = {});
     [[nodiscard]] TextDecodeSelection SelectNext();
     void Advance();
     [[nodiscard]] TextDecodeStep DecodeStep(std::size_t max_tokens);

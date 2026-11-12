@@ -495,6 +495,9 @@ struct TextGenerationScheduler::Impl {
     }
     incremental_prefill_supported =
         runner_pool->runner().Descriptor().capabilities.incremental_prefill;
+    layered_prefill_pass_tokens = runner_pool->runner()
+                                      .Descriptor()
+                                      .capabilities.layered_prefill_pass_tokens;
     final_token_advance_required =
         runner_pool->runner()
             .Descriptor()
@@ -1177,7 +1180,8 @@ struct TextGenerationScheduler::Impl {
   }
 
   void StepPrefill(const std::shared_ptr<ScheduledRequest>& request,
-                   bool decoder_runnable, bool peer_waiting = false) {
+                   bool decoder_runnable, bool peer_waiting = false,
+                   const PrefillYield& yield = {}) {
     try {
       if (CompleteIfStopped(request)) {
         return;
@@ -1190,7 +1194,15 @@ struct TextGenerationScheduler::Impl {
       // Long prefills alone retain the model's efficient chunk size.
       const bool bounded_prefill =
           incremental_prefill_supported && (decoder_runnable || peer_waiting);
-      const std::size_t budget = bounded_prefill
+      // Beside decoders, a runner with layered prefill keeps its efficient
+      // pass and lets them decode between layer groups: one group per
+      // decode-active budget of the pass, so they get the rounds that many
+      // bounded chunks would give them.
+      const bool layered = decoder_runnable && static_cast<bool>(yield) &&
+                           layered_prefill_pass_tokens != 0 &&
+                           incremental_prefill_supported;
+      const std::size_t budget = layered ? layered_prefill_pass_tokens
+                                 : bounded_prefill
                                      ? prefill_policy.decode_active_tokens
                                      : request->runner_request.prompt_tokens();
       if ((decoder_runnable || runner_pool->capacity() > 1) &&
@@ -1199,10 +1211,21 @@ struct TextGenerationScheduler::Impl {
             "incremental_prefill_unavailable";
       }
       const auto start = Clock::now();
-      const auto step = request->runner_request.Prefill(budget);
+      const std::size_t rounds_before = yield_rounds;
+      const double yield_ms_before = yield_ms;
+      const auto step =
+          layered ? request->runner_request.Prefill(
+                        budget, prefill_policy.decode_active_tokens, yield)
+                  : request->runner_request.Prefill(budget);
+      request->result.prefill_yield_rounds += yield_rounds - rounds_before;
+      request->result.max_prefill_layer_groups =
+          std::max(request->result.max_prefill_layer_groups, step.layer_groups);
+      // Decode rounds between layer groups count as the decoders' time, not
+      // this prompt's.
       const double step_ms =
           std::chrono::duration<double, std::milli>(Clock::now() - start)
-              .count();
+              .count() -
+          (yield_ms - yield_ms_before);
       request->result.prefill_ms += step_ms;
       request->result.prefill_tokens += step.consumed_tokens;
       request->live_prefill_tokens.store(request->result.prefill_tokens,
@@ -1772,6 +1795,100 @@ struct TextGenerationScheduler::Impl {
     return request;
   }
 
+  /// One decode work unit: a batch from `decoding`, due requests first when
+  /// `due_only`.
+  void RunDecodeUnit(bool due_only,
+                     std::deque<std::shared_ptr<ScheduledRequest>>& decoding,
+                     std::deque<std::shared_ptr<ScheduledRequest>>& capturing) {
+    const std::size_t candidate_count =
+        due_only ? static_cast<std::size_t>(std::count_if(
+                       decoding.begin(), decoding.end(),
+                       [](const auto& request) { return request->decode_due; }))
+                 : decoding.size();
+    const auto plan = runner_pool->SelectDecodePlan(candidate_count);
+    const std::size_t batch_size =
+        plan.kind == TextExecutionPlanKind::kBatched
+            ? std::min(candidate_count, plan.physical_width)
+            : 1;
+    std::vector<std::shared_ptr<ScheduledRequest>> batch;
+    batch.reserve(batch_size);
+    for (std::size_t index = 0; index < batch_size; ++index) {
+      auto request = PopDecoder(decoding, due_only);
+      request->decode_due = false;
+      batch.push_back(std::move(request));
+    }
+    StepDecodeBatch(batch);
+    for (auto& request : batch) {
+      if (!IsTerminal(request)) {
+        if (request->runner_request.SnapshotPending())
+          capturing.push_back(std::move(request));
+        else
+          decoding.push_back(std::move(request));
+      }
+    }
+  }
+
+  /// Moves requests whose capture has finished back to their queue. Without
+  /// `prefilling` (inside a pass), a prompt's capture stays in `capturing`.
+  void ResumeCaptured(
+      std::deque<std::shared_ptr<ScheduledRequest>>& capturing,
+      std::deque<std::shared_ptr<ScheduledRequest>>& decoding,
+      std::deque<std::shared_ptr<ScheduledRequest>>* prefilling) {
+    for (std::size_t count = capturing.size(); count != 0; --count) {
+      auto request = std::move(capturing.front());
+      capturing.pop_front();
+      if (request->runner_request.SnapshotPending() ||
+          (prefilling == nullptr &&
+           !request->runner_request.prefill_complete())) {
+        capturing.push_back(std::move(request));
+        continue;
+      }
+      progress.fetch_add(1, std::memory_order_relaxed);
+      if (!CompleteIfStopped(request)) {
+        if (request->runner_request.prefill_complete()) {
+          // Its capture already waited through peer prefill. Resume it
+          // before another bounded chunk, as for any due decoder.
+          request->decode_due = true;
+          decoding.push_back(std::move(request));
+        } else {
+          prefilling->push_back(std::move(request));
+        }
+      }
+    }
+  }
+
+  /// Between two layer groups of a prompt pass, the prompt's request is in no
+  /// queue: this round only decodes. Every decoder steps once, as every due
+  /// decoder does between bounded prefill chunks. Nothing is admitted or
+  /// prefilled. A decoder whose capture has finished rejoins the round; a
+  /// prompt's capture waits until the pass ends.
+  void RunYieldRound(
+      std::deque<std::shared_ptr<ScheduledRequest>>& decoding,
+      std::deque<std::shared_ptr<ScheduledRequest>>& capturing) noexcept {
+    try {
+      ResumeCaptured(capturing, decoding, nullptr);
+      if (decoding.empty())
+        return;
+      progress.fetch_add(1, std::memory_order_relaxed);
+      ++yield_rounds;
+      struct AddTime {
+        Clock::time_point start;
+        double& total;
+        ~AddTime() {
+          total +=
+              std::chrono::duration<double, std::milli>(Clock::now() - start)
+                  .count();
+        }
+      } add_time{Clock::now(), yield_ms};
+      MarkAllDecodersDue(decoding);
+      while (!decoding.empty() && HasDueDecoder(decoding))
+        RunDecodeUnit(true, decoding, capturing);
+    } catch (...) {
+      // Decode failures complete their own requests; nothing reaches the
+      // prompt's pass.
+    }
+  }
+
   void CancelRemaining(
       std::deque<std::shared_ptr<ScheduledRequest>>& prefilling,
       std::deque<std::shared_ptr<ScheduledRequest>>& decoding,
@@ -1816,25 +1933,7 @@ struct TextGenerationScheduler::Impl {
       loop_working.store(true, std::memory_order_relaxed);
       ProcessQueuedCancellations();
 
-      for (std::size_t count = capturing.size(); count != 0; --count) {
-        auto request = std::move(capturing.front());
-        capturing.pop_front();
-        if (request->runner_request.SnapshotPending()) {
-          capturing.push_back(std::move(request));
-          continue;
-        }
-        progress.fetch_add(1, std::memory_order_relaxed);
-        if (!CompleteIfStopped(request)) {
-          if (request->runner_request.prefill_complete()) {
-            // Its capture already waited through peer prefill. Resume it
-            // before another bounded chunk, as for any due decoder.
-            request->decode_due = true;
-            decoding.push_back(std::move(request));
-          } else {
-            prefilling.push_back(std::move(request));
-          }
-        }
-      }
+      ResumeCaptured(capturing, decoding, &prefilling);
       Admit(prefilling, decoding, capturing, waiting, stop_token);
       if (device_lost.load(std::memory_order_acquire))
         break;
@@ -1905,7 +2004,8 @@ struct TextGenerationScheduler::Impl {
           (!due_decoder || assemble_initial_batch)) {
         auto request = std::move(prefilling.front());
         prefilling.pop_front();
-        StepPrefill(request, true);
+        StepPrefill(request, true, false,
+                    [&] { RunYieldRound(decoding, capturing); });
         if (!IsTerminal(request)) {
           if (request->runner_request.SnapshotPending()) {
             capturing.push_back(std::move(request));
@@ -1920,33 +2020,7 @@ struct TextGenerationScheduler::Impl {
       }
 
       if (!decoding.empty()) {
-        const std::size_t candidate_count =
-            due_decoder
-                ? static_cast<std::size_t>(std::count_if(
-                      decoding.begin(), decoding.end(),
-                      [](const auto& request) { return request->decode_due; }))
-                : decoding.size();
-        const auto plan = runner_pool->SelectDecodePlan(candidate_count);
-        const std::size_t batch_size =
-            plan.kind == TextExecutionPlanKind::kBatched
-                ? std::min(candidate_count, plan.physical_width)
-                : 1;
-        std::vector<std::shared_ptr<ScheduledRequest>> batch;
-        batch.reserve(batch_size);
-        for (std::size_t index = 0; index < batch_size; ++index) {
-          auto request = PopDecoder(decoding, due_decoder);
-          request->decode_due = false;
-          batch.push_back(std::move(request));
-        }
-        StepDecodeBatch(batch);
-        for (auto& request : batch) {
-          if (!IsTerminal(request)) {
-            if (request->runner_request.SnapshotPending())
-              capturing.push_back(std::move(request));
-            else
-              decoding.push_back(std::move(request));
-          }
-        }
+        RunDecodeUnit(due_decoder, decoding, capturing);
         continue;
       }
 
@@ -1981,6 +2055,12 @@ struct TextGenerationScheduler::Impl {
   std::shared_ptr<OutputBudget> output_budget;
   std::shared_ptr<SessionTable> sessions;
   bool incremental_prefill_supported{false};
+  // Pass width of a runner that splits prompt passes by layers; zero without.
+  std::size_t layered_prefill_pass_tokens{0};
+  // Decode rounds run between layer groups since startup.
+  std::size_t yield_rounds{0};
+  // Time those rounds took, which their prompt's pass excludes.
+  double yield_ms{0};
   bool final_token_advance_required{true};
   bool incremental_text_is_exact{false};
   bool multi_token_decode{false};
