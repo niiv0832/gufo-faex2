@@ -197,7 +197,7 @@ constexpr std::string_view kDeepSeekStateAbi =
     "deepseek-v4-flash-gfx1151-state-v4";
 constexpr std::array<std::uint8_t, 8> kQwenPersistentSnapshotMagic = {
     'G', 'Q', 'W', 'R', 'U', 'N', '0', '1'};
-constexpr std::uint32_t kQwenPersistentPayloadVersion = 4;
+constexpr std::uint32_t kQwenPersistentPayloadVersion = 5;
 constexpr std::size_t kQwenMaxResumeTokens = 9;
 constexpr std::size_t kQwenPersistentSnapshotHeaderBytes = 112;
 constexpr std::uint32_t kQwenPersistentSpeculativeFlag = 1U << 0U;

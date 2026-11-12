@@ -477,36 +477,27 @@ void QwenMtpGpuExecutor::SaveState(std::span<std::uint8_t> destination) const {
   std::memcpy(out, &next_position_, sizeof(next_position_));
   out += sizeof(next_position_);
   HIP_CHECK(hipStreamSynchronize(stream_));
-  if (d_kv_cache_ == nullptr) {
-    // The FP16 cache is token-major: the valid prefix of each plane is one
-    // contiguous run of positions.
-    const std::size_t plane_values = config.num_key_value_heads * head_values;
+  if (d_kv_cache_ != nullptr) {
+    // The FP32 cache is head-major: each head's valid prefix is its own run.
     for (std::size_t plane = 0; plane < 2; ++plane) {
-      HIP_CHECK(hipMemcpy(out,
-                          static_cast<const std::uint16_t*>(d_kv_cache_f16_) +
-                              (plane * total_kv),
-                          plane_values * sizeof(std::uint16_t),
-                          hipMemcpyDeviceToHost));
-      out += plane_values * sizeof(std::uint16_t);
-    }
-    return;
-  }
-  for (std::size_t plane = 0; plane < 2; ++plane) {
-    for (std::size_t head = 0; head < config.num_key_value_heads; ++head) {
-      const std::size_t offset = (plane * total_kv) + (head * head_stride);
-      HIP_CHECK(hipMemcpy(out, d_kv_cache_ + offset,
-                          head_values * sizeof(float), hipMemcpyDeviceToHost));
-      out += head_values * sizeof(float);
+      for (std::size_t head = 0; head < config.num_key_value_heads; ++head) {
+        const std::size_t offset = (plane * total_kv) + (head * head_stride);
+        HIP_CHECK(hipMemcpy(out, d_kv_cache_ + offset,
+                            head_values * sizeof(float),
+                            hipMemcpyDeviceToHost));
+        out += head_values * sizeof(float);
+      }
     }
   }
+  // The FP16 cache is token-major: the valid prefix of each plane is one
+  // contiguous run of positions.
+  const std::size_t plane_values = config.num_key_value_heads * head_values;
   for (std::size_t plane = 0; plane < 2; ++plane) {
-    for (std::size_t head = 0; head < config.num_key_value_heads; ++head) {
-      const std::size_t offset = (plane * total_kv) + (head * head_stride);
-      HIP_CHECK(hipMemcpy(
-          out, static_cast<const std::uint16_t*>(d_kv_cache_f16_) + offset,
-          head_values * sizeof(std::uint16_t), hipMemcpyDeviceToHost));
-      out += head_values * sizeof(std::uint16_t);
-    }
+    HIP_CHECK(hipMemcpy(
+        out,
+        static_cast<const std::uint16_t*>(d_kv_cache_f16_) + (plane * total_kv),
+        plane_values * sizeof(std::uint16_t), hipMemcpyDeviceToHost));
+    out += plane_values * sizeof(std::uint16_t);
   }
 }
 
@@ -528,33 +519,23 @@ void QwenMtpGpuExecutor::LoadState(std::span<const std::uint8_t> source) {
   const std::size_t total_kv = config.num_key_value_heads * head_stride;
   const std::uint8_t* in = source.data() + sizeof(position);
   HIP_CHECK(hipStreamSynchronize(stream_));
-  if (d_kv_cache_ == nullptr) {
-    const std::size_t plane_values = config.num_key_value_heads * head_values;
+  if (d_kv_cache_ != nullptr) {
     for (std::size_t plane = 0; plane < 2; ++plane) {
-      HIP_CHECK(hipMemcpy(
-          static_cast<std::uint16_t*>(d_kv_cache_f16_) + (plane * total_kv), in,
-          plane_values * sizeof(std::uint16_t), hipMemcpyHostToDevice));
-      in += plane_values * sizeof(std::uint16_t);
-    }
-    next_position_ = position;
-    return;
-  }
-  for (std::size_t plane = 0; plane < 2; ++plane) {
-    for (std::size_t head = 0; head < config.num_key_value_heads; ++head) {
-      const std::size_t offset = (plane * total_kv) + (head * head_stride);
-      HIP_CHECK(hipMemcpy(d_kv_cache_ + offset, in, head_values * sizeof(float),
-                          hipMemcpyHostToDevice));
-      in += head_values * sizeof(float);
+      for (std::size_t head = 0; head < config.num_key_value_heads; ++head) {
+        const std::size_t offset = (plane * total_kv) + (head * head_stride);
+        HIP_CHECK(hipMemcpy(d_kv_cache_ + offset, in,
+                            head_values * sizeof(float),
+                            hipMemcpyHostToDevice));
+        in += head_values * sizeof(float);
+      }
     }
   }
+  const std::size_t plane_values = config.num_key_value_heads * head_values;
   for (std::size_t plane = 0; plane < 2; ++plane) {
-    for (std::size_t head = 0; head < config.num_key_value_heads; ++head) {
-      const std::size_t offset = (plane * total_kv) + (head * head_stride);
-      HIP_CHECK(hipMemcpy(static_cast<std::uint16_t*>(d_kv_cache_f16_) + offset,
-                          in, head_values * sizeof(std::uint16_t),
-                          hipMemcpyHostToDevice));
-      in += head_values * sizeof(std::uint16_t);
-    }
+    HIP_CHECK(hipMemcpy(
+        static_cast<std::uint16_t*>(d_kv_cache_f16_) + (plane * total_kv), in,
+        plane_values * sizeof(std::uint16_t), hipMemcpyHostToDevice));
+    in += plane_values * sizeof(std::uint16_t);
   }
   next_position_ = position;
 }
