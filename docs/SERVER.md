@@ -193,6 +193,14 @@ prefill about 3% slower in aggregate (the second request's passes stay below the
 paired-bank size), 16384 recovers the rest but lets a running decode wait about
 one 16K pass.
 
+The Qwen HIP runner keeps its full 4,096-token pass beside decoders and splits
+it into layer groups instead: one group per `--prefill-chunk` tokens of the
+pass, at most 16. Between groups every decoder steps once, new requests are
+admitted, and a prompt that one bounded chunk finishes gets that chunk. Each
+layer does the same arithmetic as in an unsplit pass, so a prompt read beside
+decoders reaches the same state as one read alone. `usage.gufo` reports
+`max_prefill_layer_groups` and `prefill_yield_rounds`.
+
 `--cache-ram-bytes 0` (the default) selects an automatic snapshot budget capped
 at 32 GiB and half the available host RAM after model/state allocation, respecting
 container limits. Available RAM is `MemAvailable` minus `CmaFree`: free CMA
