@@ -76,10 +76,14 @@ inline tokenization::TokenId MtpSampleRow(
   return ids[last];
 }
 
-// MoE targets verify each draft row against its own routed experts: with
-// more than `max_cohort` sessions decoding, no draft is cheaper (Qwen3.6-35B-A3B
-// MTP-1 at four sessions: 33.5 vs 36.8 t/s per session, gfx1151 2026-11-09).
-// A zero limit disables the gate.
+// MoE targets verify each draft row against its own routed experts, and each
+// session drafts with a head pass of its own: with more than `max_cohort`
+// sessions decoding, no draft is cheaper. Qwen3.6-35B-A3B MTP-1 on gfx1151,
+// tokens per second summed over the sessions, with and without drafts
+// (2026-11-12): three sessions 152 and 132, four 163 and 153, six 167 and
+// 187, eight 178 and 208. A zero limit disables the gate.
+inline constexpr std::size_t kMtpMoeMaxCohort = 4;
+
 inline bool MtpMoeSkipsDraft(bool moe, std::size_t cohort,
                              std::size_t max_cohort) {
   return moe && max_cohort > 0 && cohort > max_cohort;

@@ -479,7 +479,7 @@ def serve(config, output):
                 "TMPDIR": str(output / "tmp"), "XDG_CACHE_HOME": str(output / "cache"),
                 "HSA_ENABLE_SDMA": "0", "LD_LIBRARY_PATH": config["library_path"]}
             if advanced:
-                environment.update(GUFO_MTP_VOCAB="0", GUFO_MTP_MOE_MAX_COHORT="2")
+                environment.update(GUFO_MTP_MOE_MAX_COHORT="4")
                 if config["cache_disk_bytes"]:
                     cache = owned_directory(config["cache_disk"], config["run_root"], inspect_contents=True)
                     cache.mkdir(parents=True, exist_ok=True)

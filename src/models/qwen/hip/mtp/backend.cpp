@@ -261,7 +261,7 @@ std::vector<speculative::DraftProposal> QwenMtpGpuDraftBackend::ProposeBatch(
   static const std::size_t kMaxCohort = [] {
     const char* v = std::getenv("GUFO_MTP_MOE_MAX_COHORT");
     return v != nullptr ? static_cast<std::size_t>(std::atoll(v))
-                        : std::size_t{2};
+                        : speculative::kMtpMoeMaxCohort;
   }();
   if (!speculative::MtpMoeSkipsDraft(executor_->IsMoe(), requests.size(),
                                      kMaxCohort))

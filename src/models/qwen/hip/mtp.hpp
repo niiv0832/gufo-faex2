@@ -272,7 +272,8 @@ public:
     return true;
   }
   /// MoE targets verify every draft row against its own experts; wide
-  /// cohorts decode without a draft (GUFO_MTP_MOE_MAX_COHORT, default 2).
+  /// cohorts decode without a draft (speculative::kMtpMoeMaxCohort;
+  /// GUFO_MTP_MOE_MAX_COHORT overrides it).
   [[nodiscard]] std::vector<speculative::DraftProposal> ProposeBatch(
       std::span<const speculative::DraftProposalRequest> requests) override;
 

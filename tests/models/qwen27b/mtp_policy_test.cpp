@@ -114,6 +114,10 @@ void TestMoeCohortGate() {
          "wide MoE cohorts verify their experts without a draft");
   Expect(!MtpMoeSkipsDraft(false, 4, 2), "dense targets are never gated");
   Expect(!MtpMoeSkipsDraft(true, 4, 0), "a zero limit disables the gate");
+  using gufo::speculative::kMtpMoeMaxCohort;
+  Expect(!MtpMoeSkipsDraft(true, 4, kMtpMoeMaxCohort) &&
+             MtpMoeSkipsDraft(true, 5, kMtpMoeMaxCohort),
+         "the default limit drafts for up to four sessions");
 }
 
 }  // namespace
