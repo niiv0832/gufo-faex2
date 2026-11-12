@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "src/models/qwen/hip/kernels/staged_norm.hpp"
 #include "src/models/qwen/hip/ops/norm_residual.hpp"
 
 namespace gufo::hip {
@@ -17,32 +18,30 @@ __global__ void ResidualAddRMSNormKernel(float* __restrict__ rows_a,
                                          const float* __restrict__ weight,
                                          float* __restrict__ rows_out,
                                          std::size_t dim, float eps) {
+  __shared__ float s_val[kStagedNormDim];
   __shared__ float s_sum[256];
   const std::size_t tid = threadIdx.x;
   float* const a = rows_a + (blockIdx.x * dim);
   const float* const b = rows_b + (blockIdx.x * dim);
   float* const out = rows_out + (blockIdx.x * dim);
+  // A row of up to kStagedNormDim floats is staged in LDS so 1024 threads
+  // compute it; the squares are then summed by 256 threads in the stride-256
+  // order of the 256-thread kernel, which keeps the result bit for bit.
+  const bool staged = dim <= kStagedNormDim;
   float sum_sq = 0.0F;
   for (std::size_t i = tid; i < dim; i += blockDim.x) {
     const float val = a[i] + b[i];
     a[i] = val;
-    sum_sq += val * val;
-  }
-  s_sum[tid] = sum_sq;
-  __syncthreads();
-
-  for (std::size_t stride = blockDim.x / 2; stride > 0; stride /= 2) {
-    if (tid < stride) {
-      s_sum[tid] += s_sum[tid + stride];
+    if (staged) {
+      s_val[i] = val;
+    } else {
+      sum_sq += val * val;
     }
-    __syncthreads();
   }
-
-  const float mean_sq = s_sum[0] / static_cast<float>(dim);
-  const float inv_rms = rsqrtf(mean_sq + eps);
+  const float inv_rms = StagedRowInvRms(s_val, s_sum, sum_sq, dim, eps, staged);
   for (std::size_t i = tid; i < dim; i += blockDim.x) {
     const float w = (weight != nullptr) ? weight[i] : 1.0F;
-    out[i] = (a[i] * inv_rms) * w;
+    out[i] = ((staged ? s_val[i] : a[i]) * inv_rms) * w;
   }
 }
 
@@ -150,7 +149,8 @@ void LaunchRMSNorm(const float* x, const float* weight, float* out,
 void LaunchResidualAddRMSNorm(float* a, const float* b, const float* weight,
                               float* out, std::size_t dim, float eps,
                               hipStream_t stream, std::size_t rows) {
-  ResidualAddRMSNormKernel<<<static_cast<unsigned>(rows), 256, 0, stream>>>(
+  ResidualAddRMSNormKernel<<<static_cast<unsigned>(rows),
+                             StagedNormBlockThreads(dim), 0, stream>>>(
       a, b, weight, out, dim, eps);
 }
 void LaunchPerHeadRMSNorm(const float* x, const float* weight, float* out,

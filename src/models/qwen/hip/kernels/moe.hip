@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "src/models/qwen/hip/kernels/staged_norm.hpp"
 #include "src/models/qwen/hip/ops/moe.hpp"
 
 namespace gufo::hip {
@@ -182,6 +183,7 @@ __global__ void MoeCombineResidualAddRMSNormKernel(
     const float* __restrict__ rows_shared_weight,
     const float* __restrict__ weight, float* __restrict__ rows_out,
     std::uint32_t used, std::uint32_t hidden, float eps) {
+  __shared__ float s_val[kStagedNormDim];
   __shared__ float s_sum[256];
   const std::size_t tid = threadIdx.x;
   const std::size_t row = blockIdx.x;
@@ -191,6 +193,8 @@ __global__ void MoeCombineResidualAddRMSNormKernel(
   const float* const shared_out = rows_shared_out + (row * hidden);
   const float* const shared_weight = rows_shared_weight + row;
   float* const out = rows_out + (row * hidden);
+  // Staged like ResidualAddRMSNormKernel: 1024 threads for a short row.
+  const bool staged = hidden <= kStagedNormDim;
   float sum_sq = 0.0F;
   for (std::size_t i = tid; i < hidden; i += blockDim.x) {
     float sum = 0.0F;
@@ -200,23 +204,17 @@ __global__ void MoeCombineResidualAddRMSNormKernel(
     const float ffn = sum + shared_weight[0] * shared_out[i];
     const float val = a[i] + ffn;
     a[i] = val;
-    sum_sq += val * val;
-  }
-  s_sum[tid] = sum_sq;
-  __syncthreads();
-
-  for (std::size_t stride = blockDim.x / 2; stride > 0; stride /= 2) {
-    if (tid < stride) {
-      s_sum[tid] += s_sum[tid + stride];
+    if (staged) {
+      s_val[i] = val;
+    } else {
+      sum_sq += val * val;
     }
-    __syncthreads();
   }
-
-  const float mean_sq = s_sum[0] / static_cast<float>(hidden);
-  const float inv_rms = rsqrtf(mean_sq + eps);
+  const float inv_rms =
+      StagedRowInvRms(s_val, s_sum, sum_sq, hidden, eps, staged);
   for (std::size_t i = tid; i < hidden; i += blockDim.x) {
     const float w = (weight != nullptr) ? weight[i] : 1.0F;
-    out[i] = (a[i] * inv_rms) * w;
+    out[i] = ((staged ? s_val[i] : a[i]) * inv_rms) * w;
   }
 }
 
@@ -437,7 +435,8 @@ void LaunchMoeCombineResidualAddRMSNorm(
     const float* shared_out, const float* shared_weight, const float* weight,
     float* out, std::uint32_t used, std::uint32_t hidden, float eps,
     std::uint32_t rows, hipStream_t stream) {
-  MoeCombineResidualAddRMSNormKernel<<<rows, 256, 0, stream>>>(
+  MoeCombineResidualAddRMSNormKernel<<<rows, StagedNormBlockThreads(hidden),
+                                       0, stream>>>(
       hidden_rows, slot_out, slot_weight, shared_out, shared_weight, weight,
       out, used, hidden, eps);
 }

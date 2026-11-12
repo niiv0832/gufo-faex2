@@ -169,9 +169,10 @@ int main() {
   if (device_status != gufo::test::kHipTestSuccess) {
     return device_status;
   }
-  // 2048 is Qwen3.6-35B-A3B; the others cover a ragged last stride.
-  for (const std::size_t hidden :
-       {std::size_t{2048}, std::size_t{1536}, std::size_t{1000}}) {
+  // 2048 is Qwen3.6-35B-A3B; 1536 and 1000 cover a ragged last stride and
+  // 2560 a row too long to stage in LDS.
+  for (const std::size_t hidden : {std::size_t{2048}, std::size_t{1536},
+                                   std::size_t{1000}, std::size_t{2560}}) {
     TestHidden(hidden);
   }
   std::cout << "Qwen MoE tail ops test passed on gfx1151.\n";
