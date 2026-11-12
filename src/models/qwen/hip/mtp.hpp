@@ -152,6 +152,24 @@ public:
       const noexcept {
     return model_->GetDraftVocab();
   }
+  /// Waits for the queued step. Heads share the MoE feed-forward scratch, so
+  /// a step without logits must finish before another head starts its own.
+  void FinishStep();
+  /// The draft token of a step that ran without logits: the single-row LM
+  /// head pass a step with logits ends with.
+  [[nodiscard]] tokenization::TokenId ScoreLast();
+  /// Most heads one shared pass scores.
+  static constexpr std::size_t kMaxSharedScoreRows = 8;
+  /// Whether ScoreTogether can serve these heads' LM head.
+  [[nodiscard]] bool SupportsSharedScore() const noexcept;
+  /// The draft tokens of two or more heads of one model that each finished a
+  /// step without logits and score the same vocabulary: the LM head rows are
+  /// read once for all of them. Each row is the batched exact FP32 projection
+  /// that target verification uses; on the Q8_0 head of Qwen3.6-35B-A3B it
+  /// equals ScoreLast() bit for bit (qwen_mtp_draft_vocab_test). With
+  /// `keep_logits`, CopyLastLogits() of every head returns its row.
+  [[nodiscard]] static std::vector<tokenization::TokenId> ScoreTogether(
+      std::span<QwenMtpGpuExecutor* const> heads, bool keep_logits);
   /// Chooses the vocabulary of the following forward passes.
   void ScoreWholeVocabulary(bool whole) noexcept { whole_vocab_ = whole; }
 
@@ -216,6 +234,12 @@ private:
   void* d_kv_cache_f16_{nullptr};
   float* d_split_k_scratch_{nullptr};
   std::uint32_t* d_out_token_{nullptr};
+  // Rows of a shared score, owned by the head that leads it.
+  float* d_shared_hidden_{nullptr};
+  float* d_shared_logits_{nullptr};
+  std::uint32_t* d_shared_tokens_{nullptr};
+  // CopyLastLogits() already holds this head's row of a shared score.
+  bool host_logits_ready_{false};
 
   static constexpr std::size_t kPrimeChunk = 1024;
   void EnsurePrimeScratch();
@@ -328,6 +352,18 @@ private:
       std::span<const tokenization::TokenId> prompt_tokens,
       std::uint32_t current_pos, std::uint32_t max_tokens, float temperature,
       std::uint64_t* rng_state);
+  /// Draft rows a proposal of at most `max_tokens` takes.
+  [[nodiscard]] std::uint32_t ProposalRows(
+      std::uint32_t max_tokens) const noexcept;
+  /// Starts a proposal of `count` rows: the checkpoint, the anchor row and the
+  /// vocabulary its rows score.
+  void BeginProposal(std::span<const tokenization::TokenId> prompt_tokens,
+                     std::uint32_t count);
+  /// The token of one proposal row from the head's argmax: the argmax itself,
+  /// or a draw from the row's distribution, which is appended to `proposal`.
+  [[nodiscard]] tokenization::TokenId ChooseDraftToken(
+      tokenization::TokenId argmax, float temperature, std::uint64_t* rng_state,
+      speculative::DraftProposal& proposal);
   /// Returns an empty proposal for a target-only step (the runner then
   /// appends the committed token, advancing the MTP cache).
   [[nodiscard]] speculative::DraftProposal SkipDraft(

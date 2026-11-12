@@ -166,25 +166,17 @@ speculative::DraftProposal QwenMtpGpuDraftBackend::ProposeSampled(
                      rng_state);
 }
 
-speculative::DraftProposal QwenMtpGpuDraftBackend::ProposeImpl(
-    std::span<const tokenization::TokenId> prompt_tokens,
-    std::uint32_t current_pos, std::uint32_t max_tokens, float temperature,
-    std::uint64_t* rng_state) {
-  CheckProposalFrontier(prompt_tokens, current_pos);
-
-  speculative::DraftProposal proposal;
-  proposal.start_pos = current_pos;
+std::uint32_t QwenMtpGpuDraftBackend::ProposalRows(
+    std::uint32_t max_tokens) const noexcept {
   // Verifying a row reads its own experts, so MoE targets pay for every
   // extra draft row; three is the sweet spot on prose and code.
   constexpr std::uint32_t kMoeDraftCap = 3;
-  std::uint32_t count = std::min(max_tokens, config_.max_draft_tokens);
-  if (executor_->IsMoe()) {
-    count = std::min(count, kMoeDraftCap);
-  }
-  if (count == 0) {
-    return proposal;
-  }
+  const std::uint32_t count = std::min(max_tokens, config_.max_draft_tokens);
+  return executor_->IsMoe() ? std::min(count, kMoeDraftCap) : count;
+}
 
+void QwenMtpGpuDraftBackend::BeginProposal(
+    std::span<const tokenization::TokenId> prompt_tokens, std::uint32_t count) {
   proposal_checkpoint_ = executor_->GetNextPosition();
   proposal_input_ = prompt_tokens.back();
   proposal_target_hidden_ = target_hidden_;
@@ -201,43 +193,57 @@ speculative::DraftProposal QwenMtpGpuDraftBackend::ProposeImpl(
   executor_->ScoreWholeVocabulary(!draft_vocab.ids.empty() &&
                                   speculative::MtpDraftNeedsWholeVocabulary(
                                       prompt_tokens, draft_vocab.listed));
+}
 
-  const bool sampled = temperature > 0.0F;
-  std::vector<tokenization::TokenId> row_ids;
-  std::vector<float> row_probs;
-  if (sampled) {
-    proposal.candidates_per_token = std::min<std::size_t>(
-        speculative::kMtpSampledTopK, executor_->ScoredVocab());
-    proposal.candidate_ids.reserve(count * proposal.candidates_per_token);
-    proposal.candidate_probabilities.reserve(count *
-                                             proposal.candidates_per_token);
+tokenization::TokenId QwenMtpGpuDraftBackend::ChooseDraftToken(
+    tokenization::TokenId argmax, float temperature, std::uint64_t* rng_state,
+    speculative::DraftProposal& proposal) {
+  if (!(temperature > 0.0F)) {
+    return argmax;
   }
   // Each sampled row is the distribution actually drawn from, conditional on
   // the earlier sampled tokens fed back into the MTP layer.
-  const auto choose = [&](tokenization::TokenId argmax) {
-    if (!sampled)
-      return argmax;
-    const auto logits = executor_->CopyLastLogits();
-    speculative::MtpTopKDistribution(logits, temperature,
-                                     proposal.candidates_per_token, &row_ids,
-                                     &row_probs);
-    for (auto& id : row_ids) {
-      id = executor_->ScoredTokenId(static_cast<std::size_t>(id));
-    }
-    proposal.candidate_ids.insert(proposal.candidate_ids.end(),
-                                  row_ids.begin(), row_ids.end());
-    proposal.candidate_probabilities.insert(
-        proposal.candidate_probabilities.end(), row_probs.begin(),
-        row_probs.end());
-    return speculative::MtpSampleRow(row_ids, row_probs,
-                                     sampling::Uniform(rng_state));
-  };
-  auto token = choose(executor_->ForwardTargetHidden(
-      proposal_input_, target_hidden_, proposal_checkpoint_, true));
+  proposal.candidates_per_token = std::min<std::size_t>(
+      speculative::kMtpSampledTopK, executor_->ScoredVocab());
+  std::vector<tokenization::TokenId> row_ids;
+  std::vector<float> row_probs;
+  const auto logits = executor_->CopyLastLogits();
+  speculative::MtpTopKDistribution(
+      logits, temperature, proposal.candidates_per_token, &row_ids, &row_probs);
+  for (auto& id : row_ids) {
+    id = executor_->ScoredTokenId(static_cast<std::size_t>(id));
+  }
+  proposal.candidate_ids.insert(proposal.candidate_ids.end(), row_ids.begin(),
+                                row_ids.end());
+  proposal.candidate_probabilities.insert(
+      proposal.candidate_probabilities.end(), row_probs.begin(),
+      row_probs.end());
+  return speculative::MtpSampleRow(row_ids, row_probs,
+                                   sampling::Uniform(rng_state));
+}
+
+speculative::DraftProposal QwenMtpGpuDraftBackend::ProposeImpl(
+    std::span<const tokenization::TokenId> prompt_tokens,
+    std::uint32_t current_pos, std::uint32_t max_tokens, float temperature,
+    std::uint64_t* rng_state) {
+  CheckProposalFrontier(prompt_tokens, current_pos);
+
+  speculative::DraftProposal proposal;
+  proposal.start_pos = current_pos;
+  const std::uint32_t count = ProposalRows(max_tokens);
+  if (count == 0) {
+    return proposal;
+  }
+  BeginProposal(prompt_tokens, count);
+  auto token = ChooseDraftToken(
+      executor_->ForwardTargetHidden(proposal_input_, target_hidden_,
+                                     proposal_checkpoint_, true),
+      temperature, rng_state, proposal);
   proposed_tokens_.push_back(token);
   for (std::uint32_t index = 1; index < count; ++index) {
-    token = choose(
-        executor_->ForwardFeedback(token, proposal_checkpoint_ + index, true));
+    token = ChooseDraftToken(
+        executor_->ForwardFeedback(token, proposal_checkpoint_ + index, true),
+        temperature, rng_state, proposal);
     proposed_tokens_.push_back(token);
   }
   proposal.tokens = proposed_tokens_;
@@ -263,8 +269,7 @@ std::vector<speculative::DraftProposal> QwenMtpGpuDraftBackend::ProposeBatch(
     return v != nullptr ? static_cast<std::size_t>(std::atoll(v))
                         : speculative::kMtpMoeMaxCohort;
   }();
-  if (!speculative::MtpMoeSkipsDraft(executor_->IsMoe(), requests.size(),
-                                     kMaxCohort))
+  if (!executor_->IsMoe() || requests.size() < 2)
     return IDraftBackend::ProposeBatch(requests);
   std::vector<QwenMtpGpuDraftBackend*> backends;
   backends.reserve(requests.size());
@@ -281,9 +286,73 @@ std::vector<speculative::DraftProposal> QwenMtpGpuDraftBackend::ProposeBatch(
   }
   std::vector<speculative::DraftProposal> proposals;
   proposals.reserve(requests.size());
-  for (std::size_t index = 0; index < requests.size(); ++index)
-    proposals.push_back(backends[index]->SkipDraft(requests[index].tokens,
-                                                   requests[index].position));
+  if (speculative::MtpMoeSkipsDraft(true, requests.size(), kMaxCohort)) {
+    for (std::size_t index = 0; index < requests.size(); ++index)
+      proposals.push_back(backends[index]->SkipDraft(requests[index].tokens,
+                                                     requests[index].position));
+    return proposals;
+  }
+
+  // One-row proposals share the pass over the LM head: every session runs
+  // its own layer, then the sessions scoring the same vocabulary are scored
+  // together. Other shapes keep the per-session proposals.
+  bool shared = requests.size() <= QwenMtpGpuExecutor::kMaxSharedScoreRows;
+  for (std::size_t index = 0; index < requests.size() && shared; ++index) {
+    const auto& request = requests[index];
+    if (request.temperature > 0.0F && request.rng_state == nullptr)
+      throw std::invalid_argument("MTP sampled proposal requires RNG state");
+    shared = backends[index]->executor_->SupportsSharedScore() &&
+             backends[index]->ProposalRows(request.max_tokens) == 1;
+  }
+  if (!shared)
+    return IDraftBackend::ProposeBatch(requests);
+  for (std::size_t index = 0; index < requests.size(); ++index) {
+    auto& backend = *backends[index];
+    backend.CheckProposalFrontier(requests[index].tokens,
+                                  requests[index].position);
+    backend.BeginProposal(requests[index].tokens, 1);
+    (void)backend.executor_->ForwardTargetHidden(
+        backend.proposal_input_, backend.target_hidden_,
+        backend.proposal_checkpoint_, false);
+    backend.executor_->FinishStep();
+    proposals.emplace_back().start_pos = requests[index].position;
+  }
+  std::vector<bool> scored(requests.size(), false);
+  std::vector<tokenization::TokenId> argmax(requests.size());
+  for (std::size_t first = 0; first < requests.size(); ++first) {
+    if (scored[first])
+      continue;
+    // The sessions that score the vocabulary of `first`.
+    std::vector<std::size_t> members;
+    std::vector<QwenMtpGpuExecutor*> heads;
+    bool keep_logits = false;
+    const std::size_t vocabulary = backends[first]->executor_->ScoredVocab();
+    for (std::size_t index = first; index < requests.size(); ++index) {
+      if (scored[index] ||
+          backends[index]->executor_->ScoredVocab() != vocabulary)
+        continue;
+      scored[index] = true;
+      members.push_back(index);
+      heads.push_back(backends[index]->executor_.get());
+      keep_logits = keep_logits || requests[index].temperature > 0.0F;
+    }
+    if (members.size() == 1) {
+      argmax[first] = heads.front()->ScoreLast();
+      continue;
+    }
+    const auto tokens = QwenMtpGpuExecutor::ScoreTogether(heads, keep_logits);
+    for (std::size_t member = 0; member < members.size(); ++member)
+      argmax[members[member]] = tokens[member];
+  }
+  for (std::size_t index = 0; index < requests.size(); ++index) {
+    auto& backend = *backends[index];
+    const auto token =
+        backend.ChooseDraftToken(argmax[index], requests[index].temperature,
+                                 requests[index].rng_state, proposals[index]);
+    backend.proposed_tokens_.push_back(token);
+    proposals[index].tokens = backend.proposed_tokens_;
+    backend.proposal_active_ = true;
+  }
   return proposals;
 }
 

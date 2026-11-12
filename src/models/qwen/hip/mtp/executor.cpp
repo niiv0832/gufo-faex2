@@ -166,6 +166,9 @@ void QwenMtpGpuExecutor::Free() noexcept {
   free_buffer(d_kv_cache_f16_);
   free_buffer(d_split_k_scratch_);
   free_buffer(d_out_token_);
+  free_buffer(d_shared_hidden_);
+  free_buffer(d_shared_logits_);
+  free_buffer(d_shared_tokens_);
   free_buffer(d_prime_tokens_);
   free_buffer(d_prime_buffer_);
   free_buffer(d_prime_bf16_);
@@ -320,13 +323,19 @@ tokenization::TokenId QwenMtpGpuExecutor::Run(tokenization::TokenId input_token,
                 d_feedback_hidden_, hidden, 1.0e-6F, stream_);
   ++next_position_;
 
-  if (!compute_logits) {
-    return 0;
-  }
+  host_logits_ready_ = false;
+  return compute_logits ? ScoreLast() : 0;
+}
+
+tokenization::TokenId QwenMtpGpuExecutor::ScoreLast() {
+  const auto& weights = model_->GetWeights();
+  const auto& config = weights.config;
+  const std::size_t hidden = config.hidden_size;
   const std::size_t scored = ScoredVocab();
   const auto& head = scored == config.vocab_size
                          ? weights.output
                          : model_->GetDraftVocab().output;
+  host_logits_ready_ = false;
   LaunchGEMV(head.data, head.type, d_feedback_hidden_, d_logits_, scored,
              hidden, stream_, models::qwen::QwenGemmMode::kHipMtp);
   // The feed-forward output is dead after the residual add: its buffer holds
@@ -340,6 +349,75 @@ tokenization::TokenId QwenMtpGpuExecutor::Run(tokenization::TokenId input_token,
     throw std::runtime_error("MTP GPU result synchronization failed");
   }
   return ScoredTokenId(CheckedSampleToken(result, scored));
+}
+
+void QwenMtpGpuExecutor::FinishStep() {
+  HIP_CHECK(hipStreamSynchronize(stream_));
+}
+
+bool QwenMtpGpuExecutor::SupportsSharedScore() const noexcept {
+  const auto type = model_->GetWeights().output.type;
+  return type == core::GgmlType::kQ8_0 || type == core::GgmlType::kQ8_K ||
+         detail::IsNativeWmmaQuant(type);
+}
+
+std::vector<tokenization::TokenId> QwenMtpGpuExecutor::ScoreTogether(
+    std::span<QwenMtpGpuExecutor* const> heads, bool keep_logits) {
+  if (heads.size() < 2 || heads.size() > kMaxSharedScoreRows) {
+    throw std::invalid_argument("MTP shared score takes two to eight heads");
+  }
+  QwenMtpGpuExecutor& lead = *heads.front();
+  const auto& weights = lead.model_->GetWeights();
+  const auto& config = weights.config;
+  const std::size_t hidden = config.hidden_size;
+  const std::size_t scored = lead.ScoredVocab();
+  for (QwenMtpGpuExecutor* const head : heads) {
+    if (head->model_ != lead.model_ || head->ScoredVocab() != scored ||
+        !head->SupportsSharedScore()) {
+      throw std::invalid_argument("MTP shared score mixes head configurations");
+    }
+  }
+  if (lead.d_shared_hidden_ == nullptr) {
+    AllocateBuffer(lead.d_shared_hidden_, kMaxSharedScoreRows * hidden);
+    AllocateBuffer(lead.d_shared_logits_,
+                   kMaxSharedScoreRows * config.vocab_size);
+    AllocateBuffer(lead.d_shared_tokens_, kMaxSharedScoreRows);
+  }
+  // Each head finished its layer on its own stream; the rows meet on the
+  // leading head's.
+  for (std::size_t row = 0; row < heads.size(); ++row) {
+    HIP_CHECK(hipMemcpyAsync(
+        lead.d_shared_hidden_ + (row * hidden), heads[row]->d_feedback_hidden_,
+        hidden * sizeof(float), hipMemcpyDeviceToDevice, lead.stream_));
+  }
+  const auto& output = scored == config.vocab_size
+                           ? weights.output
+                           : lead.model_->GetDraftVocab().output;
+  LaunchBatchedQuantGEMMFp32(output.type, output.data, lead.d_shared_hidden_,
+                             lead.d_shared_logits_, heads.size(), scored,
+                             hidden, lead.stream_);
+  // The leading head's feed-forward output is dead: it holds the tile maxima.
+  LaunchBatchedGPUArgmax(
+      lead.d_shared_logits_, lead.d_shared_tokens_, heads.size(), scored,
+      std::span<float>(lead.d_ffn_out_, hidden), lead.stream_);
+  std::vector<std::uint32_t> raw(heads.size());
+  HIP_CHECK(hipMemcpyAsync(raw.data(), lead.d_shared_tokens_,
+                           raw.size() * sizeof(std::uint32_t),
+                           hipMemcpyDeviceToHost, lead.stream_));
+  for (std::size_t row = 0; row < heads.size(); ++row) {
+    heads[row]->host_logits_ready_ = keep_logits;
+    if (keep_logits) {
+      HIP_CHECK(hipMemcpyAsync(
+          heads[row]->h_logits_.data(), lead.d_shared_logits_ + (row * scored),
+          scored * sizeof(float), hipMemcpyDeviceToHost, lead.stream_));
+    }
+  }
+  HIP_CHECK(hipStreamSynchronize(lead.stream_));
+  std::vector<tokenization::TokenId> tokens(heads.size());
+  for (std::size_t row = 0; row < heads.size(); ++row) {
+    tokens[row] = lead.ScoredTokenId(CheckedSampleToken(raw[row], scored));
+  }
+  return tokens;
 }
 
 void QwenMtpGpuExecutor::EnsurePrimeScratch() {
@@ -592,6 +670,9 @@ tokenization::TokenId QwenMtpGpuExecutor::ScoredTokenId(
 
 std::span<const float> QwenMtpGpuExecutor::CopyLastLogits() {
   const std::size_t scored = ScoredVocab();
+  if (host_logits_ready_) {
+    return std::span<const float>(h_logits_).first(scored);
+  }
   const auto error =
       hipMemcpyAsync(h_logits_.data(), d_logits_, scored * sizeof(float),
                      hipMemcpyDeviceToHost, stream_);

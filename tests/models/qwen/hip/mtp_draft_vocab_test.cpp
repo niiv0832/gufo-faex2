@@ -1,13 +1,17 @@
 // The MTP draft vocabulary on real weights: the head scores only the rows of
 // speculative::MtpDraftScoresToken, and each of those logits is, bit for bit,
 // the logit the target's whole LM head gives the same token. Switched to the
-// whole vocabulary, the head returns that head's logits.
+// whole vocabulary, the head returns that head's logits. Several heads scored
+// in one pass get rows that do not depend on the other heads of the pass and
+// equal the single-row pass bit for bit.
 //
 // qwen_mtp_draft_vocab_test [MODEL.gguf]
 // Without an argument GUFO_QWEN_LAYERED_PREFILL_MODEL names the weights; the
 // test is skipped without it, without an embedded MTP head, or when the head
 // scores the whole vocabulary.
 
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -201,6 +205,90 @@ int main(int argc, char** argv) {
     }
     HIP_CHECK(hipFree(d_hidden));
     HIP_CHECK(hipFree(d_logits));
+
+    // Shared scoring: three heads with caches of their own.
+    std::vector<std::unique_ptr<gufo::hip::QwenMtpGpuExecutor>> owned;
+    std::vector<gufo::hip::QwenMtpGpuExecutor*> trio;
+    const std::size_t primed = tokens.size() - 4;
+    for (std::size_t index = 0; index < 3; ++index) {
+      auto next =
+          gufo::hip::QwenMtpGpuExecutor::Create(mtp, kContext, &head_error);
+      if (!next)
+        throw std::runtime_error("MTP executor: " + head_error);
+      Expect(next->SupportsSharedScore(), "this LM head has no shared score");
+      next->PrimeBatch(std::span(tokens).subspan(index, primed),
+                       std::span(rows).subspan(index * hidden, primed * hidden),
+                       0);
+      trio.push_back(next.get());
+      owned.push_back(std::move(next));
+    }
+    for (const bool whole : {false, true}) {
+      const std::size_t scored = whole ? vocab : ids.size();
+      std::vector<std::vector<float>> single(3), together(3), swapped(3);
+      std::vector<TokenId> single_tokens(3);
+      const auto step = [&](std::size_t index, bool logits) {
+        trio[index]->Rewind(static_cast<std::uint32_t>(primed));
+        trio[index]->ScoreWholeVocabulary(whole);
+        const TokenId token = trio[index]->ForwardTargetHidden(
+            tokens[index + primed],
+            std::span(rows).subspan((index + primed) * hidden, hidden),
+            static_cast<std::uint32_t>(primed), logits);
+        trio[index]->FinishStep();
+        return token;
+      };
+      for (std::size_t index = 0; index < 3; ++index) {
+        single_tokens[index] = step(index, true);
+        const auto logits = trio[index]->CopyLastLogits();
+        single[index].assign(logits.begin(), logits.end());
+      }
+      for (std::size_t index = 0; index < 3; ++index)
+        (void)step(index, false);
+      const auto shared_tokens =
+          gufo::hip::QwenMtpGpuExecutor::ScoreTogether(trio, true);
+      for (std::size_t index = 0; index < 3; ++index) {
+        const auto logits = trio[index]->CopyLastLogits();
+        together[index].assign(logits.begin(), logits.end());
+      }
+      // Another pass, led by another head, with two of the three rows.
+      for (std::size_t index = 0; index < 3; ++index)
+        (void)step(index, false);
+      std::vector<gufo::hip::QwenMtpGpuExecutor*> pair{trio[2], trio[0]};
+      const auto pair_tokens =
+          gufo::hip::QwenMtpGpuExecutor::ScoreTogether(pair, true);
+      for (const std::size_t index : {std::size_t{2}, std::size_t{0}}) {
+        const auto logits = trio[index]->CopyLastLogits();
+        swapped[index].assign(logits.begin(), logits.end());
+      }
+      float worst = 0.0F;
+      std::size_t same_tokens = 0;
+      bool ok = pair_tokens[0] == shared_tokens[2] &&
+                pair_tokens[1] == shared_tokens[0];
+      for (std::size_t index = 0; index < 3; ++index) {
+        ok = ok && together[index].size() == scored &&
+             single[index].size() == scored;
+        std::size_t best = 0;
+        for (std::size_t i = 0; i < scored && ok; ++i) {
+          worst =
+              std::max(worst, std::abs(together[index][i] - single[index][i]));
+          if (together[index][i] > together[index][best])
+            best = i;
+        }
+        ok = ok && shared_tokens[index] ==
+                       (whole ? static_cast<TokenId>(best) : ids[best]);
+        if (index != 1) {
+          ok = ok && std::memcmp(together[index].data(), swapped[index].data(),
+                                 scored * sizeof(float)) == 0;
+        }
+        same_tokens += shared_tokens[index] == single_tokens[index];
+      }
+      // On this LM head the shared pass equals the single-row pass exactly.
+      ok = ok && worst == 0.0F && same_tokens == 3;
+      std::cout << "shared,whole=" << whole << ",scored=" << scored
+                << ",max_abs_vs_single=" << worst
+                << ",tokens_equal_single=" << same_tokens << "/3,"
+                << (ok ? "PASS" : "FAIL") << '\n';
+      passed = passed && ok;
+    }
     return passed ? 0 : 1;
   } catch (const std::exception& failure) {
     std::cerr << "qwen_mtp_draft_vocab_test: " << failure.what() << '\n';
