@@ -1,13 +1,22 @@
-// MTP head with an FP16-only K/V cache (eight query heads per KV head, as in
-// Qwen3.6-35B-A3B) on real weights. A snapshot must carry every cached
-// position: a head restored from it has to reproduce the draft logits of the
-// head that wrote it, bit for bit, at every attention route (online, split-K
-// per head, and the shared-KV kernel from 512 positions on).
+// MTP head K/V cache snapshots on real weights.
 //
-// qwen_mtp_half_kv_test [MODEL.gguf]
-// Without an argument GUFO_QWEN_LAYERED_PREFILL_MODEL names the weights; the
-// test is skipped without it, without an embedded MTP head, or when the head
-// keeps both cache precisions.
+// FP16-only cache (eight query heads per KV head, as in Qwen3.6-35B-A3B): a
+// snapshot must carry every cached position, so a head restored from it
+// reproduces the draft logits of the head that wrote it, bit for bit, at every
+// attention route (online, split-K per head, and the shared-KV kernel from 512
+// positions on), and a snapshot that loses positions drafts other logits.
+//
+// Cache in both precisions (Qwen3.8 27B with its MTP file): the snapshot
+// holds the FP32 planes head by head and the FP16 planes position by
+// position. Every FP16 value must be the rounded FP32 value of the same
+// position, head and dimension, in the snapshot a head wrote and in the one
+// a restored head writes again; planes cut along the wrong axis break that.
+// The draft logits of this head do not depend on its cache when the target
+// hidden states are synthetic, so they cannot serve as the check here.
+//
+// qwen_mtp_half_kv_test [MODEL.gguf [MTP.gguf]]
+// Without arguments GUFO_QWEN_LAYERED_PREFILL_MODEL names the weights; the
+// test is skipped without it, or without an MTP head (embedded, or the file).
 
 #include <cstdint>
 #include <cstdlib>
@@ -69,6 +78,44 @@ std::vector<float> Draft(gufo::hip::QwenMtpGpuExecutor& head,
   return all;
 }
 
+// Positions whose FP16 copy is not the rounded FP32 value, in a snapshot of a
+// head that keeps both precisions: [position][FP32 K and V, head-major][FP16 K
+// and V, token-major].
+std::size_t PrecisionMismatches(std::span<const std::uint8_t> payload,
+                                std::size_t positions, std::size_t heads,
+                                std::size_t dim) {
+  const std::size_t plane = positions * heads * dim;
+  const std::uint8_t* const full = payload.data() + sizeof(std::uint32_t);
+  const std::uint8_t* const half = full + (2 * plane * sizeof(float));
+  std::size_t mismatches = 0;
+  for (std::size_t which = 0; which < 2; ++which) {
+    for (std::size_t position = 0; position < positions; ++position) {
+      bool equal = true;
+      for (std::size_t head = 0; head < heads && equal; ++head) {
+        for (std::size_t d = 0; d < dim; ++d) {
+          float value = 0.0F;
+          std::memcpy(&value,
+                      full + ((which * plane) + (head * positions * dim) +
+                              (position * dim) + d) *
+                                 sizeof(float),
+                      sizeof(value));
+          const _Float16 rounded = static_cast<_Float16>(value);
+          if (std::memcmp(&rounded,
+                          half + ((which * plane) + (position * heads * dim) +
+                                  (head * dim) + d) *
+                                     sizeof(std::uint16_t),
+                          sizeof(rounded)) != 0) {
+            equal = false;
+            break;
+          }
+        }
+      }
+      mismatches += equal ? 0 : 1;
+    }
+  }
+  return mismatches;
+}
+
 bool Same(const std::vector<float>& a, const std::vector<float>& b) {
   return a.size() == b.size() &&
          std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0;
@@ -88,8 +135,8 @@ std::unique_ptr<gufo::hip::QwenMtpGpuExecutor> Head(
 
 int main(int argc, char** argv) {
 #if defined(ENGINE_ENABLE_HIP)
-  if (argc > 2) {
-    std::cerr << "Usage: qwen_mtp_half_kv_test [MODEL.gguf]\n";
+  if (argc > 3) {
+    std::cerr << "Usage: qwen_mtp_half_kv_test [MODEL.gguf [MTP.gguf]]\n";
     return 2;
   }
   const char* env = std::getenv("GUFO_QWEN_LAYERED_PREFILL_MODEL");
@@ -110,16 +157,27 @@ int main(int argc, char** argv) {
     const auto target = gufo::hip::QwenGpuModel::CreateFromGguf(reader, &error);
     if (!target)
       throw std::runtime_error("model: " + error);
-    const auto mtp = gufo::hip::QwenMtpGpuModel::CreateEmbedded(target, &error);
+    std::shared_ptr<const gufo::hip::QwenMtpGpuModel> mtp;
+    if (argc > 2) {
+      auto mtp_reader = gufo::core::GgufReader::OpenFile(argv[2], &error);
+      if (!mtp_reader)
+        throw std::runtime_error("open MTP: " + error);
+      mtp = gufo::hip::QwenMtpGpuModel::Create(
+          std::shared_ptr<const gufo::core::GgufReader>(std::move(mtp_reader)),
+          target, &error);
+      if (!mtp)
+        throw std::runtime_error("MTP model: " + error);
+    } else {
+      mtp = gufo::hip::QwenMtpGpuModel::CreateEmbedded(target, &error);
+    }
     if (!mtp) {
       std::cerr << "no embedded MTP head (" << error << "); skipping\n";
       return 77;
     }
     const auto& config = mtp->GetConfig();
-    if (!gufo::hip::QwenMtpGpuExecutor::KeepsHalfKvOnly(config)) {
-      std::cerr << "this head keeps both cache precisions; skipping\n";
-      return 77;
-    }
+    const bool half_only =
+        gufo::hip::QwenMtpGpuExecutor::KeepsHalfKvOnly(config);
+    std::cout << "cache=" << (half_only ? "fp16" : "fp32+fp16") << '\n';
     const auto tokens = target->GetTokenizer().Encode(Ledger(260));
     const auto hidden = HiddenRows(tokens.size(), config.hidden_size);
     auto writer = Head(mtp);
@@ -138,9 +196,10 @@ int main(int argc, char** argv) {
       writer->PrimeBatch(prefix, prefix_hidden, 0);
       std::vector<std::uint8_t> payload(writer->StateBytes());
       const std::size_t expected =
-          sizeof(std::uint32_t) + primed * config.num_key_value_heads *
-                                      config.head_dim * 2 *
-                                      sizeof(std::uint16_t);
+          sizeof(std::uint32_t) +
+          primed * config.num_key_value_heads * config.head_dim * 2 *
+              (half_only ? sizeof(std::uint16_t)
+                         : sizeof(float) + sizeof(std::uint16_t));
       writer->SaveState(payload);
       const auto reference = Draft(*writer, tokens, hidden, primed);
 
@@ -152,6 +211,18 @@ int main(int argc, char** argv) {
                                     primed * config.hidden_size),
           0);
       reader_head->LoadState(payload);
+      // A restored head writes the snapshot it was restored from.
+      std::vector<std::uint8_t> resaved(reader_head->StateBytes());
+      reader_head->SaveState(resaved);
+      const bool resaved_equal = resaved == payload;
+      const std::size_t mismatches =
+          half_only || payload.size() != expected
+              ? 0
+              : PrecisionMismatches(payload, primed, config.num_key_value_heads,
+                                    config.head_dim) +
+                    PrecisionMismatches(resaved, primed,
+                                        config.num_key_value_heads,
+                                        config.head_dim);
       const auto restored = Draft(*reader_head, tokens, hidden, primed);
 
       // The check must notice a snapshot that loses the later positions:
@@ -181,11 +252,15 @@ int main(int argc, char** argv) {
       const auto after_commit = Draft(*reader_head, tokens, hidden, primed + 1);
       const bool commit_ok = Same(after_step, after_commit);
 
+      // The logits notice a damaged snapshot only where they read the cache.
       const bool ok = commit_ok && payload.size() == expected &&
                       !reference.empty() && Same(reference, restored) &&
-                      !Same(reference, corrupted);
+                      resaved_equal && mismatches == 0 &&
+                      (!half_only || !Same(reference, corrupted));
       std::cout << "primed=" << primed << ",state_bytes=" << payload.size()
                 << ",restored_equal=" << Same(reference, restored)
+                << ",resaved_equal=" << resaved_equal
+                << ",precision_mismatches=" << mismatches
                 << ",damage_detected=" << !Same(reference, corrupted)
                 << ",commit_equal=" << commit_ok << ','
                 << (ok ? "PASS" : "FAIL") << '\n';
