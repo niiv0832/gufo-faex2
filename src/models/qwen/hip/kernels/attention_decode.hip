@@ -956,6 +956,17 @@ static void LaunchSplitKAttentionHalfPartials(
   }
 }
 
+void LaunchDecodeKvWrite(const float* k, const float* v, float* k_cache,
+                         float* v_cache, void* k_cache_f16, void* v_cache_f16,
+                         std::uint32_t layer_idx, std::uint32_t pos,
+                         std::uint32_t max_context, std::uint32_t num_kv_heads,
+                         std::uint32_t head_dim, hipStream_t stream) {
+  WriteKVCacheKernel<<<num_kv_heads, 256, 0, stream>>>(
+      k, v, k_cache, v_cache, static_cast<__half*>(k_cache_f16),
+      static_cast<__half*>(v_cache_f16), layer_idx, pos, max_context,
+      num_kv_heads, head_dim);
+}
+
 void LaunchAttention(const float* q, const float* k, const float* v,
                      const float* gate, float* k_cache, float* v_cache,
                      void* k_cache_f16, void* v_cache_f16, float* out_context,

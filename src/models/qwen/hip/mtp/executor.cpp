@@ -203,6 +203,24 @@ tokenization::TokenId QwenMtpGpuExecutor::ForwardTargetHidden(
   return Run(input_token, d_target_hidden_, position, compute_logits);
 }
 
+void QwenMtpGpuExecutor::CommitTargetHidden(
+    tokenization::TokenId input_token, std::span<const float> target_hidden,
+    std::uint32_t position) {
+  if (target_hidden.size() != model_->GetConfig().hidden_size) {
+    throw std::invalid_argument("MTP target hidden width is invalid");
+  }
+  const auto copy_error = hipMemcpyAsync(d_target_hidden_, target_hidden.data(),
+                                         target_hidden.size_bytes(),
+                                         hipMemcpyHostToDevice, stream_);
+  if (copy_error != hipSuccess) {
+    throw std::runtime_error(std::string("MTP hidden copy failed: ") +
+                             hipGetErrorString(copy_error));
+  }
+  (void)Run(input_token, d_target_hidden_, position, false, true);
+  // The host buffer behind the queued copy belongs to the caller.
+  HIP_CHECK(hipStreamSynchronize(stream_));
+}
+
 tokenization::TokenId QwenMtpGpuExecutor::ForwardFeedback(
     tokenization::TokenId input_token, std::uint32_t position,
     bool compute_logits) {
@@ -212,7 +230,8 @@ tokenization::TokenId QwenMtpGpuExecutor::ForwardFeedback(
 tokenization::TokenId QwenMtpGpuExecutor::Run(tokenization::TokenId input_token,
                                               const float* hidden_input,
                                               std::uint32_t position,
-                                              bool compute_logits) {
+                                              bool compute_logits,
+                                              bool cache_only) {
   if (position != next_position_ || position >= max_context_) {
     throw std::out_of_range("MTP GPU position is not sequential");
   }
@@ -259,6 +278,18 @@ tokenization::TokenId QwenMtpGpuExecutor::Run(tokenization::TokenId input_token,
   LaunchRoPE(d_q_, d_k_, config.num_attention_heads, config.num_key_value_heads,
              config.head_dim, config.rotary_dim, position, config.rope_theta,
              stream_, vision_input_ ? vision_input_->rope() : nullptr);
+  if (cache_only) {
+    // The rows above are the ones a full step writes; nothing after the
+    // cache write outlives a step whose logits and hidden state go unused.
+    LaunchDecodeKvWrite(
+        d_k_, d_v_, d_kv_cache_,
+        d_kv_cache_ != nullptr ? d_kv_cache_ + total_kv : nullptr,
+        d_kv_cache_f16_,
+        static_cast<std::uint16_t*>(d_kv_cache_f16_) + total_kv, 0, position,
+        max_context_, config.num_key_value_heads, config.head_dim, stream_);
+    ++next_position_;
+    return 0;
+  }
   LaunchAttention(
       d_q_, d_k_, d_v_, d_gate_, d_kv_cache_,
       d_kv_cache_ != nullptr ? d_kv_cache_ + total_kv : nullptr,

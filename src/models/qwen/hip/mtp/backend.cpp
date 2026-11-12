@@ -293,15 +293,17 @@ void QwenMtpGpuDraftBackend::AcceptFeedback(
   // has already updated target_hidden_ to the final committed row; it cannot
   // be reused for the earlier anchor. Accepted rows also need target features,
   // rather than the tentative draft hidden states used while proposing.
+  // Only the cache rows of these positions are used afterwards: the next
+  // proposal starts from a target hidden state again.
   executor_->Rewind(proposal_checkpoint_);
-  (void)executor_->ForwardTargetHidden(proposal_input_, proposal_target_hidden_,
-                                       proposal_checkpoint_, false);
+  executor_->CommitTargetHidden(proposal_input_, proposal_target_hidden_,
+                                proposal_checkpoint_);
   for (std::size_t index = 0; index < accepted.size(); ++index) {
-    (void)executor_->ForwardTargetHidden(
+    executor_->CommitTargetHidden(
         accepted[index],
         std::span<const float>(committed_target_hidden_)
             .subspan(index * target_hidden_.size(), target_hidden_.size()),
-        proposal_checkpoint_ + static_cast<std::uint32_t>(index) + 1, false);
+        proposal_checkpoint_ + static_cast<std::uint32_t>(index) + 1);
   }
   proposal_active_ = false;
   proposed_tokens_.clear();

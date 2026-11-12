@@ -115,6 +115,14 @@ public:
       tokenization::TokenId input_token, std::uint32_t position,
       bool compute_logits = true);
 
+  /// Commits one position to the K/V cache from its input token and target
+  /// hidden state, with the rows ForwardTargetHidden would write, and stops
+  /// there: no attention read, feed-forward or logits. The head's last hidden
+  /// state is left unspecified.
+  void CommitTargetHidden(tokenization::TokenId input_token,
+                          std::span<const float> target_hidden,
+                          std::uint32_t position);
+
   [[nodiscard]] std::span<const float> CopyLastHidden();
   [[nodiscard]] std::span<const float> CopyLastLogits();
   /// Leading vocabulary ids whose logits the last forward pass computed.
@@ -148,7 +156,8 @@ private:
   [[nodiscard]] tokenization::TokenId Run(tokenization::TokenId input_token,
                                           const float* hidden_input,
                                           std::uint32_t position,
-                                          bool compute_logits);
+                                          bool compute_logits,
+                                          bool cache_only = false);
   void Allocate();
   void Free() noexcept;
 

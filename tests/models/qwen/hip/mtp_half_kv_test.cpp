@@ -129,7 +129,7 @@ int main(int argc, char** argv) {
     // Online attention, split-K per head, and the shared-KV kernel.
     for (const std::size_t primed :
          {std::size_t{100}, std::size_t{300}, std::size_t{1500}}) {
-      if (tokens.size() < primed + kSteps)
+      if (tokens.size() < primed + kSteps + 1)
         throw std::runtime_error("ledger is shorter than the test needs");
       const auto prefix = std::span(tokens).first(primed);
       const auto prefix_hidden =
@@ -165,11 +165,29 @@ int main(int argc, char** argv) {
       damaged->LoadState(broken);
       const auto corrupted = Draft(*damaged, tokens, hidden, primed);
 
-      const bool ok = payload.size() == expected && !reference.empty() &&
-                      Same(reference, restored) && !Same(reference, corrupted);
+      // A cache-only commit must leave the rows a full step writes: drafts
+      // that follow it match drafts that follow the full step.
+      const std::size_t width = config.hidden_size;
+      const auto row = std::span(hidden).subspan(primed * width, width);
+      writer->Reset();
+      writer->PrimeBatch(prefix, prefix_hidden, 0);
+      (void)writer->ForwardTargetHidden(
+          tokens[primed], row, static_cast<std::uint32_t>(primed), false);
+      const auto after_step = Draft(*writer, tokens, hidden, primed + 1);
+      reader_head->Reset();
+      reader_head->PrimeBatch(prefix, prefix_hidden, 0);
+      reader_head->CommitTargetHidden(tokens[primed], row,
+                                      static_cast<std::uint32_t>(primed));
+      const auto after_commit = Draft(*reader_head, tokens, hidden, primed + 1);
+      const bool commit_ok = Same(after_step, after_commit);
+
+      const bool ok = commit_ok && payload.size() == expected &&
+                      !reference.empty() && Same(reference, restored) &&
+                      !Same(reference, corrupted);
       std::cout << "primed=" << primed << ",state_bytes=" << payload.size()
                 << ",restored_equal=" << Same(reference, restored)
-                << ",damage_detected=" << !Same(reference, corrupted) << ','
+                << ",damage_detected=" << !Same(reference, corrupted)
+                << ",commit_equal=" << commit_ok << ','
                 << (ok ? "PASS" : "FAIL") << '\n';
       passed = passed && ok;
     }

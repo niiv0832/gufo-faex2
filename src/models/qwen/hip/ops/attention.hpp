@@ -24,6 +24,14 @@ void LaunchFusedQKVProjections(const void* q_w, core::GgmlType q_type,
                                std::size_t kv_dim, std::size_t hidden_size,
                                hipStream_t stream = nullptr);
 
+/// Writes one position's K and V rows into every non-null cache, exactly as
+/// LaunchAttention does before it reads them.
+void LaunchDecodeKvWrite(const float* k, const float* v, float* k_cache,
+                         float* v_cache, void* k_cache_f16, void* v_cache_f16,
+                         std::uint32_t layer_idx, std::uint32_t pos,
+                         std::uint32_t max_context, std::uint32_t num_kv_heads,
+                         std::uint32_t head_dim, hipStream_t stream);
+
 /// Computes Grouped-Query Softmax Attention with KV-cache and optional gating
 /// on GPU. Production supplies canonical FP16 K/V; the independent validation
 /// fallback supplies FP32 K/V. Tests may supply both representations. When
