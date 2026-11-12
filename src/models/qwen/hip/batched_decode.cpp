@@ -145,10 +145,13 @@ void LaunchMoeFfnRows(const models::QwenLayerWeights& layer,
                                 nullptr, rows * shared_ff, stream);
   LaunchProjection(layer.ffn_down_shexp, s.shared_act, s.shared_out, rows,
                    hidden, shared_ff, stream);
-  LaunchMoeCombine(out, s.down_out, s.weights, s.shared_out, s.shared_weight,
-                   static_cast<std::uint32_t>(used),
-                   static_cast<std::uint32_t>(hidden),
-                   static_cast<std::uint32_t>(rows), stream);
+  // A null `out` leaves the expert outputs for MoeFfnFinishRows.
+  if (out != nullptr) {
+    LaunchMoeCombine(out, s.down_out, s.weights, s.shared_out, s.shared_weight,
+                     static_cast<std::uint32_t>(used),
+                     static_cast<std::uint32_t>(hidden),
+                     static_cast<std::uint32_t>(rows), stream);
+  }
 }
 
 struct SsmControls {
@@ -311,13 +314,19 @@ std::vector<tokenization::TokenId> QwenGpuExecutor::ForwardTokenBatch(
   }
 
   EmitDecodeRouteTelemetry(weights, coordinator->policy_);
+  // Rows at most the MoE scratch holds end each MoE layer in one launch.
+  const bool fused_moe_tail =
+      config.IsMoe() && hidden_size != 5120 && batch_size <= kMoeFfnScratchRows;
   for (std::uint32_t layer_index = 0; layer_index < config.num_layers;
        ++layer_index) {
     const auto& layer = weights.layers[layer_index];
-    LaunchBatchedRMSNorm(scratch.decode.hidden.data(),
-                         static_cast<const float*>(layer.attn_norm.data),
-                         scratch.decode.normed.data(), nullptr, batch_size,
-                         hidden_size, 1e-6F, arena.stream);
+    // A MoE layer ends by writing the next layer's pre-norm (below).
+    if (!fused_moe_tail || layer_index == 0) {
+      LaunchBatchedRMSNorm(scratch.decode.hidden.data(),
+                           static_cast<const float*>(layer.attn_norm.data),
+                           scratch.decode.normed.data(), nullptr, batch_size,
+                           hidden_size, 1e-6F, arena.stream);
+    }
 
     if (layer.is_full_attention) {
       LaunchProjection(layer.attn_q, scratch.decode.normed.data(),
@@ -413,15 +422,35 @@ std::vector<tokenization::TokenId> QwenGpuExecutor::ForwardTokenBatch(
                        ssm_inner_size, arena.stream);
     }
 
-    LaunchBatchedResidualAdd(
-        scratch.decode.hidden.data(), scratch.attention.output.data(),
-        scratch.decode.hidden.data(), batch_size, hidden_size, arena.stream);
-    LaunchBatchedRMSNorm(scratch.decode.hidden.data(),
-                         static_cast<const float*>(layer.ffn_norm.data),
-                         scratch.decode.normed.data(), nullptr, batch_size,
-                         hidden_size, 1e-6F, arena.stream);
+    if (fused_moe_tail) {
+      // The residual add and the FFN pre-norm in one launch.
+      LaunchResidualAddRMSNorm(scratch.decode.hidden.data(),
+                               scratch.attention.output.data(),
+                               static_cast<const float*>(layer.ffn_norm.data),
+                               scratch.decode.normed.data(), hidden_size, 1e-6F,
+                               arena.stream, batch_size);
+    } else {
+      LaunchBatchedResidualAdd(
+          scratch.decode.hidden.data(), scratch.attention.output.data(),
+          scratch.decode.hidden.data(), batch_size, hidden_size, arena.stream);
+      LaunchBatchedRMSNorm(scratch.decode.hidden.data(),
+                           static_cast<const float*>(layer.ffn_norm.data),
+                           scratch.decode.normed.data(), nullptr, batch_size,
+                           hidden_size, 1e-6F, arena.stream);
+    }
 
-    if (config.IsMoe()) {
+    if (fused_moe_tail) {
+      // Combine the experts, add the residual and normalize for the next
+      // layer, or for the head, in one launch.
+      LaunchMoeFfnRows(layer, config, arena, scratch.decode.normed.data(),
+                       nullptr, batch_size);
+      MoeFfnFinishRows(config, arena.moe, scratch.decode.hidden.data(),
+                       static_cast<const float*>(
+                           layer_index + 1 < config.num_layers
+                               ? weights.layers[layer_index + 1].attn_norm.data
+                               : weights.output_norm.data),
+                       scratch.decode.normed.data(), batch_size, arena.stream);
+    } else if (config.IsMoe()) {
       LaunchMoeFfnRows(layer, config, arena, scratch.decode.normed.data(),
                        scratch.ffn.out.data(), batch_size);
     } else {
@@ -431,9 +460,11 @@ std::vector<tokenization::TokenId> QwenGpuExecutor::ForwardTokenBatch(
                        scratch.ffn.out.data(), batch_size, hidden_size,
                        intermediate_size, arena.stream);
     }
-    LaunchBatchedResidualAdd(
-        scratch.decode.hidden.data(), scratch.ffn.out.data(),
-        scratch.decode.hidden.data(), batch_size, hidden_size, arena.stream);
+    if (!fused_moe_tail) {
+      LaunchBatchedResidualAdd(
+          scratch.decode.hidden.data(), scratch.ffn.out.data(),
+          scratch.decode.hidden.data(), batch_size, hidden_size, arena.stream);
+    }
 
     for (std::size_t row = 0; row < batch_size; ++row) {
       auto& state_arena = items[row].executor->arena_;
@@ -448,10 +479,12 @@ std::vector<tokenization::TokenId> QwenGpuExecutor::ForwardTokenBatch(
     }
   }
 
-  LaunchBatchedRMSNorm(scratch.decode.hidden.data(),
-                       static_cast<const float*>(weights.output_norm.data),
-                       scratch.decode.normed.data(), nullptr, batch_size,
-                       hidden_size, 1e-6F, arena.stream);
+  if (!fused_moe_tail) {
+    LaunchBatchedRMSNorm(scratch.decode.hidden.data(),
+                         static_cast<const float*>(weights.output_norm.data),
+                         scratch.decode.normed.data(), nullptr, batch_size,
+                         hidden_size, 1e-6F, arena.stream);
+  }
   coordinator->EnsureVerificationLogits(batch_size);
   LaunchProjection(weights.output, scratch.decode.normed.data(),
                    coordinator->d_verification_logits_, batch_size, vocab_size,
@@ -629,6 +662,9 @@ QwenGpuExecutor::ForwardVerificationBatch(
                            batch_size * sizeof(std::uint32_t),
                            hipMemcpyHostToDevice, arena_.stream));
   EmitDecodeRouteTelemetry(weights_, coordinator.policy_);
+  // Rows at most the MoE scratch holds end each MoE layer in one launch.
+  const bool fused_moe_tail =
+      config.IsMoe() && hidden_size != 5120 && batch_size <= kMoeFfnScratchRows;
   for (std::uint32_t layer_index = 0; layer_index < config.num_layers;
        ++layer_index) {
     const auto& layer = weights_.layers[layer_index];
@@ -636,10 +672,13 @@ QwenGpuExecutor::ForwardVerificationBatch(
         ResolveQwenLayerRoute(coordinator.policy_, QwenExecutionMode::kDecode,
                               layer.is_full_attention);
 
-    LaunchBatchedRMSNorm(scratch.decode.hidden.data(),
-                         static_cast<const float*>(layer.attn_norm.data),
-                         scratch.decode.normed.data(), nullptr, batch_size,
-                         hidden_size, 1e-6F, arena_.stream);
+    // A MoE layer ends by writing the next layer's pre-norm (below).
+    if (!fused_moe_tail || layer_index == 0) {
+      LaunchBatchedRMSNorm(scratch.decode.hidden.data(),
+                           static_cast<const float*>(layer.attn_norm.data),
+                           scratch.decode.normed.data(), nullptr, batch_size,
+                           hidden_size, 1e-6F, arena_.stream);
+    }
 
     if (layer.is_full_attention) {
       LaunchProjection(layer.attn_q, scratch.decode.normed.data(),
@@ -815,15 +854,35 @@ QwenGpuExecutor::ForwardVerificationBatch(
                        ssm_inner_size, arena_.stream);
     }
 
-    LaunchBatchedResidualAdd(
-        scratch.decode.hidden.data(), scratch.attention.output.data(),
-        scratch.decode.hidden.data(), batch_size, hidden_size, arena_.stream);
-    LaunchBatchedRMSNorm(scratch.decode.hidden.data(),
-                         static_cast<const float*>(layer.ffn_norm.data),
-                         scratch.decode.normed.data(), nullptr, batch_size,
-                         hidden_size, 1e-6F, arena_.stream);
+    if (fused_moe_tail) {
+      // The residual add and the FFN pre-norm in one launch.
+      LaunchResidualAddRMSNorm(scratch.decode.hidden.data(),
+                               scratch.attention.output.data(),
+                               static_cast<const float*>(layer.ffn_norm.data),
+                               scratch.decode.normed.data(), hidden_size, 1e-6F,
+                               arena_.stream, batch_size);
+    } else {
+      LaunchBatchedResidualAdd(
+          scratch.decode.hidden.data(), scratch.attention.output.data(),
+          scratch.decode.hidden.data(), batch_size, hidden_size, arena_.stream);
+      LaunchBatchedRMSNorm(scratch.decode.hidden.data(),
+                           static_cast<const float*>(layer.ffn_norm.data),
+                           scratch.decode.normed.data(), nullptr, batch_size,
+                           hidden_size, 1e-6F, arena_.stream);
+    }
 
-    if (config.IsMoe()) {
+    if (fused_moe_tail) {
+      // Combine the experts, add the residual and normalize for the next
+      // layer, or for the head, in one launch.
+      LaunchMoeFfnRows(layer, config, arena_, scratch.decode.normed.data(),
+                       nullptr, batch_size);
+      MoeFfnFinishRows(config, arena_.moe, scratch.decode.hidden.data(),
+                       static_cast<const float*>(
+                           layer_index + 1 < config.num_layers
+                               ? weights_.layers[layer_index + 1].attn_norm.data
+                               : weights_.output_norm.data),
+                       scratch.decode.normed.data(), batch_size, arena_.stream);
+    } else if (config.IsMoe()) {
       LaunchMoeFfnRows(layer, config, arena_, scratch.decode.normed.data(),
                        scratch.ffn.out.data(), batch_size);
     } else {
@@ -833,9 +892,11 @@ QwenGpuExecutor::ForwardVerificationBatch(
                        scratch.ffn.out.data(), batch_size, hidden_size,
                        intermediate_size, arena_.stream);
     }
-    LaunchBatchedResidualAdd(
-        scratch.decode.hidden.data(), scratch.ffn.out.data(),
-        scratch.decode.hidden.data(), batch_size, hidden_size, arena_.stream);
+    if (!fused_moe_tail) {
+      LaunchBatchedResidualAdd(
+          scratch.decode.hidden.data(), scratch.ffn.out.data(),
+          scratch.decode.hidden.data(), batch_size, hidden_size, arena_.stream);
+    }
     if (capture_prompt_hidden_) {
       if (const auto tap = arena_.GetTargetLayerCaptureIndex(layer_index);
           tap.has_value()) {
@@ -882,10 +943,12 @@ QwenGpuExecutor::ForwardVerificationBatch(
       executor.last_hidden_offset_ = 0;
     }
   }
-  LaunchBatchedRMSNorm(scratch.decode.hidden.data(),
-                       static_cast<const float*>(weights_.output_norm.data),
-                       scratch.decode.normed.data(), nullptr, batch_size,
-                       hidden_size, 1e-6F, arena_.stream);
+  if (!fused_moe_tail) {
+    LaunchBatchedRMSNorm(scratch.decode.hidden.data(),
+                         static_cast<const float*>(weights_.output_norm.data),
+                         scratch.decode.normed.data(), nullptr, batch_size,
+                         hidden_size, 1e-6F, arena_.stream);
+  }
   LaunchProjection(weights_.output, scratch.decode.normed.data(), logits_buffer,
                    batch_size, vocab_size, hidden_size, arena_.stream);
   auto* const d_out_tokens = scratch.decode.prompt_tokens.data();

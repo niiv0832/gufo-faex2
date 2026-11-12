@@ -77,6 +77,10 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
     image_input->Inject(decode_scratch.hidden.data(), pos, 1, hidden_size, 1,
                         arena.stream);
 
+  // The end of a MoE layer (combine the experts, add the residual, normalize
+  // for whatever reads the hidden state next) is one launch instead of three.
+  const bool fused_moe_tail = config.IsMoe() && hidden_size != kRowCachedHidden;
+
   // 2. Layer stack
   for (std::uint32_t l = 0; l < config.num_layers; ++l) {
     const auto& layer = weights.layers[l];
@@ -85,7 +89,8 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
     const gufo::models::qwen::HipModuleContext module_ctx(
         static_cast<void*>(arena.stream), l, pos);
 
-    {
+    // A MoE layer ends by writing the next layer's pre-norm (below).
+    if (!fused_moe_tail || l == 0) {
       // Pre-RMSNorm, routed through the norm module (HIP backend). Same
       // kernel, same args, same arena slices (d_hidden in, d_normed out);
       // behavior identical to the former inline `LaunchRMSNorm` call.
@@ -248,7 +253,19 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
     }
 
     // Fused SwiGLU FFN
-    if (config.IsMoe()) {
+    const float* const next_norm =
+        l + 1 < config.num_layers
+            ? static_cast<const float*>(weights.layers[l + 1].attn_norm.data)
+        : compute_logits ? static_cast<const float*>(weights.output_norm.data)
+                         : nullptr;
+    const bool fuse_tail = fused_moe_tail && next_norm != nullptr;
+    if (fuse_tail) {
+      MoeFfnDecodeToken(layer, config, arena.moe, decode_scratch.normed.data(),
+                        nullptr, arena.stream);
+      MoeFfnFinishRows(config, arena.moe, decode_scratch.hidden.data(),
+                       next_norm, decode_scratch.normed.data(), 1,
+                       arena.stream);
+    } else if (config.IsMoe()) {
       MoeFfnDecodeToken(layer, config, arena.moe, decode_scratch.normed.data(),
                         ffn_scratch.out.data(), arena.stream);
     } else {
@@ -263,8 +280,10 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
     }
 
     // Residual Add
-    gufo::models::qwen::ResidualAdd(module_ctx, decode_scratch.hidden,
-                                    ffn_scratch.out);
+    if (!fuse_tail) {
+      gufo::models::qwen::ResidualAdd(module_ctx, decode_scratch.hidden,
+                                      ffn_scratch.out);
+    }
 
     if (const auto tap_index = arena.GetTargetLayerCaptureIndex(l);
         tap_index.has_value()) {
@@ -276,11 +295,13 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
   }
 
   if (compute_logits) {
-    // 3. Final Output Norm
-    LaunchRMSNorm(decode_scratch.hidden.data(),
-                  static_cast<const float*>(weights.output_norm.data),
-                  decode_scratch.normed.data(), hidden_size, 1e-6F,
-                  arena.stream);
+    // 3. Final Output Norm (the last MoE layer already wrote it)
+    if (!fused_moe_tail) {
+      LaunchRMSNorm(decode_scratch.hidden.data(),
+                    static_cast<const float*>(weights.output_norm.data),
+                    decode_scratch.normed.data(), hidden_size, 1e-6F,
+                    arena.stream);
+    }
 
     // 4. LM Head Logits GEMV on final token
     LaunchGEMV(weights.output.data, weights.output.type,

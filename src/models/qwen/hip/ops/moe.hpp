@@ -58,9 +58,15 @@ void LaunchRouterSplitLogits(const float* y, float* router, float* shared,
                              std::size_t rows, std::size_t experts,
                              std::size_t ld, hipStream_t stream = nullptr);
 
-/// Elementwise weighted accumulation: out += scale * add.
-void LaunchMoeScaledAccumulate(float* out, const float* add, float scale,
-                               std::size_t dim, hipStream_t stream = nullptr);
+/// The end of a MoE layer in one launch per row set: the LaunchMoeCombine sum
+/// is added to `hidden_rows` in place and `out` receives RMSNorm of the result
+/// times `weight`. Bit-identical to LaunchMoeCombine, a residual add and an
+/// RMSNorm of `hidden` floats (not 5120) in that order.
+void LaunchMoeCombineResidualAddRMSNorm(
+    float* hidden_rows, const float* slot_out, const float* slot_weight,
+    const float* shared_out, const float* shared_weight, const float* weight,
+    float* out, std::uint32_t used, std::uint32_t hidden, float eps = 1e-6F,
+    std::uint32_t rows = 1, hipStream_t stream = nullptr);
 
 /// out[i] = sum_s slot_weight[s] * slot_out[s][i] + shared_weight[0] *
 /// shared_out[i]: the routed experts and the gated shared expert in one pass.

@@ -51,9 +51,23 @@ void MoeFfnDecodeToken(const models::QwenLayerWeights& layer,
                         scratch.shared_act, shared_ff, hidden, stream);
   LaunchGEMV(layer.ffn_down_shexp.data, layer.ffn_down_shexp.type,
              scratch.shared_act, scratch.shared_out, hidden, shared_ff, stream);
-  LaunchMoeCombine(out, scratch.down_out, scratch.weights, scratch.shared_out,
-                   scratch.shared_weight, static_cast<std::uint32_t>(used),
-                   static_cast<std::uint32_t>(hidden), 1, stream);
+  if (out != nullptr) {
+    LaunchMoeCombine(out, scratch.down_out, scratch.weights, scratch.shared_out,
+                     scratch.shared_weight, static_cast<std::uint32_t>(used),
+                     static_cast<std::uint32_t>(hidden), 1, stream);
+  }
+}
+
+void MoeFfnFinishRows(const core::ModelConfig& config,
+                      const QwenMoeScratch& scratch, float* hidden,
+                      const float* norm_weight, float* normed, std::size_t rows,
+                      hipStream_t stream) {
+  LaunchMoeCombineResidualAddRMSNorm(
+      hidden, scratch.down_out, scratch.weights, scratch.shared_out,
+      scratch.shared_weight, norm_weight, normed,
+      static_cast<std::uint32_t>(config.num_experts_used),
+      static_cast<std::uint32_t>(config.hidden_size), 1e-6F,
+      static_cast<std::uint32_t>(rows), stream);
 }
 
 void WarmMoeDecode(const models::QwenModelWeights& weights,

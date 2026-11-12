@@ -148,15 +148,6 @@ __global__ void MoeRouterTopKKernel(const float* __restrict__ router_logits,
   }
 }
 
-__global__ void MoeScaledAccumulateKernel(float* __restrict__ out,
-                                          const float* __restrict__ add,
-                                          float scale, std::size_t dim) {
-  const std::size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx < dim) {
-    out[idx] += scale * add[idx];
-  }
-}
-
 __global__ void MoeCombineKernel(float* __restrict__ out,
                                  const float* __restrict__ slot_out,
                                  const float* __restrict__ slot_weight,
@@ -178,6 +169,55 @@ __global__ void MoeCombineKernel(float* __restrict__ out,
     sum += slot_weight[s] * slot_out[static_cast<std::size_t>(s) * hidden + i];
   }
   out[i] = sum + shared_weight[0] * shared_out[i];
+}
+
+// MoeCombineKernel, then a += that sum, then out = RMSNorm(a) * weight, one
+// block per row: the three launches the end of a MoE layer otherwise takes.
+// Each expression and its order are those of MoeCombineKernel and
+// ResidualAddRMSNormKernel.
+__global__ void MoeCombineResidualAddRMSNormKernel(
+    float* __restrict__ rows_a, const float* __restrict__ rows_slot_out,
+    const float* __restrict__ rows_slot_weight,
+    const float* __restrict__ rows_shared_out,
+    const float* __restrict__ rows_shared_weight,
+    const float* __restrict__ weight, float* __restrict__ rows_out,
+    std::uint32_t used, std::uint32_t hidden, float eps) {
+  __shared__ float s_sum[256];
+  const std::size_t tid = threadIdx.x;
+  const std::size_t row = blockIdx.x;
+  float* const a = rows_a + (row * hidden);
+  const float* const slot_out = rows_slot_out + (row * used * hidden);
+  const float* const slot_weight = rows_slot_weight + (row * used);
+  const float* const shared_out = rows_shared_out + (row * hidden);
+  const float* const shared_weight = rows_shared_weight + row;
+  float* const out = rows_out + (row * hidden);
+  float sum_sq = 0.0F;
+  for (std::size_t i = tid; i < hidden; i += blockDim.x) {
+    float sum = 0.0F;
+    for (std::uint32_t s = 0; s < used; ++s) {
+      sum += slot_weight[s] * slot_out[static_cast<std::size_t>(s) * hidden + i];
+    }
+    const float ffn = sum + shared_weight[0] * shared_out[i];
+    const float val = a[i] + ffn;
+    a[i] = val;
+    sum_sq += val * val;
+  }
+  s_sum[tid] = sum_sq;
+  __syncthreads();
+
+  for (std::size_t stride = blockDim.x / 2; stride > 0; stride /= 2) {
+    if (tid < stride) {
+      s_sum[tid] += s_sum[tid + stride];
+    }
+    __syncthreads();
+  }
+
+  const float mean_sq = s_sum[0] / static_cast<float>(hidden);
+  const float inv_rms = rsqrtf(mean_sq + eps);
+  for (std::size_t i = tid; i < hidden; i += blockDim.x) {
+    const float w = (weight != nullptr) ? weight[i] : 1.0F;
+    out[i] = (a[i] * inv_rms) * w;
+  }
 }
 
 // Row `m` of A dotted with x, summed exactly as FastGEMVBlockKernel does so a
@@ -392,12 +432,14 @@ void LaunchMoeRouterTopK(const float* router_logits, const float* shared_logit,
       num_experts, num_used);
 }
 
-void LaunchMoeScaledAccumulate(float* out, const float* add, float scale,
-                               std::size_t dim, hipStream_t stream) {
-  constexpr std::size_t kBlockSize = 256;
-  const std::size_t grid = (dim + kBlockSize - 1) / kBlockSize;
-  MoeScaledAccumulateKernel<<<grid, kBlockSize, 0, stream>>>(out, add, scale,
-                                                             dim);
+void LaunchMoeCombineResidualAddRMSNorm(
+    float* hidden_rows, const float* slot_out, const float* slot_weight,
+    const float* shared_out, const float* shared_weight, const float* weight,
+    float* out, std::uint32_t used, std::uint32_t hidden, float eps,
+    std::uint32_t rows, hipStream_t stream) {
+  MoeCombineResidualAddRMSNormKernel<<<rows, 256, 0, stream>>>(
+      hidden_rows, slot_out, slot_weight, shared_out, shared_weight, weight,
+      out, used, hidden, eps);
 }
 
 void LaunchMoeCombine(float* out, const float* slot_out,

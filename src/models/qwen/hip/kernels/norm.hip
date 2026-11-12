@@ -9,15 +9,19 @@
 
 namespace gufo::hip {
 
-/// a += b followed by out = RMSNorm(a); the sums and their order match
-/// ResidualAddKernel followed by the generic RMSNormKernel.
-__global__ void ResidualAddRMSNormKernel(float* __restrict__ a,
-                                         const float* __restrict__ b,
+/// a += b followed by out = RMSNorm(a), one block per row of `dim` floats;
+/// the sums and their order match ResidualAddKernel followed by the generic
+/// RMSNormKernel (and their batched forms).
+__global__ void ResidualAddRMSNormKernel(float* __restrict__ rows_a,
+                                         const float* __restrict__ rows_b,
                                          const float* __restrict__ weight,
-                                         float* __restrict__ out,
+                                         float* __restrict__ rows_out,
                                          std::size_t dim, float eps) {
   __shared__ float s_sum[256];
   const std::size_t tid = threadIdx.x;
+  float* const a = rows_a + (blockIdx.x * dim);
+  const float* const b = rows_b + (blockIdx.x * dim);
+  float* const out = rows_out + (blockIdx.x * dim);
   float sum_sq = 0.0F;
   for (std::size_t i = tid; i < dim; i += blockDim.x) {
     const float val = a[i] + b[i];
@@ -145,8 +149,9 @@ void LaunchRMSNorm(const float* x, const float* weight, float* out,
 }
 void LaunchResidualAddRMSNorm(float* a, const float* b, const float* weight,
                               float* out, std::size_t dim, float eps,
-                              hipStream_t stream) {
-  ResidualAddRMSNormKernel<<<1, 256, 0, stream>>>(a, b, weight, out, dim, eps);
+                              hipStream_t stream, std::size_t rows) {
+  ResidualAddRMSNormKernel<<<static_cast<unsigned>(rows), 256, 0, stream>>>(
+      a, b, weight, out, dim, eps);
 }
 void LaunchPerHeadRMSNorm(const float* x, const float* weight, float* out,
                           std::uint32_t num_heads, std::uint32_t head_dim,
