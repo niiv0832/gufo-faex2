@@ -231,6 +231,14 @@ def validate_requests(rows, server_log=None):
             assert cached > 0 and metrics["prefill_tokens"] < prompt, row
 
 
+def tool_outputs(history):
+    """Text of successful tool results, as Pi stored them after executing the tool."""
+    return ["".join(part.get("text", "") for part in message.get("content", [])
+                    if isinstance(part, dict) and part.get("type") == "text")
+            for message in history
+            if message.get("role") == "toolResult" and not message.get("isError")]
+
+
 def validate_task(name, cwd, history):
     calls = calls_from(history)
     for call in calls:
@@ -270,11 +278,16 @@ def validate_task(name, cwd, history):
     elif name == "tools":
         assert (cwd / "hello.txt").read_bytes() == b"bonjour"
         assert {"bash", "read"} <= names, names
+        # The model must have been shown the file by a tool that really ran.
+        assert any("bonjour" in output for output in tool_outputs(history)), "no tool returned the file"
     elif name == "edit":
         namespace = {}
         exec(compile((cwd / "src/calc.py").read_text(), "calc.py", "exec"), namespace)
         assert namespace["add"](2, 3) == 5 and namespace["add"](-4, 1) == -3
         assert {"edit", "bash"} <= names, names
+        # The buggy line reaches the model only through a real read of the fixture.
+        assert any("return a - b" in output for output in tool_outputs(history)), \
+            "no tool returned the original fixture"
     elif name == "literal-protocol":
         source = (cwd / "chat_template_fixture.py").read_text()
         assert kImEnd in source and kImStart in source, source

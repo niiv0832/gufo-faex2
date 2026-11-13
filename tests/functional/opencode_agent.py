@@ -15,9 +15,11 @@ bodies/SSE, opencode JSON events, MCP calls and per-request timings.
 """
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
+import secrets
 import signal
 import subprocess
 import sys
@@ -66,6 +68,10 @@ PROMPTS = {
             "the date 2026-10-05, and tag record 42 with the tag name urgent and weight 3. "
             "Then write the record title returned by the lookup into result.txt and reply "
             "with that title."),
+    # The bash result depends on a per-run secret, so it cannot be produced
+    # without really executing the fixture's check after a real fix.
+    "verify": ("Read calc.py, fix the obvious bug with the edit tool, then run "
+               "`python3 check.py` with the bash tool and reply with the exact line it prints."),
 }
 
 
@@ -170,7 +176,7 @@ def validate_task(name, cwd, calls_log):
         if calls_log.exists() else []
     if name == "tools":
         assert (cwd / "hello.txt").read_text().strip() == "bonjour"
-    elif name == "edit":
+    elif name in ("edit", "verify"):
         subprocess.run([sys.executable, "-c",
                         "import calc; assert calc.add(2, 3) == 5 and calc.add(-4, 1) == -3"],
                        cwd=cwd, check=True, capture_output=True, timeout=10)
@@ -184,12 +190,115 @@ def validate_task(name, cwd, calls_log):
     return mcp
 
 
+def tool_history(bodies):
+    """Calls with the results the client really sent back, in request order.
+
+    Tool results in a request body come from the agent's own execution: the
+    recorder forwards bodies unchanged and never writes one. Chat bodies carry
+    them as `tool` messages, Responses bodies as `function_call_output` items.
+    """
+    calls, order = {}, []
+
+    def call(identifier, name, arguments):
+        if identifier not in calls:
+            calls[identifier] = {"name": name, "arguments": arguments, "result": None}
+            order.append(identifier)
+
+    def text(content):
+        if isinstance(content, list):
+            return "".join(part.get("text", "") for part in content if isinstance(part, dict))
+        return content if isinstance(content, str) else json.dumps(content)
+
+    for body in bodies:
+        for message in body.get("messages", []):
+            for item in message.get("tool_calls") or []:
+                call(item["id"], item["function"]["name"], item["function"]["arguments"])
+            if message.get("role") == "tool" and message.get("tool_call_id") in calls:
+                calls[message["tool_call_id"]]["result"] = text(message.get("content"))
+        for item in body.get("input", []) if isinstance(body.get("input"), list) else []:
+            if item.get("type") == "function_call":
+                call(item["call_id"], item["name"], item["arguments"])
+            elif item.get("type") == "function_call_output" and item.get("call_id") in calls:
+                calls[item["call_id"]]["result"] = text(item.get("output"))
+    return [calls[identifier] for identifier in order]
+
+
+def validate_tool_results(name, history, fixture=None):
+    """The model was shown real tool output, not a claim that the task is done."""
+    executed = [call for call in history if call["result"] is not None]
+    assert executed, "no tool result reached the model"
+
+    def ran(tools, argument, result, forbidden=()):
+        found = [call for call in executed
+                 if any(call["name"] == tool or call["name"].endswith("_" + tool) for tool in tools)
+                 and all(part in call["arguments"] for part in argument)]
+        assert found, (f"no executed {'/'.join(tools)} call mentioning {argument}",
+                       [(call["name"], call["arguments"]) for call in executed])
+        good = [call for call in found if result in call["result"]
+                and not any(mark in call["result"] for mark in forbidden)]
+        assert good, (f"{'/'.join(tools)} {argument}: result lacks {result!r}",
+                      [call["result"][-400:] for call in found])
+        return good[-1]
+
+    failed = ("Traceback", "AssertionError")
+    if name == "tools":
+        ran(("bash",), ("cat", "hello.txt"), "bonjour")
+        ran(("read",), ("hello.txt",), "bonjour")
+    elif name == "edit":
+        ran(("read",), ("calc.py",), "return a - b")
+        ran(("bash",), ("calc",), "ok", failed)
+    elif name == "verify":
+        ran(("read",), ("calc.py",), fixture["sentinel"])
+        ran(("edit", "patch", "multiedit", "write"), ("calc.py",), "")
+        ran(("bash",), ("check.py",), fixture["expected"], failed)
+    elif name == "mcp":
+        ran(("lookup_record",), ("42",), "Native framing record")
+        ran(("lookup_date",), ("2026-10-05",), "release")
+    return len(executed)
+
+
+def verify_fixture(cwd):
+    """A buggy module, a marker only a real read returns and a check only a real run passes."""
+    nonce, sentinel = secrets.token_hex(8), "fixture-" + secrets.token_hex(6)
+    (cwd / "calc.py").write_text(f"# {sentinel}\ndef add(a, b):\n    return a - b\n")
+    (cwd / ".nonce").write_text(nonce)
+    (cwd / "check.py").write_text(
+        "import hashlib\nimport calc\n"
+        "assert calc.add(2, 3) == 5 and calc.add(-4, 1) == -3\n"
+        "print('verified-' + hashlib.sha256(open('.nonce', 'rb').read()).hexdigest()[:16])\n")
+    return {"sentinel": sentinel,
+            "expected": "verified-" + hashlib.sha256(nonce.encode()).hexdigest()[:16]}
+
+
+def inside_git_tree(path):
+    """An agent started under a repository reads that repository's instructions."""
+    path = Path(path).resolve()
+    return any((parent / ".git").exists() for parent in (path, *path.parents))
+
+
+def case_environment(case, isolated):
+    """Per-case opencode directories; `isolated` also drops the caller's HOME and variables."""
+    source = os.environ
+    if isolated:
+        (case / "home").mkdir(exist_ok=True)
+        source = {key: value for key, value in os.environ.items()
+                  if key in {"PATH", "USER", "LANG", "LC_ALL", "TMPDIR", "SHELL", "SSL_CERT_FILE"}}
+        source["HOME"] = str(case / "home")
+    return {**source, "OPENCODE_CONFIG": str(case / "opencode.json"),
+            "XDG_CONFIG_HOME": str(case / "xdg-config"), "XDG_DATA_HOME": str(case / "xdg-data"),
+            "XDG_STATE_HOME": str(case / "xdg-state"), "XDG_CACHE_HOME": str(case / "xdg-cache")}
+
+
 def run_case(args, recorder, index, name):
     case = args.output / f"{index:02d}-{name}"
     cwd = case / "work"
     cwd.mkdir(parents=True)
+    fixture = None
     if name == "edit":
         (cwd / "calc.py").write_text("def add(a, b):\n    return a - b\n")
+    elif name == "verify":
+        fixture = verify_fixture(cwd)
+        save(case / "fixture.json", fixture)
     calls_log = case / "mcp-calls.jsonl"
     config = {
         "$schema": "https://opencode.ai/config.json",
@@ -206,11 +315,11 @@ def run_case(args, recorder, index, name):
         "permission": {"*": "allow"},
     }
     save(case / "opencode.json", config)
-    env = {**os.environ, "OPENCODE_CONFIG": str(case / "opencode.json"),
-           "XDG_CONFIG_HOME": str(case / "xdg-config"), "XDG_DATA_HOME": str(case / "xdg-data"),
-           "XDG_STATE_HOME": str(case / "xdg-state"), "XDG_CACHE_HOME": str(case / "xdg-cache")}
-    command = [args.opencode, "run", "--pure", "--auto", "--format", "json",
-               "-m", f"gufo/{args.model}", PROMPTS[name]]
+    env = case_environment(case, args.isolated)
+    # A private server: the default background service may belong to the
+    # user's own opencode and carry their configuration.
+    command = [args.opencode, "run", *(["--standalone"] if args.isolated else []),
+               "--pure", "--auto", "--format", "json", "-m", f"gufo/{args.model}", PROMPTS[name]]
     save(case / "command.json", command)
     recorder.case = case.name
     row = {"case": case.name, "start_request": len(recorder.requests)}
@@ -242,6 +351,15 @@ def run_case(args, recorder, index, name):
         row["agent_requests"] = len(validate_requests(row["requests"], args.output))
     except Exception as error:
         row.update(status="fail", error=f"HTTP/framing/cache validation: {error!r}")
+    try:
+        bodies = [json.loads((args.output / f"request-{item['index']:04d}.json").read_text())
+                  for item in row["requests"]]
+        row["tool_results"] = validate_tool_results(name, tool_history(bodies), fixture)
+    except Exception as error:
+        if row["status"] == "pass":
+            row.update(status="fail", error=f"real tool results: {error!r}")
+        else:
+            row["tool_results_error"] = repr(error)
     save(case / "result.json", row)
     print(f"{case.name}: {row['status']} {row['wall_ms']/1000:.1f}s, "
           f"{row.get('agent_requests', 0)} agent requests", flush=True)
@@ -263,7 +381,13 @@ def main():
     parser.add_argument("--timeout", type=float, default=600)
     parser.add_argument("--thinking", action="store_true",
                         help="Declare the model as reasoning, as opencode users do")
+    parser.add_argument("--isolated", action="store_true",
+                        help="Private opencode server, per-case HOME and a minimal environment; "
+                             "requires --output outside any git work tree")
     args = parser.parse_args()
+    if args.isolated and inside_git_tree(args.output.resolve().parent):
+        parser.error("--isolated needs --output outside a git work tree: opencode would load "
+                     "that repository's instructions and configuration")
     args.output.mkdir(parents=True, exist_ok=False)
     version = subprocess.run([args.opencode, "--version"], capture_output=True, text=True)
     save(args.output / "opencode-version.json", {"version": version.stdout.strip()})
