@@ -39,6 +39,7 @@
 #include "tests/core/sampled_speculation_cases.hpp"
 #include "tests/core/sampled_speculation_oracle.hpp"
 #include "tests/models/qwen/hip/support/device.hpp"
+#include "tests/models/qwen/hip/support/sampled_float_bound.hpp"
 
 namespace {
 
@@ -159,69 +160,12 @@ private:
   std::size_t launches_{0};
 };
 
-// How far single precision may move the kernels from the reference.
-//
-// With m the largest kept logit, a kept token has x = (l - m) / T <= 0 and
-// the weight w = exp(x). In float, with e = 2^-24: the subtraction, the
-// reciprocal of T and the product each round once, so x carries a relative
-// error of 3e, which moves w by 3|x|e; expf is taken to be within 4 ulp. A
-// penalized logit is the result of up to three more float operations, each
-// within e of the magnitudes involved. A weight is thus within
-//   rel = (3|x| + 4 + [penalties] 4(|l| + |m|)/T) e
-// of w. Sums of non-negative floats add at most e per addition: a segment of
-// the kept tokens and the 256 segment sums give (L + 256) e, relative.
-// Hence for the total W:       dW = sum(w rel) + (L + 256) e W.
-// The accepted mass of a draft token d, q min(1, p/q) = min(p, q), follows
-// p = w_d / W:                 |d min(p, q)| <= p (rel_d + dW/W + 2e).
-// A residual weight max(0, w - q W) moves by w rel + q dW + e q W + e v, and
-// their sum V = Z W by         dV = sum(w rel) + (dW + e W) Q + (L + 257) e V
-// with Q the draft mass on the kept tokens. An interval of the residual CDF
-// is a quotient of such sums, so its length moves by at most 2 dV / V; a
-// rejection has probability Z, which makes the contribution to the emitted
-// distribution 2 dV / W. Bounds are doubled for the second-order terms.
-// Values below FLT_MIN may be flushed to zero on the device; that moves a
-// probability by less than 4 FLT_MIN.
-struct FloatBound {
-  double total{0.0};  // dW / W
-  double emitted_residual{0.0};
-  std::vector<double> weight;  // rel of each kept token, in target order
-};
-
-FloatBound BoundOf(const Case& test, std::span<const Candidate> target,
-                   const DraftRow* draft, double residual_mass) {
-  constexpr double e = 0x1.0p-24;
-  const double temperature = test.filters.temperature;
-  const bool penalized = !test.Penalties().empty();
-  const double segment = std::min<double>(
-      static_cast<double>(target.size()),
-      std::ceil(static_cast<double>(test.logits.size()) / 256.0));
-  FloatBound bound;
-  double total = 0.0;
-  double moved = 0.0;
-  double draft_mass = 0.0;
-  for (const Candidate& candidate : target) {
-    const double x = (candidate.logit - target.front().logit) / temperature;
-    const double weight = std::exp(x);
-    double relative = (3.0 * std::abs(x)) + 4.0;
-    if (penalized)
-      relative += 4.0 *
-                  (std::abs(candidate.logit) + std::abs(target.front().logit)) /
-                  temperature;
-    bound.weight.push_back(relative * e);
-    total += weight;
-    moved += weight * relative * e;
-    if (draft != nullptr)
-      draft_mass += draft->Probability(candidate.token);
-  }
-  const double total_moved = moved + ((segment + 256.0) * e * total);
-  bound.total = total_moved / total;
-  const double residual = residual_mass * total;
-  const double residual_moved = moved +
-                                ((total_moved + (e * total)) * draft_mass) +
-                                ((segment + 257.0) * e * residual);
-  bound.emitted_residual =
-      (2.0 * 2.0 * residual_moved / total) + (4.0 * FLT_MIN) + 0x1.0p-28;
-  return bound;
+gufo::test::FloatBound BoundOf(const Case& test,
+                               std::span<const Candidate> target,
+                               const DraftRow* draft, double residual_mass) {
+  return gufo::test::BoundFloat(target, test.filters.temperature,
+                                !test.Penalties().empty(), test.logits.size(),
+                                draft, residual_mass);
 }
 
 // The kept set must not hinge on rounding: the reference keeps the same
@@ -263,7 +207,7 @@ void CheckDeviceCase(const Case& test) {
     worst_plain = sampled_oracle::MeasureError(measure, target);
     Expect(measure.contiguous,
            test.name + ": the sampler is not an inverse CDF");
-    Expect(worst_plain <= (4.0 * plain.total) + (4.0 * FLT_MIN) + 0x1.0p-28,
+    Expect(worst_plain <= plain.sampled,
            test.name + ": the sampler draws p with error " +
                std::to_string(worst_plain));
   }
@@ -331,13 +275,11 @@ void CheckDeviceCase(const Case& test) {
       }
       // min(p, q) as accepted mass.
       const double accepted_error = std::abs(high - expected) * q;
-      double relative = bound.total + (2 * 0x1.0p-24);
-      for (std::size_t i = 0; i < target.size(); ++i)
-        if (target[i].token == draft_token)
-          relative += bound.weight[i];
+      std::size_t kept = 0;
+      while (kept < target.size() && target[kept].token != draft_token)
+        ++kept;
       worst_accepted = std::max(worst_accepted, accepted_error);
-      Expect(accepted_error <=
-                 (2.0 * p * relative) + (4.0 * FLT_MIN) + (q * 0x1.0p-40),
+      Expect(accepted_error <= bound.Accepted(kept, p, q),
              label + ",draft=" + std::to_string(draft_token) +
                  ": accepted up to " + std::to_string(high) + ", expected " +
                  std::to_string(expected));
@@ -366,7 +308,7 @@ void CheckDeviceCase(const Case& test) {
     worst_conditional = std::max(worst_conditional, conditional);
     worst_residual = std::max(worst_residual, emitted);
     if (reference.residual.empty())
-      Expect(conditional <= (4.0 * plain.total) + (4.0 * FLT_MIN) + 0x1.0p-28,
+      Expect(conditional <= plain.sampled,
              label +
                  ": without a residual the correction is not drawn "
                  "from p");
