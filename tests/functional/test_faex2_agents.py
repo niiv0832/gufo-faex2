@@ -1,4 +1,4 @@
-"""CPU-проверки разбора результатов агентских сценариев: без агента, модели и сети.
+"""CPU-проверки агентских сценариев: без модели и внешней сети.
 
 Проверяется, что harness требует НАСТОЯЩИЙ результат инструмента (то, что агент
 сам вернул модели после исполнения), а не только итоговое состояние файлов или
@@ -6,11 +6,16 @@
 """
 
 import json
+import http.client
+import http.server
 import os
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import threading
+import time
+from types import SimpleNamespace
 import unittest
 import unittest.mock
 
@@ -67,6 +72,66 @@ class OpenCodeResults(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, "no tool result reached the model"):
             opencode_agent.validate_tool_results("tools", self.history(("bash", {"command": "cat hello.txt"}, None)))
 
+    def test_shell_tool_results_are_checked_like_the_older_bash_tool(self):
+        good = self.history(("shell", {"command": "cat hello.txt"}, "bonjour\n"),
+                            ("read", {"filePath": "hello.txt"}, "bonjour\n"))
+        self.assertEqual(opencode_agent.validate_tool_results("tools", good), 2)
+        with self.assertRaises(AssertionError):
+            opencode_agent.validate_tool_results("tools", [{**good[0], "result": ""}, good[1]])
+
+    def test_cancelled_background_title_does_not_hide_agent_or_server_errors(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            title = {"messages": [{"role": "system", "content":
+                     "You name conversations so the user can find them later in a list of past sessions."}]}
+            agent = chat_body(("shell", {"command": "cat hello.txt"}, "bonjour"))
+            for index, body in enumerate((title, agent)):
+                (output / f"request-{index:04d}.json").write_text(json.dumps(body))
+                (output / f"request-{index:04d}.sse").write_text("data: [DONE]\n")
+            cancelled = {"index": 0, "status": 200, "finalized": True,
+                         "error": "BrokenPipeError(32, 'Broken pipe')"}
+            completed = {"index": 1, "status": 200, "finalized": True}
+            self.assertEqual(opencode_agent.validate_requests([cancelled, completed], output), [completed])
+            for rows in ([{**cancelled, "status": 500}, completed],
+                         [{**cancelled, "error": "TimeoutError()"}, completed],
+                         [{**completed, "error": cancelled["error"]}]):
+                with self.subTest(rows=rows), self.assertRaises(AssertionError):
+                    opencode_agent.validate_requests(rows, output)
+
+    def test_no_tools_foreground_is_not_mistaken_for_background_title(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            native = {"messages": [{"role": "user", "content": "task"}], "tools": [
+                {"type": "function", "function": {"name": "catalog_" + tool["name"],
+                 "parameters": tool["inputSchema"]}} for tool in opencode_agent.MCP_TOOLS]}
+            missing_tools = {"messages": [{"role": "user", "content": "finish task"}]}
+            for index, body in enumerate((native, missing_tools)):
+                (output / f"request-{index:04d}.json").write_text(json.dumps(body))
+                (output / f"request-{index:04d}.sse").write_text("data: [DONE]\n")
+            rows = [{"index": index, "status": 200, "finalized": True,
+                     "usage": {"prompt_tokens": 10, "cached_tokens": 5},
+                     "metrics": {"prefill_tokens": 5}} for index in range(2)]
+            self.assertEqual(opencode_agent.validate_requests(rows[:1], output, native_mcp=True), rows[:1])
+            with self.assertRaisesRegex(AssertionError, "native MCP tool missing"):
+                opencode_agent.validate_requests(rows, output, native_mcp=True)
+            (output / "request-0001.sse").write_text('data: {"choices":[{"delta":{"content":'
+                                                   '"<invoke forbidden framing"}}]}\n')
+            with self.assertRaisesRegex(AssertionError, "framing reached content"):
+                opencode_agent.validate_requests(rows, output)
+
+    def test_pending_http_200_cannot_pass_before_its_late_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            body = chat_body(("shell", {"command": "cat hello.txt"}, "bonjour"))
+            (output / "request-0000.json").write_text(json.dumps(body))
+            (output / "request-0000.sse").write_text("data: [DONE]\n")
+            row = {"index": 0, "status": 200}
+            with self.assertRaisesRegex(AssertionError, "not finalized"):
+                opencode_agent.validate_requests([row], output)
+            row.update(finalized=True, wall_ms=10, error="TimeoutError('late upstream error')")
+            with self.assertRaises(AssertionError):
+                opencode_agent.validate_requests([row], output)
+
     def test_edit_task_needs_original_source_and_passing_run(self):
         good = self.history(("read", {"filePath": "calc.py"}, "00001| def add(a, b):\n00002|     return a - b"),
                             ("edit", {"filePath": "calc.py", "oldString": "-", "newString": "+"}, "done"),
@@ -97,10 +162,76 @@ class OpenCodeResults(unittest.TestCase):
         with self.assertRaises(AssertionError):
             opencode_agent.validate_tool_results("mcp", good[:1])
 
+    def stale_calc_bytecode(self, cwd, *, cached_fixed):
+        # Apple Python otherwise redirects py_compile outside the fixture to
+        # ~/Library/Caches, which is both shared state and sandbox-inaccessible.
+        cache = unittest.mock.patch.dict(os.environ, {"PYTHONPYCACHEPREFIX": str(cwd / "bytecode")})
+        cache.start()
+        self.addCleanup(cache.stop)
+        fixture = opencode_agent.verify_fixture(cwd)
+        path = cwd / "calc.py"
+        broken = path.read_text()
+        fixed = broken.replace("a - b", "a + b")
+        timestamp = 1700000000
+        path.write_text(fixed if cached_fixed else broken)
+        os.utime(path, (timestamp, timestamp))
+        # Compile explicitly: the caller may disable bytecode writes or use
+        # PYTHONPYCACHEPREFIX. Timestamp invalidation reproduces same-tick edits.
+        subprocess.run([sys.executable, "-c",
+                        "import py_compile; py_compile.compile('calc.py', doraise=True, "
+                        "invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP)"],
+                       cwd=cwd, check=True, capture_output=True, timeout=10)
+        path.write_text(broken if cached_fixed else fixed)
+        os.utime(path, (timestamp, timestamp))
+        cached = subprocess.run([sys.executable, "-c", "import calc; print(calc.add(2, 3))"],
+                                cwd=cwd, check=True, capture_output=True, text=True, timeout=10)
+        self.assertEqual(cached.stdout.strip(), "5" if cached_fixed else "-1")
+        return fixture
+
+    def test_validate_task_accepts_fixed_source_despite_stale_broken_bytecode(self):
+        for name in ("edit", "verify"):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                cwd = Path(directory)
+                self.stale_calc_bytecode(cwd, cached_fixed=False)
+                try:
+                    opencode_agent.validate_task(name, cwd, cwd / "absent.jsonl")
+                except subprocess.CalledProcessError as error:
+                    self.fail(f"fixed calc.py was rejected because of stale bytecode: {error.stderr!r}")
+
+    def test_validate_task_rejects_broken_source_despite_stale_fixed_bytecode(self):
+        for name in ("edit", "verify"):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                cwd = Path(directory)
+                self.stale_calc_bytecode(cwd, cached_fixed=True)
+                with self.assertRaises(subprocess.CalledProcessError):
+                    opencode_agent.validate_task(name, cwd, cwd / "absent.jsonl")
+
+    def test_fixture_check_accepts_fixed_source_despite_stale_broken_bytecode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cwd = Path(directory)
+            fixture = self.stale_calc_bytecode(cwd, cached_fixed=False)
+            result = subprocess.run([sys.executable, "check.py"], cwd=cwd,
+                                    capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), fixture["expected"])
+
+    def test_fixture_check_rejects_broken_source_despite_stale_fixed_bytecode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cwd = Path(directory)
+            fixture = self.stale_calc_bytecode(cwd, cached_fixed=True)
+            result = subprocess.run([sys.executable, "check.py"], cwd=cwd,
+                                    capture_output=True, text=True, timeout=10)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertNotIn(fixture["expected"], result.stdout)
+
     def test_verify_fixture_passes_only_after_a_real_fix_and_a_real_run(self):
         with tempfile.TemporaryDirectory() as directory:
             cwd = Path(directory)
             fixture = opencode_agent.verify_fixture(cwd)
+            # Same-size edits within a filesystem timestamp tick must not load
+            # the broken module from Python's bytecode cache after the fix.
+            timestamp = 1700000000
+            os.utime(cwd / "calc.py", (timestamp, timestamp))
             run = lambda: subprocess.run([sys.executable, "check.py"], cwd=cwd, capture_output=True, text=True)
             broken = run()
             self.assertNotEqual(broken.returncode, 0)
@@ -109,6 +240,7 @@ class OpenCodeResults(unittest.TestCase):
             source = (cwd / "calc.py").read_text()
             self.assertIn(fixture["sentinel"], source)
             (cwd / "calc.py").write_text(source.replace("a - b", "a + b"))
+            os.utime(cwd / "calc.py", (timestamp, timestamp))
             fixed = run()
             self.assertEqual(fixed.stdout.strip(), fixture["expected"])
             opencode_agent.validate_task("verify", cwd, cwd / "absent.jsonl")
@@ -139,10 +271,35 @@ class OpenCodeResults(unittest.TestCase):
             self.assertEqual(isolated["HOME"], str(case / "home"))
             self.assertTrue((case / "home").is_dir())
             self.assertEqual(inherited["HOME"], "/Users/someone")
+            self.assertEqual(isolated.get("OPENCODE_CONFIG_PROJECT_DISABLE"), "1")
+            self.assertEqual(isolated.get("OPENCODE_DISABLE_CLAUDE_CODE"), "1")
+            self.assertEqual(isolated.get("OPENCODE_CONFIG_DIR"), str(case / "xdg-config" / "opencode"))
             for environment in (isolated, inherited):
                 for name in ("OPENCODE_CONFIG", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME",
                              "XDG_CACHE_HOME"):
                     self.assertTrue(environment[name].startswith(str(case)))
+
+    def test_native_mcp_requires_the_actual_schemas_not_a_code_mode_wrapper(self):
+        body = {"tools": [{"type": "function", "function": {
+            "name": "catalog_" + tool["name"], "parameters": tool["inputSchema"]}}
+            for tool in opencode_agent.MCP_TOOLS]}
+        opencode_agent.validate_native_mcp(body)
+        with self.assertRaises(AssertionError):
+            opencode_agent.validate_native_mcp({"tools": [{"type": "function", "function": {
+                "name": "execute", "parameters": {"type": "object", "properties": {"code": {"type": "string"}}}}}]})
+        broken = json.loads(json.dumps(body))
+        broken["tools"][1]["function"]["parameters"]["properties"]["date"].pop("pattern")
+        with self.assertRaises(AssertionError):
+            opencode_agent.validate_native_mcp(broken)
+
+    def test_isolation_gate_checks_user_messages_and_system_messages(self):
+        clean = {"messages": [{"role": "system", "content": "OpenCode"},
+                              {"role": "user", "content": "Read calc.py"}]}
+        opencode_agent.validate_isolation([clean])
+        for role in ("system", "user"):
+            with self.subTest(role=role), self.assertRaises(AssertionError):
+                opencode_agent.validate_isolation([{"messages": [{"role": role,
+                    "content": "You have superpowers. Load using-superpowers."}]}])
 
     def test_output_inside_a_git_tree_is_detected(self):
         self.assertTrue(opencode_agent.inside_git_tree(Path(__file__).parent))
@@ -150,6 +307,239 @@ class OpenCodeResults(unittest.TestCase):
             self.assertFalse(opencode_agent.inside_git_tree(Path(directory) / "new" / "output"))
             (Path(directory) / ".git").mkdir()
             self.assertTrue(opencode_agent.inside_git_tree(Path(directory) / "new" / "output"))
+
+
+class RecorderCompletion(unittest.TestCase):
+    """Задержанный loopback upstream воспроизводит позднюю ошибку после HTTP 200."""
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.output = Path(self.directory.name)
+        self.release = threading.Event()
+        release = self.release
+
+        class PausedUpstream(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *_):
+                pass
+
+            def do_POST(self):
+                self.rfile.read(int(self.headers["Content-Length"]))
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(b'data: {"choices":[{"delta":{"content":"title"}}]}\n\n')
+                self.wfile.flush()
+                release.wait(3)
+
+        self.upstream = http.server.ThreadingHTTPServer(("127.0.0.1", 0), PausedUpstream)
+        self.upstream.daemon_threads = True
+        self.recorder = pi_agent.Recorder(f"http://127.0.0.1:{self.upstream.server_port}", self.output)
+        self.clients = []
+        for server in (self.upstream, self.recorder):
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(self.stop)
+
+    def stop(self):
+        self.release.set()
+        for thread in self.clients:
+            thread.join(timeout=2)
+        for server in (self.recorder, self.upstream):
+            server.shutdown()
+            server.server_close()
+
+    def post(self, case):
+        self.recorder.case = case
+        index = len(self.recorder.requests)
+        title = {"stream": True, "messages": [{"role": "system", "content":
+                 "You name conversations so the user can find them later in a list of past sessions."}]}
+
+        def send():
+            conn = http.client.HTTPConnection("127.0.0.1", self.recorder.server_port, timeout=3)
+            try:
+                conn.request("POST", "/v1/chat/completions", json.dumps(title), {"Content-Type": "application/json"})
+                conn.getresponse().read()
+            except (OSError, http.client.HTTPException):
+                pass  # Forced drain intentionally closes this downstream connection.
+            finally:
+                conn.close()
+
+        thread = threading.Thread(target=send, daemon=True)
+        self.clients.append(thread)
+        thread.start()
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            if len(self.recorder.requests) > index:
+                row = self.recorder.requests[index]
+                if row.get("status") == 200 or row.get("finalized"):
+                    return row
+            time.sleep(0.005)
+        self.fail("proxy did not reach response headers")
+
+    def test_drain_waits_for_late_timeout_and_preserves_raw(self):
+        self.recorder.request_timeout = 0.15
+        live = self.post("one")
+        self.assertNotIn("wall_ms", live)
+        self.assertTrue(callable(getattr(self.recorder, "drain_case", None)), "Recorder needs a completion barrier")
+        rows, report = self.recorder.drain_case("one", timeout=1)
+        self.assertTrue(report["complete"])
+        self.assertEqual(report["timed_out"], [])
+        self.assertTrue(rows[0]["finalized"])
+        self.assertRegex(rows[0]["error"], r"(?:TimeoutError|timeout)\(")
+        self.assertGreater(rows[0]["wall_ms"], 100)
+        self.assertTrue((self.output / "request-0000.sse").read_bytes())
+        self.assertEqual(json.loads((self.output / "request-0000.timing.json").read_text()), rows[0])
+        with self.assertRaises(AssertionError):
+            opencode_agent.validate_requests(rows, self.output)
+        timeout_error = rows[0]["error"]
+        live["error"] = "later mutation"
+        self.assertEqual(rows[0]["error"], timeout_error)  # Report owns an immutable snapshot.
+
+    def test_bounded_drain_aborts_only_the_current_case_and_cannot_pass(self):
+        one = self.post("one")
+        two = self.post("two")
+        self.assertTrue(callable(getattr(self.recorder, "drain_case", None)), "Recorder needs a completion barrier")
+        start = time.monotonic()
+        rows, report = self.recorder.drain_case("one", timeout=0.05, abort_timeout=1)
+        self.assertLess(time.monotonic() - start, 1.5)
+        self.assertTrue(report["complete"])
+        self.assertEqual(report["timed_out"], [one["index"]])
+        self.assertTrue(rows[0]["finalized"])
+        with self.assertRaises(AssertionError):
+            opencode_agent.validate_requests(rows, self.output)
+        self.assertFalse(two.get("finalized", False))
+        self.assertNotIn("drain_timeout", two)
+        self.release.set()
+        _, other = self.recorder.drain_case("two", timeout=1)
+        self.assertTrue(other["complete"])
+        self.assertEqual(other["timed_out"], [])
+
+    def test_body_capture_error_is_finalized_instead_of_hanging(self):
+        with unittest.mock.patch.object(Path, "write_bytes", side_effect=OSError("capture disk failure")):
+            row = self.post("one")
+        self.assertTrue(row.get("finalized"), "body capture errors must reach the completion barrier")
+        self.assertIn("capture disk failure", row["error"])
+        self.assertTrue((self.output / "request-0000.timing.json").is_file())
+
+
+class OpenCodeLifecycle(unittest.TestCase):
+    """Настоящие дочерние процессы проверяют ожидание и cleanup, без модели/сети."""
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.case = Path(self.directory.name)
+        self.cwd = self.case / "work"
+        self.cwd.mkdir()
+        self.executable = self.case / "fake-opencode"
+        self.executable.write_text(f"#!{sys.executable}\n" + r'''
+import json, os, pathlib, signal, subprocess, sys, time
+root = pathlib.Path(__file__).parent
+mode = (root / 'mode').read_text()
+if sys.argv[1] == 'serve':
+    (root / 'server.pid').write_text(str(os.getpid()))
+    if mode == 'child':
+        child = subprocess.Popen([sys.executable, '-c',
+            "import pathlib,signal,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); "
+            "p=pathlib.Path('heartbeat'); "
+            "exec('while True:\\n p.write_text(str(time.monotonic()))\\n time.sleep(.02)')"], cwd=root)
+        (root / 'child.pid').write_text(str(child.pid))
+    if mode == 'partial':
+        sys.stdout.write('{"url":'); sys.stdout.flush()
+    else:
+        print('{"url":"http://127.0.0.1:12345"}', flush=True)
+    sys.stdin.read()
+elif sys.argv[1:3] == ['api', 'mcp.list']:
+    assert sys.argv[3:] == ['--server', 'http://127.0.0.1:12345']
+    if mode == 'query-hangs':
+        time.sleep(30)
+    count = root / 'queries'
+    n = int(count.read_text()) + 1 if count.exists() else 1
+    count.write_text(str(n))
+    status = 'failed' if mode == 'failed' else 'pending' if n == 1 else 'connected'
+    if status == 'connected' and not (root / 'registry-ready-at').exists():
+        (root / 'registry-ready-at').write_text(str(time.time() + .1))
+    print(json.dumps({'location': {'directory': os.getcwd()},
+                      'data': [{'name': 'catalog', 'status': {'status': status}}]}))
+    sys.stdout.flush()
+    os._exit(0)
+else:
+    raise SystemExit('unexpected fake CLI arguments')
+''')
+        self.executable.chmod(0o755)
+
+    def server(self, mode, seconds=3):
+        self.assertTrue(callable(getattr(opencode_agent, "private_opencode", None)),
+                        "harness must wait for MCP on an owned private server")
+        (self.case / "mode").write_text(mode)
+        return opencode_agent.private_opencode(str(self.executable), self.case, self.cwd,
+                                               dict(os.environ), time.monotonic() + seconds)
+
+    def assert_server_stopped(self):
+        pid = int((self.case / "server.pid").read_text())
+        with self.assertRaises(ProcessLookupError):
+            os.kill(pid, 0)
+        self.assertIsNotNone(json.loads((self.case / "server-exit.json").read_text())["returncode"])
+
+    def test_first_prompt_waits_for_connected_mcp(self):
+        with self.server("pending") as (endpoint, env):
+            self.assertEqual(endpoint, "http://127.0.0.1:12345")
+            self.assertGreaterEqual(int((self.case / "queries").read_text()), 2)
+            self.assertGreaterEqual(time.time(), float((self.case / "registry-ready-at").read_text()),
+                                    "connected precedes the asynchronous tool registry update")
+            self.assertTrue(env.get("OPENCODE_PASSWORD"))
+        self.assert_server_stopped()
+
+    def test_mcp_failure_prevents_prompt_and_stops_server(self):
+        with self.assertRaisesRegex(AssertionError, "MCP.*failed"):
+            with self.server("failed"):
+                self.fail("failed MCP must not reach the agent prompt")
+        self.assert_server_stopped()
+
+    def test_case_keeps_readiness_failure_as_the_primary_error(self):
+        (self.case / "mode").write_text("failed")
+        args = SimpleNamespace(output=self.case / "results", model="unused", thinking=False,
+                               isolated=True, opencode=str(self.executable), timeout=3)
+        recorder = SimpleNamespace(server_port=1, requests=[],
+                                   drain_case=lambda _: ([], {"complete": True, "timed_out": []}))
+        with unittest.mock.patch("builtins.print"):
+            row = opencode_agent.run_case(args, recorder, 0, "tools")
+        self.assertEqual(row["status"], "fail")
+        self.assertIn("MCP catalog failed", row["error"])
+        self.assertIn("http_validation_error", row)
+        self.assertFalse((args.output / "00-tools" / "command.json").exists())
+        with self.assertRaises(ProcessLookupError):
+            os.kill(int((self.case / "server.pid").read_text()), 0)
+
+    def test_partial_readiness_and_hanging_query_obey_deadline(self):
+        for mode in ("partial", "query-hangs"):
+            with self.subTest(mode=mode):
+                start = time.monotonic()
+                with self.assertRaisesRegex(AssertionError, "timeout"):
+                    with self.server(mode, seconds=0.5):
+                        self.fail("incomplete readiness must not reach the agent prompt")
+                self.assertLess(time.monotonic() - start, 3)
+                self.assert_server_stopped()
+
+    def test_body_exception_kills_owned_descendants_only(self):
+        unrelated = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            with self.assertRaisesRegex(RuntimeError, "agent failed"):
+                with self.server("child"):
+                    deadline = time.monotonic() + 2
+                    while not (self.case / "heartbeat").exists() and time.monotonic() < deadline:
+                        time.sleep(0.02)
+                    self.assertTrue((self.case / "heartbeat").exists())
+                    raise RuntimeError("agent failed")
+            self.assert_server_stopped()
+            heartbeat = (self.case / "heartbeat").read_text()
+            time.sleep(0.1)
+            self.assertEqual((self.case / "heartbeat").read_text(), heartbeat)
+            self.assertIsNone(unrelated.poll())
+        finally:
+            unrelated.terminate()
+            unrelated.wait(timeout=5)
 
 
 class OptimizedPython(unittest.TestCase):

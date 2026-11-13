@@ -500,6 +500,22 @@ turn declares them beside opencode's own tools. It checks that framing never
 reaches content or replayed history, that MCP arguments keep their JSON types,
 that tasks complete, and that each next agent request reuses the previous one.
 
+Для приёмки FAEX2 с OpenCode 2.2.5 используйте `--isolated` и новый каталог
+`--output` вне Git-дерева. Harness создаёт отдельные HOME/XDG и конфигурацию,
+отключает поиск конфигурации в родительских каталогах и загрузку Claude Code
+инструкций. Пользовательские настройки не изменяются. Собственный сервер
+OpenCode слушает случайный loopback-порт; перед первым запросом проверяется
+готовность MCP в том же рабочем каталоге. Холодный `run --standalone` сам по
+себе этой готовности не гарантирует.
+
+Для MCP задан `codemode: false`: каждый foreground-запрос обязан передать
+исходные `catalog_*` схемы. Наличие встроенного `execute` не заменяет эту
+проверку. Задачи `tools`, `edit`, `verify`, `mcp` проверяют реальные результаты
+инструментов; `verify` и итоговая проверка исправления исполняют текущий
+исходник Python, обходя старый `.pyc`. Диагностика запуска и готовности
+сохраняется рядом с сырыми запросами. Такие результаты относятся к OpenCode;
+они не подменяют неисполненный сценарий `pi_agent.py`.
+
 Cache checks use real assistant replies and run cold controls after the warm
 history, so the controls cannot hide a missed checkpoint. `cache-edits` checks
 latest-message edits, shortened tool results and rewinds. `cache-growth` checks

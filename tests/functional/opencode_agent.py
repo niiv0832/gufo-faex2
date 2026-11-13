@@ -15,16 +15,19 @@ bodies/SSE, opencode JSON events, MCP calls and per-request timings.
 """
 
 import argparse
+from contextlib import contextmanager
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
 import secrets
+import select
 import signal
 import subprocess
 import sys
 import time
+from urllib.parse import urlsplit
 
 from pi_agent import Recorder, save
 from tool_native import NEIGHBORS
@@ -60,11 +63,11 @@ MCP_TOOLS += [{"name": f"zoo_{name}", "description": "Catalog extension; not nee
 
 PROMPTS = {
     "tools": ("Create a file hello.txt containing exactly the word bonjour, show it with "
-              "cat using the bash tool with a timeout of 5000, then read it back with the "
+              "cat using the shell tool with a timeout of 5000, then read it back with the "
               "read tool and confirm its content in one sentence."),
     "edit": ("Read calc.py, fix the obvious bug with the edit tool, then run "
              "`python3 -c 'import calc; assert calc.add(2, 3) == 5; print(\"ok\")'` "
-             "with the bash tool and report the result."),
+             "with the shell tool and report the result."),
     "mcp": ("Use the catalog MCP tools: look up record 42 (the integer id 42), look up "
             "the date 2026-10-05, and tag record 42 with the tag name urgent and weight 3. "
             "Then write the record title returned by the lookup into result.txt and reply "
@@ -72,7 +75,7 @@ PROMPTS = {
     # The bash result depends on a per-run secret, so it cannot be produced
     # without really executing the fixture's check after a real fix.
     "verify": ("Read calc.py, fix the obvious bug with the edit tool, then run "
-               "`python3 check.py` with the bash tool and reply with the exact line it prints."),
+               "`python3 check.py` with the shell tool and reply with the exact line it prints."),
 }
 
 
@@ -147,15 +150,57 @@ def sse_output(path, *, reasoning=None):
     return content, list(calls.values())
 
 
-def validate_requests(rows, output):
+def validate_native_mcp(body):
+    """The native-schema regression must expose MCP schemas to the model."""
+    require_assertions()
+    declared = {tool["function"]["name"]: tool["function"].get("parameters", {})
+                for tool in body.get("tools", []) if tool.get("type") == "function"}
+
+    def contains(actual, expected):
+        if isinstance(expected, dict):
+            return isinstance(actual, dict) and all(
+                key in actual and contains(actual[key], value)
+                for key, value in expected.items() if key != "$schema")
+        return actual == expected
+
+    for tool in MCP_TOOLS:
+        name = "catalog_" + tool["name"]
+        assert name in declared, ("native MCP tool missing (Code Mode is a different test)", name)
+        assert contains(declared[name], tool["inputSchema"]), ("MCP schema was weakened", name)
+
+
+def validate_isolation(bodies):
+    """Catch the external plugin instructions observed in the contaminated run."""
+    require_assertions()
+    for index, body in enumerate(bodies):
+        messages = json.dumps(body.get("messages", body.get("input", [])), ensure_ascii=False)
+        for marker in ("You have superpowers", "using-superpowers", "superpowers:brainstorming"):
+            assert marker not in messages, ("external instructions in isolated request", index, marker)
+
+
+def validate_requests(rows, output, *, native_mcp=False):
     """Every agent turn stays native and reuses the previous one."""
     require_assertions()
     agent = []
     for row in rows:
-        assert row.get("status") == 200 and not row.get("error"), row
+        assert row.get("finalized") is True, ("HTTP request not finalized", row)
+        assert not row.get("drain_timeout"), ("HTTP request exceeded recorder drain timeout", row)
         body = json.loads((output / f"request-{row['index']:04d}.json").read_text())
-        if not body.get("tools"):
+        # OpenCode cancels its background conversation-title request when the
+        # foreground task finishes. Keep its raw failure, but do not mistake
+        # that client cancellation for an agent/tool failure. Server errors,
+        # timeouts and disconnected foreground requests remain failures.
+        title = not body.get("tools") and any(
+            message.get("role") == "system" and isinstance(message.get("content"), str)
+            and message["content"].startswith("You name conversations so the user can find them later")
+            for message in body.get("messages", []))
+        cancelled_title = title and str(row.get("error", "")).startswith(
+            ("BrokenPipeError(", "ConnectionResetError("))
+        assert row.get("status") == 200 and (not row.get("error") or cancelled_title), row
+        if title:
             continue  # opencode's title request has its own prompt
+        if native_mcp:
+            validate_native_mcp(body)
         content, calls = sse_output(output / f"request-{row['index']:04d}.sse")
         leaked = [tag for tag in FRAMING if tag in content]
         assert not leaked, ("framing reached content", leaked, row["index"], content)
@@ -186,8 +231,11 @@ def validate_task(name, cwd, calls_log):
     if name == "tools":
         assert (cwd / "hello.txt").read_text().strip() == "bonjour"
     elif name in ("edit", "verify"):
+        # Execute the current source; same-size edits within one timestamp tick
+        # can leave a valid-looking but stale calc.pyc after an agent's test run.
         subprocess.run([sys.executable, "-c",
-                        "import calc; assert calc.add(2, 3) == 5 and calc.add(-4, 1) == -3"],
+                        "import runpy; calc = runpy.run_path('calc.py'); "
+                        "assert calc['add'](2, 3) == 5 and calc['add'](-4, 1) == -3"],
                        cwd=cwd, check=True, capture_output=True, timeout=10)
     elif name == "mcp":
         by_name = {call["name"]: call["arguments"] for call in mcp}
@@ -253,17 +301,17 @@ def validate_tool_results(name, history, fixture=None):
 
     failed = ("Traceback", "AssertionError")
     if name == "tools":
-        ran(("bash",), ("cat", "hello.txt"), "bonjour")
+        ran(("shell", "bash"), ("cat", "hello.txt"), "bonjour")
         ran(("read",), ("hello.txt",), "bonjour")
     elif name == "edit":
         ran(("read",), ("calc.py",), "return a - b")
         # The run that asserts the fix printed "ok" on a line of its own; the
         # word inside other text, or a command without the assertion, is not it.
-        ran(("bash",), ("calc", "assert"), re.compile(r"(?m)^\s*ok\s*$"), failed)
+        ran(("shell", "bash"), ("calc", "assert"), re.compile(r"(?m)^\s*ok\s*$"), failed)
     elif name == "verify":
         ran(("read",), ("calc.py",), fixture["sentinel"])
         ran(("edit", "patch", "multiedit", "write"), ("calc.py",), "")
-        ran(("bash",), ("check.py",), fixture["expected"], failed)
+        ran(("shell", "bash"), ("check.py",), fixture["expected"], failed)
     elif name == "mcp":
         ran(("lookup_record",), ("42",), "Native framing record")
         ran(("lookup_date",), ("2026-10-05",), "release")
@@ -276,8 +324,8 @@ def verify_fixture(cwd):
     (cwd / "calc.py").write_text(f"# {sentinel}\ndef add(a, b):\n    return a - b\n")
     (cwd / ".nonce").write_text(nonce)
     (cwd / "check.py").write_text(
-        "import hashlib\nimport calc\n"
-        "assert calc.add(2, 3) == 5 and calc.add(-4, 1) == -3\n"
+        "import hashlib\nimport runpy\ncalc = runpy.run_path('calc.py')\n"
+        "assert calc['add'](2, 3) == 5 and calc['add'](-4, 1) == -3\n"
         "print('verified-' + hashlib.sha256(open('.nonce', 'rb').read()).hexdigest()[:16])\n")
     return {"sentinel": sentinel,
             "expected": "verified-" + hashlib.sha256(nonce.encode()).hexdigest()[:16]}
@@ -297,13 +345,126 @@ def case_environment(case, isolated):
         source = {key: value for key, value in os.environ.items()
                   if key in {"PATH", "USER", "LANG", "LC_ALL", "TMPDIR", "SHELL", "SSL_CERT_FILE"}}
         source["HOME"] = str(case / "home")
+        # V2 searches all cwd ancestors for opencode.json(c), even outside a
+        # Git tree. HOME/XDG alone does not isolate a fixture under /Users/name.
+        source["OPENCODE_CONFIG_PROJECT_DISABLE"] = "1"
+        source["OPENCODE_DISABLE_CLAUDE_CODE"] = "1"
+        source["OPENCODE_CONFIG_DIR"] = str(case / "xdg-config" / "opencode")
     return {**source, "OPENCODE_CONFIG": str(case / "opencode.json"),
             "XDG_CONFIG_HOME": str(case / "xdg-config"), "XDG_DATA_HOME": str(case / "xdg-data"),
             "XDG_STATE_HOME": str(case / "xdg-state"), "XDG_CACHE_HOME": str(case / "xdg-cache")}
 
 
+def stop_process_group(proc):
+    """Stop only a process group created here with start_new_session=True."""
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        proc.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        pass
+    # The group can still contain MCP/tool children after its leader exits.
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    proc.wait(timeout=2)
+
+
+@contextmanager
+def private_opencode(opencode, case, cwd, env, deadline):
+    """Own one V2 server and wait for its MCP catalog before the first prompt.
+
+    A cold `run --standalone` races asynchronous MCP startup in OpenCode 2.2.5.
+    Readiness and the run must use this same server and canonical directory.
+    The random loopback password is passed through env only, never saved.
+    """
+    require_assertions()
+    cwd = cwd.resolve()
+    env = {**env, "OPENCODE_PASSWORD": secrets.token_urlsafe(32)}
+    command = [opencode, "serve", "--stdio", "--hostname", "127.0.0.1", "--port", "0", "--print-logs"]
+    save(case / "server-command.json", command)
+    server = None
+    try:
+        with (case / "server.log").open("w") as log, (case / "server.stdout").open("wb") as output:
+            server = subprocess.Popen(command, cwd=cwd, env=env, stdin=subprocess.PIPE,
+                                      stdout=subprocess.PIPE, stderr=log, start_new_session=True)
+            line = b""
+            while b"\n" not in line:
+                remaining = deadline - time.monotonic()
+                assert remaining > 0, "private OpenCode readiness timeout"
+                assert select.select([server.stdout], [], [], remaining)[0], "private OpenCode readiness timeout"
+                chunk = os.read(server.stdout.fileno(), 4096)
+                assert chunk, "private OpenCode exited before readiness; see server.log"
+                output.write(chunk)
+                output.flush()
+                line += chunk
+                assert len(line) <= 65536, "invalid private OpenCode readiness output"
+            endpoint = json.loads(line.split(b"\n", 1)[0])["url"]
+            parsed = urlsplit(endpoint)
+            assert parsed.scheme == "http" and parsed.hostname == "127.0.0.1" and parsed.port, (
+                "private OpenCode returned a non-loopback endpoint")
+            with (case / "mcp-readiness.jsonl").open("w") as history:
+                connected_since = None
+                while True:
+                    remaining = deadline - time.monotonic()
+                    assert remaining > 0, "MCP catalog readiness timeout"
+                    assert server.poll() is None, "private OpenCode exited while waiting for MCP; see server.log"
+                    query = subprocess.Popen([opencode, "api", "mcp.list", "--server", endpoint],
+                                             cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                             stdin=subprocess.DEVNULL, text=True, start_new_session=True)
+                    try:
+                        try:
+                            stdout, stderr = query.communicate(timeout=remaining)
+                        except subprocess.TimeoutExpired as error:
+                            history.write(json.dumps({"error": "MCP readiness query timeout"}) + "\n")
+                            raise AssertionError("MCP readiness query timeout") from error
+                    finally:
+                        stop_process_group(query)
+                        query.stdout.close()
+                        query.stderr.close()
+                    history.write(json.dumps({"returncode": query.returncode,
+                                              "stdout": stdout, "stderr": stderr}) + "\n")
+                    history.flush()
+                    assert query.returncode == 0, "MCP readiness query failed; see mcp-readiness.jsonl"
+                    state = json.loads(stdout)
+                    assert state["location"]["directory"] == str(cwd), "MCP readiness used a different directory"
+                    catalog = next((row for row in state["data"] if row["name"] == "catalog"), None)
+                    status = catalog["status"]["status"] if catalog else "pending"
+                    if status == "connected":
+                        # V2.2.5 updates the tool registry through a 100 ms
+                        # debounce after publishing `connected`. Observe a
+                        # stable connection for two polling intervals; actual
+                        # outgoing schemas remain a separate strict gate.
+                        if connected_since is None:
+                            connected_since = time.monotonic()
+                        if time.monotonic() - connected_since >= 0.2:
+                            break
+                    else:
+                        connected_since = None
+                        assert status == "pending", f"MCP catalog {status}; see mcp-readiness.jsonl"
+                    time.sleep(min(0.1, max(0, deadline - time.monotonic())))
+            yield endpoint, env
+    finally:
+        if server is not None:
+            # Closing stdin lets `serve --stdio` shut down normally. Always
+            # clean the owned group as well, including children of a dead leader.
+            if server.stdin:
+                server.stdin.close()
+            try:
+                server.wait(timeout=0.5)
+            except subprocess.TimeoutExpired:
+                pass
+            stop_process_group(server)
+            if server.stdout:
+                server.stdout.close()
+            save(case / "server-exit.json", {"pid": server.pid, "returncode": server.returncode})
+
+
 def run_case(args, recorder, index, name):
-    case = args.output / f"{index:02d}-{name}"
+    case = (args.output / f"{index:02d}-{name}").resolve()
     cwd = case / "work"
     cwd.mkdir(parents=True)
     fixture = None
@@ -322,51 +483,53 @@ def run_case(args, recorder, index, name):
             "models": {args.model: {"name": args.model, "tool_call": True,
                                     "reasoning": args.thinking,
                                     "limit": {"context": 262144, "output": 16384}}}}},
-        "mcp": {"catalog": {"type": "local", "enabled": True,
+        "mcp": {"catalog": {"type": "local", "enabled": True, "codemode": False,
                             "command": [sys.executable, str(Path(__file__).resolve()),
                                         "--mcp", str(calls_log)]}},
         "permission": {"*": "allow"},
     }
     save(case / "opencode.json", config)
     env = case_environment(case, args.isolated)
-    # A private server: the default background service may belong to the
-    # user's own opencode and carry their configuration.
-    command = [args.opencode, "run", *(["--standalone"] if args.isolated else []),
-               "--auto", "--format", "json", "-m", f"gufo/{args.model}", PROMPTS[name]]
-    save(case / "command.json", command)
     recorder.case = case.name
     row = {"case": case.name, "start_request": len(recorder.requests)}
     start = time.monotonic()
     proc = None
     try:
-        with (case / "events.jsonl").open("w") as out, (case / "stderr.log").open("w") as err:
-            proc = subprocess.Popen(command, cwd=cwd, env=env, stdout=out, stderr=err,
-                                    start_new_session=True)
-            while proc.poll() is None:
-                if time.monotonic() - start > args.timeout:
-                    raise AssertionError("opencode task timeout")
-                time.sleep(0.5)
-            assert proc.returncode == 0, (case / "stderr.log").read_text()[-4000:]
+        with private_opencode(args.opencode, case, cwd, env, start + min(args.timeout, 30)) as (endpoint, run_env):
+            command = [args.opencode, "run", "--server", endpoint, "--auto", "--format", "json",
+                       "-m", f"gufo/{args.model}", PROMPTS[name]]
+            save(case / "command.json", command)
+            with (case / "events.jsonl").open("w") as out, (case / "stderr.log").open("w") as err:
+                proc = subprocess.Popen(command, cwd=cwd.resolve(), env=run_env, stdout=out, stderr=err,
+                                        start_new_session=True)
+                try:
+                    proc.wait(timeout=max(0.001, args.timeout - (time.monotonic() - start)))
+                except subprocess.TimeoutExpired as error:
+                    raise AssertionError("opencode task timeout") from error
+                finally:
+                    stop_process_group(proc)
+                assert proc.returncode == 0, (case / "stderr.log").read_text()[-4000:]
         row["mcp_calls"] = validate_task(name, cwd, calls_log)
         row["status"] = "pass"
     except Exception as error:
         row.update(status="fail", error=repr(error))
-        if proc is not None and proc.poll() is None:
-            os.killpg(proc.pid, signal.SIGTERM)
-            try:
-                proc.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                os.killpg(proc.pid, signal.SIGKILL)
-                proc.wait()
+    row["requests"], row["http_drain"] = recorder.drain_case(case.name)
+    save(case / "http-drain.json", row["http_drain"])
     row["wall_ms"] = (time.monotonic() - start) * 1000
-    row["requests"] = recorder.requests[row["start_request"]:]
     try:
-        row["agent_requests"] = len(validate_requests(row["requests"], args.output))
+        assert row["http_drain"]["complete"] and not row["http_drain"]["timed_out"], (
+            "HTTP recorder did not finish within the drain deadline", row["http_drain"])
+        row["agent_requests"] = len(validate_requests(row["requests"], args.output, native_mcp=True))
     except Exception as error:
-        row.update(status="fail", error=f"HTTP/framing/cache validation: {error!r}")
+        if row["status"] == "pass":
+            row.update(status="fail", error=f"HTTP/framing/cache validation: {error!r}")
+        else:
+            row["http_validation_error"] = repr(error)
     try:
         bodies = [json.loads((args.output / f"request-{item['index']:04d}.json").read_text())
                   for item in row["requests"]]
+        if args.isolated:
+            validate_isolation(bodies)
         row["tool_results"] = validate_tool_results(name, tool_history(bodies), fixture)
     except Exception as error:
         if row["status"] == "pass":

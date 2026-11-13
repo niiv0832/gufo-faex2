@@ -8,6 +8,7 @@ sessions, exact HTTP bodies/SSE, task files and individual request/task timings.
 import argparse
 import base64
 import collections
+import copy
 import hashlib
 import http.client
 import http.server
@@ -17,6 +18,7 @@ import os
 from pathlib import Path
 import re
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -79,8 +81,44 @@ class Recorder(http.server.ThreadingHTTPServer):
         self.output = output
         self.requests = []
         self.lock = threading.Lock()
+        self.completed = threading.Condition(self.lock)
+        self.active = {}
         self.case = "startup"
         self.request_timeout = request_timeout
+
+    def drain_case(self, case, *, timeout=5, abort_timeout=2):
+        """Freeze a case only after its handlers persist final results.
+
+        A stopped agent can leave an upstream title response blocked in read().
+        Bound that wait and interrupt only this case's sockets. Crossing the
+        deadline is always a failure, even if shutdown produces BrokenPipe.
+        """
+        def pending():
+            return [row for row in self.requests if row["case"] == case and not row.get("finalized")]
+
+        with self.completed:
+            deadline = time.monotonic() + timeout
+            while pending() and time.monotonic() < deadline:
+                self.completed.wait(max(0, deadline - time.monotonic()))
+            unfinished = pending()
+            timed_out = [row["index"] for row in unfinished]
+            sockets = []
+            for row in unfinished:
+                row["drain_timeout"] = True
+                sockets.extend(sock for sock in self.active.get(row["index"], {}).values() if sock is not None)
+        for sock in sockets:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        with self.completed:
+            deadline = time.monotonic() + abort_timeout
+            while pending() and time.monotonic() < deadline:
+                self.completed.wait(max(0, deadline - time.monotonic()))
+            remaining = [row["index"] for row in pending()]
+            rows = copy.deepcopy([row for row in self.requests if row["case"] == case])
+        return rows, {"case": case, "complete": not remaining, "timed_out": timed_out,
+                      "pending": remaining, "timeout_seconds": timeout, "abort_timeout_seconds": abort_timeout}
 
 
 class Proxy(http.server.BaseHTTPRequestHandler):
@@ -109,18 +147,28 @@ class Proxy(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         server = self.server
-        with server.lock:
+        with server.completed:
             index = len(server.requests)
             row = {"index": index, "case": server.case, "path": self.path}
             server.requests.append(row)
+            server.active[index] = {"downstream": self.connection, "upstream": None}
         stem = server.output / f"request-{index:04d}"
-        body = self.rfile.read(int(self.headers["Content-Length"]))
-        stem.with_suffix(".json").write_bytes(body)
-        conn = http.client.HTTPConnection(
-            server.upstream.hostname, server.upstream.port, timeout=server.request_timeout
-        )
         start = time.monotonic()
+        conn = upstream_socket = None
         try:
+            body = self.rfile.read(int(self.headers["Content-Length"]))
+            stem.with_suffix(".json").write_bytes(body)
+            conn = http.client.HTTPConnection(
+                server.upstream.hostname, server.upstream.port, timeout=server.request_timeout
+            )
+            conn.connect()
+            # HTTPConnection may clear sock after getresponse() when the
+            # upstream sends Connection: close. Own a duplicate for cancellation.
+            upstream_socket = conn.sock.dup()
+            with server.completed:
+                server.active[index]["upstream"] = upstream_socket
+                if row.get("drain_timeout"):
+                    raise TimeoutError("Recorder drain timeout before upstream request")
             conn.request("POST", self.path, body, {"Content-Type": "application/json"})
             response = conn.getresponse()
             row["status"] = response.status
@@ -155,10 +203,20 @@ class Proxy(http.server.BaseHTTPRequestHandler):
         except Exception as error:
             row["error"] = repr(error)
         finally:
-            row["wall_ms"] = (time.monotonic() - start) * 1000
-            conn.close()
+            if conn is not None:
+                conn.close()
+            if upstream_socket is not None:
+                upstream_socket.close()
             self.close_connection = True
-            save(stem.with_suffix(".timing.json"), row)
+            with server.completed:
+                final = {**row, "wall_ms": (time.monotonic() - start) * 1000, "finalized": True}
+                try:
+                    save(stem.with_suffix(".timing.json"), final)
+                except Exception as error:
+                    final["error"] = f"timing capture failed: {error!r}; previous: {row.get('error')!r}"
+                row.update(final)
+                server.active.pop(index, None)
+                server.completed.notify_all()
 
 
 def require_assertions():
