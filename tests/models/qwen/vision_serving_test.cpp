@@ -1,13 +1,31 @@
+// Image prompts through the serving stack on real weights: autoregression
+// against an explicitly selected speculative backend, sampling, concurrency,
+// cancellation, live-prefix and disk restoration.
+//
+// qwen_vision_serving_test MODEL SPECULATION IMAGES [--mmproj PATH]
+//                          [--disk-only|--append-only]
+// SPECULATION is `-` (autoregression only), `mtp-embedded` (the prediction
+// head inside MODEL), `mtp=PATH` or `dflash=PATH`. The selected backend must
+// load and must have proposals accepted; nothing falls back to another one.
+// IMAGES is a directory with red.png, blue.png and blue-wide.png, or
+// `synthetic` to generate those solid-colour images.
+
 #include <unistd.h>
 
+#include <algorithm>
 #include <array>
 #include <cctype>
 #include <cmath>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <iostream>
 #include <memory>
+#include <span>
 #include <stdexcept>
+#include <string>
+#include <string_view>
+#include <vector>
 
 #include "src/cli/serve/inference_backend.hpp"
 #include "src/core/gguf_identity.hpp"
@@ -22,6 +40,105 @@ using Backend = server::InferenceBackend;
 void Require(bool condition, std::string_view message) {
   if (!condition)
     throw std::runtime_error(std::string(message));
+}
+
+// A solid-colour 8-bit RGB PNG with stored (uncompressed) deflate blocks.
+void WriteSolidPng(const std::filesystem::path& path, std::uint32_t width,
+                   std::uint32_t height, std::array<std::uint8_t, 3> rgb) {
+  const auto put32 = [](std::vector<std::uint8_t>& out, std::uint32_t value) {
+    for (int shift = 24; shift >= 0; shift -= 8)
+      out.push_back(static_cast<std::uint8_t>(value >> shift));
+  };
+  std::vector<std::uint8_t> raw;
+  raw.reserve(static_cast<std::size_t>(height) * (1 + (3 * width)));
+  for (std::uint32_t y = 0; y < height; ++y) {
+    raw.push_back(0);  // filter: none
+    for (std::uint32_t x = 0; x < width; ++x)
+      raw.insert(raw.end(), rgb.begin(), rgb.end());
+  }
+  std::vector<std::uint8_t> zlib = {0x78, 0x01};
+  std::uint32_t a = 1, b = 0;  // Adler-32
+  for (const auto byte : raw) {
+    a = (a + byte) % 65521U;
+    b = (b + a) % 65521U;
+  }
+  for (std::size_t offset = 0; offset < raw.size();) {
+    const std::size_t size = std::min<std::size_t>(raw.size() - offset, 65535);
+    zlib.push_back(offset + size == raw.size() ? 1 : 0);
+    zlib.push_back(static_cast<std::uint8_t>(size));
+    zlib.push_back(static_cast<std::uint8_t>(size >> 8U));
+    zlib.push_back(static_cast<std::uint8_t>(~size));
+    zlib.push_back(static_cast<std::uint8_t>(~size >> 8U));
+    zlib.insert(zlib.end(), raw.begin() + static_cast<std::ptrdiff_t>(offset),
+                raw.begin() + static_cast<std::ptrdiff_t>(offset + size));
+    offset += size;
+  }
+  put32(zlib, (b << 16U) | a);
+  std::vector<std::uint8_t> png = {0x89, 'P', 'N', 'G', '\r', '\n', 0x1A, '\n'};
+  const auto chunk = [&](std::string_view type,
+                         std::span<const std::uint8_t> data) {
+    put32(png, static_cast<std::uint32_t>(data.size()));
+    const std::size_t begin = png.size();
+    png.insert(png.end(), type.begin(), type.end());
+    png.insert(png.end(), data.begin(), data.end());
+    std::uint32_t crc = 0xFFFFFFFFU;
+    for (std::size_t i = begin; i < png.size(); ++i) {
+      crc ^= png[i];
+      for (int bit = 0; bit < 8; ++bit)
+        crc = (crc >> 1U) ^ (0xEDB88320U & (0U - (crc & 1U)));
+    }
+    put32(png, ~crc);
+  };
+  std::vector<std::uint8_t> header;
+  put32(header, width);
+  put32(header, height);
+  header.insert(header.end(), {8, 2, 0, 0, 0});  // 8-bit RGB
+  chunk("IHDR", header);
+  chunk("IDAT", zlib);
+  chunk("IEND", {});
+  std::ofstream output(path, std::ios::binary);
+  output.write(reinterpret_cast<const char*>(png.data()),
+               static_cast<std::streamsize>(png.size()));
+  Require(output.good(), "cannot write a synthetic image");
+}
+
+std::filesystem::path TemporaryDirectory(std::string_view name) {
+  std::string pattern =
+      (std::filesystem::temp_directory_path() / (std::string(name) + "-XXXXXX"))
+          .string();
+  Require(::mkdtemp(pattern.data()) != nullptr,
+          "cannot create a temporary directory");
+  return pattern;
+}
+
+struct RemoveDirectory {
+  std::filesystem::path path;
+  ~RemoveDirectory() {
+    if (path.empty())
+      return;
+    std::error_code ignored;
+    std::filesystem::remove_all(path, ignored);
+  }
+};
+
+// Speculation that proposes nothing, or whose proposals are never accepted,
+// is autoregression under another name.
+void RequireAcceptedDrafts(std::span<const Backend::Result> results,
+                           std::string_view label) {
+  std::size_t proposed = 0;
+  std::size_t accepted = 0;
+  for (const auto& result : results) {
+    Require(result.draft_tokens > 0,
+            "image request bypassed speculative decoding");
+    Require(result.draft_accepted_tokens <= result.draft_tokens,
+            "image request accepted more tokens than it drafted");
+    proposed += result.draft_tokens;
+    accepted += result.draft_accepted_tokens;
+  }
+  std::cout << label << ": requests=" << results.size()
+            << " draft_tokens=" << proposed
+            << " draft_accepted_tokens=" << accepted << '\n';
+  Require(accepted > 0, "no speculative proposal was accepted");
 }
 
 std::string Lower(std::string value) {
@@ -337,16 +454,57 @@ int main(int argc, char** argv) {
   if (argc == 1)
     return 77;
   try {
-    const bool disk_only =
-        argc == 5 && std::string_view(argv[4]) == "--disk-only";
-    const bool append_only =
-        argc == 5 && std::string_view(argv[4]) == "--append-only";
-    Require(argc == 4 || disk_only || append_only,
-            "usage: qwen_vision_serving_test MODEL DRAFT_OR_DASH "
-            "IMAGE_DIRECTORY [--disk-only|--append-only]");
+    constexpr std::string_view usage =
+        "usage: qwen_vision_serving_test MODEL "
+        "-|mtp-embedded|mtp=PATH|dflash=PATH IMAGE_DIRECTORY|synthetic "
+        "[--mmproj PATH] [--disk-only|--append-only]";
+    Require(argc >= 4, usage);
+    bool disk_only = false;
+    bool append_only = false;
+    std::filesystem::path mmproj;
+    for (int i = 4; i < argc; ++i) {
+      const std::string_view option(argv[i]);
+      if (option == "--disk-only") {
+        disk_only = true;
+      } else if (option == "--append-only") {
+        append_only = true;
+      } else if (option == "--mmproj" && i + 1 < argc) {
+        mmproj = argv[++i];
+      } else {
+        Require(false, usage);
+      }
+    }
+    Require(!(disk_only && append_only), usage);
     const std::string model_path(argv[1]);
-    const std::string draft = std::string_view(argv[2]) == "-" ? "" : argv[2];
-    const std::filesystem::path images(argv[3]);
+    // The speculative backend is named, never inferred from the artifacts.
+    const std::string_view speculation(argv[2]);
+    server::TextSpeculativeConfig speculative;
+    std::string draft;
+    if (speculation == "mtp-embedded") {
+      speculative.backend = server::TextSpeculativeBackend::kMtp;
+    } else if (speculation.starts_with("mtp=")) {
+      speculative.backend = server::TextSpeculativeBackend::kMtp;
+      draft = speculation.substr(4);
+      Require(!draft.empty(), usage);
+    } else if (speculation.starts_with("dflash=")) {
+      speculative.backend = server::TextSpeculativeBackend::kDFlash;
+      draft = speculation.substr(7);
+      Require(!draft.empty(), usage);
+    } else {
+      Require(speculation == "-", usage);
+    }
+    const bool speculation_requested =
+        speculative.backend != server::TextSpeculativeBackend::kDisabled;
+    const bool embedded_mtp = speculation == "mtp-embedded";
+    RemoveDirectory synthetic_images;
+    std::filesystem::path images(argv[3]);
+    if (images == "synthetic") {
+      images = TemporaryDirectory("gufo-vision-images");
+      synthetic_images.path = images;
+      WriteSolidPng(images / "red.png", 256, 256, {255, 0, 0});
+      WriteSolidPng(images / "blue.png", 256, 256, {0, 0, 255});
+      WriteSolidPng(images / "blue-wide.png", 512, 128, {0, 0, 255});
+    }
     std::string error;
     auto reader = std::shared_ptr<const core::GgufReader>(
         core::GgufReader::OpenFile(model_path, &error));
@@ -354,26 +512,36 @@ int main(int argc, char** argv) {
     constexpr std::uint32_t context = 1024;
     const bool flash =
         reader->GetMetadataString("general.architecture") == "qwen4exp";
-    server::TextSpeculativeConfig speculative;
-    speculative.backend = draft.empty()
-                              ? server::TextSpeculativeBackend::kDisabled
-                          : flash ? server::TextSpeculativeBackend::kMtp
-                                  : server::TextSpeculativeBackend::kDFlash;
-    speculative.draft_model_path = draft;
     std::shared_ptr<const hip::QwenGpuModel> qwen;
     std::shared_ptr<models::qwen38_flash_next::Model> qfn;
     if (flash) {
+      Require(speculative.backend != server::TextSpeculativeBackend::kDFlash,
+              "Flash-Next has no DFlash backend");
+      speculative.draft_model_path = draft;
       qfn = models::qwen38_flash_next::Model::Load(
           model_path, {.max_context = context, .mtp_model_path = draft},
           &error);
       Require(qfn != nullptr && qfn->VisionEncoder() != nullptr, error);
+      Require(!speculation_requested || qfn->HasMtp(),
+              "MTP was requested but the Flash-Next model has no MTP head");
     } else {
-      auto encoder = models::qwen::vision::Encoder::Open(model_path, {}, 5120);
+      // The backend refuses to load when the checkpoint has no embedded head.
+      speculative.draft_model_path = embedded_mtp ? "embedded" : draft;
+      // Qwen3.6-35B-A3B projects image rows to 2048, Qwen3.8-27B to 5120.
+      const std::uint32_t width =
+          reader->GetMetadataUint64("qwen35moe.embedding_length") == 2048
+              ? 2048
+              : 5120;
+      auto encoder =
+          models::qwen::vision::Encoder::Open(model_path, mmproj, width);
       Require(encoder != nullptr, "missing vision sidecar");
       qwen =
           hip::QwenGpuModel::CreateFromGguf(reader, &error, std::move(encoder));
       Require(qwen != nullptr, error);
     }
+    std::cout << "speculation=" << speculation << " architecture="
+              << reader->GetMetadataString("general.architecture").value_or("")
+              << '\n';
     if (!disk_only)
       CheckAppendSnapshotOracle(qwen, qfn, images);
     if (append_only)
@@ -432,16 +600,25 @@ int main(int argc, char** argv) {
       ar.reset();
       ar = load(false);
       CheckConcurrent(*ar, requests, references, greedy);
-      if (!draft.empty()) {
+      if (speculation_requested) {
         spec = load(true);
         std::array<Backend::Result, 4> speculative_references;
+        std::array<Backend::Result, 4> speculative_replays;
         for (std::size_t i = 0; i < requests.size(); ++i) {
           speculative_references[i] = spec->chat(requests[i], 16, greedy);
           Require(speculative_references[i].tokens == references[i].tokens,
                   "greedy image speculation differs from autoregression");
-          Require(speculative_references[i].draft_tokens > 0,
-                  "image request bypassed speculative decoding");
+          // The retained prefix serves the retry without any prefill.
+          speculative_replays[i] = spec->chat(requests[i], 16, greedy);
+          const auto& replay = speculative_replays[i];
+          Require(replay.cache_hit && !replay.cache_disk_hit &&
+                      replay.prefill_tokens == 0 &&
+                      replay.cached_prompt_tokens == replay.prompt_tokens &&
+                      replay.tokens == references[i].tokens,
+                  "speculative image prefix replay is not exact");
         }
+        RequireAcceptedDrafts(speculative_references, "speculative cold");
+        RequireAcceptedDrafts(speculative_replays, "speculative RAM replay");
         spec.reset();
         spec = load(true);
         CheckConcurrent(*spec, requests, speculative_references, greedy, flash);
@@ -464,6 +641,7 @@ int main(int argc, char** argv) {
         auto interrupted = requests[0];
         interrupted.messages.back().content =
             "Name the image color, then count from one to one hundred.";
+        std::vector<Backend::Result> resumed_results;
         for (const auto& sampling : {greedy, sampled}) {
           const auto expected = backend->chat(interrupted, 8, sampling);
           std::size_t pieces = 0;
@@ -474,10 +652,30 @@ int main(int argc, char** argv) {
                   "image cancellation fixture did not interrupt generation");
           const auto resumed = backend->chat(interrupted, 8, sampling);
           Require(resumed.cache_hit && resumed.prefill_tokens == 0 &&
+                      resumed.cached_prompt_tokens == resumed.prompt_tokens &&
                       resumed.tokens == expected.tokens,
                   "cancelled image request lost its exact reusable frontier");
+          resumed_results.push_back(resumed);
         }
-        std::cout << "image cancellation/resume exact, speculative="
+        if (backend == spec.get())
+          RequireAcceptedDrafts(resumed_results, "speculative after cancel");
+        // The slot that was cancelled and reused answers like a backend that
+        // never saw the request.
+        {
+          const auto cold = load(backend == spec.get());
+          std::size_t i = 0;
+          for (const auto& sampling : {greedy, sampled}) {
+            const auto fresh = cold->chat(interrupted, 8, sampling);
+            Require(
+                i > 0 || (!fresh.cache_hit && fresh.cached_prompt_tokens == 0),
+                "the cold cancellation reference reused a prefix");
+            Require(fresh.tokens == resumed_results[i].tokens,
+                    "a cancelled and reused slot differs from a cold backend");
+            ++i;
+          }
+        }
+        std::cout << "image cancellation/resume exact and equal to cold, "
+                     "speculative="
                   << (backend == spec.get()) << '\n';
       }
     } else {
@@ -537,17 +735,7 @@ int main(int argc, char** argv) {
     if (flash)
       CheckFlashIncrementalOracle(qfn, continuation, continued);
 
-    std::array<char, 64> pattern{};
-    const std::string temporary = "/tmp/gufo-vision-cache-XXXXXX";
-    std::copy(temporary.begin(), temporary.end(), pattern.begin());
-    Require(::mkdtemp(pattern.data()) != nullptr, "cannot create test cache");
-    struct Cleanup {
-      std::filesystem::path path;
-      ~Cleanup() {
-        std::error_code ignored;
-        std::filesystem::remove_all(path, ignored);
-      }
-    } cleanup{pattern.data()};
+    const RemoveDirectory cleanup{TemporaryDirectory("gufo-vision-cache")};
     server::TextDiskCacheConfig cache{
         .directory = cleanup.path,
         .capacity_bytes = std::size_t{2} << 30,
@@ -585,8 +773,9 @@ int main(int argc, char** argv) {
                  result.prompt_tokens;
     };
     for (const bool use_spec : {false, true}) {
-      if (use_spec && draft.empty())
+      if (use_spec && !speculation_requested)
         continue;
+      std::vector<Backend::Result> disk_results;
       cache.directory = cleanup.path / (use_spec ? "spec" : "ar");
       auto first = load(use_spec, cache);
       const auto red = first->chat(requests[0], 16, greedy);
@@ -618,6 +807,7 @@ int main(int argc, char** argv) {
                       result.tokens ==
                           (i == 0 ? sampled_red.tokens : sampled_blue.tokens),
                   "disk-restored sampled image replay differs");
+          disk_results.push_back(result);
         }
       }
       auto restored = load(use_spec, cache);
@@ -631,7 +821,10 @@ int main(int argc, char** argv) {
         Require(restored_prompt(result, i) &&
                     result.tokens == (i == 0 ? red.tokens : blue.tokens),
                 "disk-restored image state or identity differs");
+        disk_results.push_back(result);
       }
+      if (use_spec)
+        RequireAcceptedDrafts(disk_results, "speculative disk restore");
       const auto result = restored->chat(continuation, 16, greedy);
       Require(result.cached_prompt_tokens > red.prompt_tokens,
               "continued image check must reuse generated history");

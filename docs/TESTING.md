@@ -69,8 +69,12 @@ are release/quality qualification, not routine PR work. `nix flake check` runs
 all declared checks and is deliberately not the hosted CI command.
 
 For Qwen image-prefix changes, build `qwen_vision_serving_test` with `gpu-test`
-and run it with `MODEL DRAFT_OR_DASH IMAGE_DIRECTORY --append-only`.
-The directory needs `red.png` and `blue.png`. This compares complete target
+and run it with `MODEL SPECULATION IMAGE_DIRECTORY --append-only`.
+`SPECULATION` names the speculative backend explicitly: `-`, `mtp-embedded`,
+`mtp=PATH` or `dflash=PATH`; without `--append-only` the run fails unless that
+backend loads and has proposals accepted. `--mmproj PATH` names the vision
+sidecar. The directory needs `red.png`, `blue.png` and `blue-wide.png`;
+`synthetic` generates them. This compares complete target
 logits when images are attached early or after a cached prefix, including
 snapshot restoration and sampled Flash-Next MTP replay.
 Qwen27B also checks exact restoration after cancellation between layers.
