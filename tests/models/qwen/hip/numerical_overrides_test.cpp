@@ -45,7 +45,8 @@ int main() {
   const QwenNumericalOverrides defaults;
   Expect(Resolve({}) == defaults &&
              defaults.CacheIdentity() ==
-                 "attention=dense-v1\nmoe_prefill=grouped-v1\n",
+                 "attention=dense-v1\nmoe_prefill=grouped-v1\n"
+                 "prefill_ffn=gpu-v1\nhipblaslt_plans=default\n",
          "an empty environment is the default policy, named explicitly so a "
          "state stored without these lines is not taken for it");
   // The tag of the arithmetic before verification rows equalled decoding.
@@ -78,6 +79,12 @@ int main() {
     Expect(identities.insert(overrides.CacheIdentity()).second, message);
   };
   distinct(sparse_defaults, "sparse attention changes the identity");
+  distinct(Resolve({{"GUFO_NPU_DIR", "/npu"}}),
+           "NPU prompt layers change the identity");
+  distinct(Resolve({{"GUFO_HIPBLASLT_PLAN_CACHE", "/plans-a"}}),
+           "a hipBLASLt plan file changes the identity");
+  distinct(Resolve({{"GUFO_HIPBLASLT_PLAN_CACHE", "/plans-b"}}),
+           "another hipBLASLt plan file changes the identity");
   struct Parameter {
     const char* name;
     std::uint32_t QwenNumericalOverrides::* field;

@@ -21,15 +21,18 @@ namespace gufo::hip {
 ///   v1: speculative verification and batched decoding computed the
 ///       recurrent step controls with a different sum tree than single-token
 ///       decoding.
-///   v2: every row operation equals single-token decoding bit for bit.
+///   v2: every row operation equals single-token decoding bit for bit
+///       (verified on real weights for the pinned Qwen3.6-35B-A3B GGUF).
 inline constexpr std::string_view kQwenNumericsIdentity =
     "qwen-bf16-fp32-prefill-v2";
 
 /// Opt-in environment overrides that change the arithmetic of a Qwen session:
-/// block-sparse attention (GUFO_QWEN_SPARSE_ATTN and its parameters) and the
-/// grouped-expert prefill switch (GUFO_QWEN_MOE_PREFILL). The arena resolves
-/// them once and every consumer reads the arena's copy, so the state a session
-/// computes and the identity it is stored under cannot disagree.
+/// block-sparse attention (GUFO_QWEN_SPARSE_ATTN and its parameters), the
+/// grouped-expert prefill switch (GUFO_QWEN_MOE_PREFILL), NPU prompt layers
+/// (GUFO_NPU_DIR) and a hipBLASLt plan file (GUFO_HIPBLASLT_PLAN_CACHE). The
+/// arena resolves them once and every consumer reads the arena's copy, so the
+/// state a session computes and the identity it is stored under cannot
+/// disagree.
 struct QwenNumericalOverrides {
   bool sparse_attention{false};
   std::uint32_t sparse_sink_blocks{2};
@@ -37,6 +40,12 @@ struct QwenNumericalOverrides {
   std::uint32_t sparse_top_blocks{256};
   std::uint32_t sparse_min_context{8192};
   bool grouped_moe_prefill{true};
+  /// GUFO_NPU_DIR: prompt feed-forward layers may run on the NPU, which also
+  /// moves their projections to another activation format.
+  bool npu_prefill{false};
+  /// GUFO_HIPBLASLT_PLAN_CACHE: the file whose plans choose the hipBLASLt
+  /// algorithm, and with it the rounding of the BF16 products.
+  std::string hipblaslt_plan_cache;
 
   [[nodiscard]] bool operator==(const QwenNumericalOverrides&) const = default;
 
@@ -56,6 +65,12 @@ struct QwenNumericalOverrides {
     }
     identity += grouped_moe_prefill ? "moe_prefill=grouped-v1\n"
                                     : "moe_prefill=row-wise-v1\n";
+    identity += npu_prefill ? "prefill_ffn=npu-v1\n" : "prefill_ffn=gpu-v1\n";
+    identity +=
+        "hipblaslt_plans=" +
+        (hipblaslt_plan_cache.empty() ? std::string("default")
+                                      : "file:" + hipblaslt_plan_cache) +
+        '\n';
     return identity;
   }
 };
@@ -71,6 +86,11 @@ using QwenEnvironmentLookup = std::function<const char*(const char*)>;
   QwenNumericalOverrides overrides;
   const char* const grouped = lookup("GUFO_QWEN_MOE_PREFILL");
   overrides.grouped_moe_prefill = grouped == nullptr || grouped[0] != '0';
+  overrides.npu_prefill = lookup("GUFO_NPU_DIR") != nullptr;
+  if (const char* const plans = lookup("GUFO_HIPBLASLT_PLAN_CACHE");
+      plans != nullptr) {
+    overrides.hipblaslt_plan_cache = plans;
+  }
   const char* const sparse = lookup("GUFO_QWEN_SPARSE_ATTN");
   const bool supported_heads =
       (config.num_attention_heads == 24 && config.num_key_value_heads == 4) ||
