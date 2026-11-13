@@ -26,6 +26,7 @@
 #include <hipblas/hipblas.h>
 
 #include "src/core/hip/detail/hip_graph_decode_executor.hpp"
+#include "src/core/hip/device_allocator.hpp"
 #include "src/models/qwen/hip/detail/prefill_task.hpp"
 #include "src/models/qwen/hip/execution_policy.hpp"
 #include "src/models/qwen/hip/moe_prefill.hpp"
@@ -350,6 +351,9 @@ public:
   [[nodiscard]] std::uint64_t RecurrentIoIdentity() const noexcept;
   [[nodiscard]] bool BeginSsmReplayCapture();
   void DisableSsmReplayCapture();
+  /// Replaces the memory source of the replay log, which must not exist yet.
+  /// Allocation-failure tests use this; production keeps the default.
+  void SetSsmReplayAllocator(const DeviceAllocator& allocator);
   void MarkSsmReplayPosition(std::uint32_t position) noexcept;
   [[nodiscard]] bool CanReplaySsmPosition(
       std::uint32_t position) const noexcept;
@@ -458,6 +462,10 @@ private:
   void AllocateRecurrentSnapshot();
   void SyncLivePointers() noexcept;
   [[nodiscard]] bool AllocateSsmReplayLog();
+  [[nodiscard]] bool HasSsmReplayLog() const noexcept {
+    return d_ssm_replay_qkv_ != nullptr && d_ssm_replay_alpha_ != nullptr &&
+           d_ssm_replay_beta_ != nullptr && d_ssm_replay_enabled_ != nullptr;
+  }
 
   core::ModelConfig config_;
   std::uint32_t max_context_;
@@ -473,6 +481,8 @@ private:
   std::uint8_t live_recurrent_{0};
   std::uint8_t saved_recurrent_{0};
   std::uint8_t source_recurrent_{0};
+  // The four replay buffers are published together or not at all.
+  DeviceAllocator ssm_replay_allocator_;
   float* d_ssm_replay_qkv_{nullptr};
   float* d_ssm_replay_alpha_{nullptr};
   float* d_ssm_replay_beta_{nullptr};

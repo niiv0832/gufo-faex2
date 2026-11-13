@@ -99,22 +99,35 @@ std::uint64_t QwenGpuArena::RecurrentIoIdentity() const noexcept {
 }
 
 bool QwenGpuArena::AllocateSsmReplayLog() {
-  if (d_ssm_replay_qkv_ != nullptr) {
+  if (HasSsmReplayLog()) {
     return false;
   }
 
   const std::size_t layer_slots =
       static_cast<std::size_t>(config_.SsmLayerCount()) * kSsmReplayCapacity;
-  HIP_CHECK(hipMalloc(&d_ssm_replay_qkv_,
-                      layer_slots * config_.SsmQkvSize() * sizeof(float)));
-  HIP_CHECK(
-      hipMalloc(&d_ssm_replay_alpha_,
-                layer_slots * config_.ssm_time_step_rank * sizeof(float)));
-  HIP_CHECK(
-      hipMalloc(&d_ssm_replay_beta_,
-                layer_slots * config_.ssm_time_step_rank * sizeof(float)));
-  HIP_CHECK(hipMalloc(&d_ssm_replay_enabled_, sizeof(std::uint32_t)));
+  const std::size_t gate_bytes =
+      layer_slots * config_.ssm_time_step_rank * sizeof(float);
+  // Publish the log only once all four allocations exist: capture and replay
+  // index every buffer, and a retry must not mistake a partial set for a
+  // complete one. A failed allocation releases the ones before it.
+  DeviceAllocation qkv(ssm_replay_allocator_,
+                       layer_slots * config_.SsmQkvSize() * sizeof(float));
+  DeviceAllocation alpha(ssm_replay_allocator_, gate_bytes);
+  DeviceAllocation beta(ssm_replay_allocator_, gate_bytes);
+  DeviceAllocation enabled(ssm_replay_allocator_, sizeof(std::uint32_t));
+  d_ssm_replay_qkv_ = qkv.Release<float>();
+  d_ssm_replay_alpha_ = alpha.Release<float>();
+  d_ssm_replay_beta_ = beta.Release<float>();
+  d_ssm_replay_enabled_ = enabled.Release<std::uint32_t>();
   return true;
+}
+
+void QwenGpuArena::SetSsmReplayAllocator(const DeviceAllocator& allocator) {
+  if (d_ssm_replay_qkv_ != nullptr || d_ssm_replay_alpha_ != nullptr ||
+      d_ssm_replay_beta_ != nullptr || d_ssm_replay_enabled_ != nullptr) {
+    throw std::logic_error("SSM replay log is already allocated");
+  }
+  ssm_replay_allocator_ = allocator;
 }
 
 bool QwenGpuArena::BeginSsmReplayCapture() {
@@ -145,7 +158,7 @@ void QwenGpuArena::MarkSsmReplayPosition(std::uint32_t position) noexcept {
 }
 
 bool QwenGpuArena::CanReplaySsmPosition(std::uint32_t position) const noexcept {
-  if (!has_saved_state_ || d_ssm_replay_qkv_ == nullptr ||
+  if (!has_saved_state_ || !HasSsmReplayLog() ||
       replay_captured_positions_ == 0) {
     return false;
   }

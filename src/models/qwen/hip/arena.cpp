@@ -1176,6 +1176,7 @@ QwenGpuArena::QwenGpuArena(QwenGpuArena&& other) noexcept
   live_recurrent_ = other.live_recurrent_;
   saved_recurrent_ = other.saved_recurrent_;
   source_recurrent_ = other.source_recurrent_;
+  ssm_replay_allocator_ = other.ssm_replay_allocator_;
   d_ssm_replay_qkv_ = other.d_ssm_replay_qkv_;
   d_ssm_replay_alpha_ = other.d_ssm_replay_alpha_;
   d_ssm_replay_beta_ = other.d_ssm_replay_beta_;
@@ -1293,6 +1294,7 @@ QwenGpuArena& QwenGpuArena::operator=(QwenGpuArena&& other) noexcept {
     live_recurrent_ = other.live_recurrent_;
     saved_recurrent_ = other.saved_recurrent_;
     source_recurrent_ = other.source_recurrent_;
+    ssm_replay_allocator_ = other.ssm_replay_allocator_;
     d_ssm_replay_qkv_ = other.d_ssm_replay_qkv_;
     d_ssm_replay_alpha_ = other.d_ssm_replay_alpha_;
     d_ssm_replay_beta_ = other.d_ssm_replay_beta_;
@@ -1503,13 +1505,13 @@ void QwenGpuArena::FreeAll() noexcept {
   if (d_weights_bf16 != nullptr)
     LogCleanupError(hipFree(d_weights_bf16));
   if (d_ssm_replay_qkv_ != nullptr)
-    LogCleanupError(hipFree(d_ssm_replay_qkv_));
+    LogCleanupError(ssm_replay_allocator_.release(d_ssm_replay_qkv_));
   if (d_ssm_replay_alpha_ != nullptr)
-    LogCleanupError(hipFree(d_ssm_replay_alpha_));
+    LogCleanupError(ssm_replay_allocator_.release(d_ssm_replay_alpha_));
   if (d_ssm_replay_beta_ != nullptr)
-    LogCleanupError(hipFree(d_ssm_replay_beta_));
+    LogCleanupError(ssm_replay_allocator_.release(d_ssm_replay_beta_));
   if (d_ssm_replay_enabled_ != nullptr)
-    LogCleanupError(hipFree(d_ssm_replay_enabled_));
+    LogCleanupError(ssm_replay_allocator_.release(d_ssm_replay_enabled_));
   if (hipblas_handle != nullptr)
     LogCleanupError(hipblasDestroy(hipblas_handle));
   hipblaslt_gemm.reset();
