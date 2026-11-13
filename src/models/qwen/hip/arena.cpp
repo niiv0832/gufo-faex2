@@ -847,23 +847,13 @@ QwenGpuArena::QwenGpuArena(const core::ModelConfig& config,
     } else {
       HIP_CHECK(hipMalloc(&d_kv_cache, total_kv * sizeof(float) * 2));
     }
-    if (const char* sparse = std::getenv("GUFO_QWEN_SPARSE_ATTN");
-        sparse != nullptr && sparse[0] != '0' &&
-        ((config_.num_attention_heads == 24 &&
-          config_.num_key_value_heads == 4) ||
-         (config_.num_attention_heads == 16 &&
-          config_.num_key_value_heads == 2)) &&
-        policy_.UsesFp16AttentionKv() && max_context_ <= 262144) {
-      const auto read = [](const char* name, std::uint32_t fallback) {
-        const char* value = std::getenv(name);
-        return value != nullptr
-                   ? static_cast<std::uint32_t>(std::max(0, std::atoi(value)))
-                   : fallback;
-      };
-      sparse_config.sink_blocks = read("GUFO_QWEN_SPARSE_SINK", 2);
-      sparse_config.local_blocks = read("GUFO_QWEN_SPARSE_LOCAL", 32);
-      sparse_config.top_blocks = read("GUFO_QWEN_SPARSE_TOPK", 256);
-      sparse_config.min_context = read("GUFO_QWEN_SPARSE_MIN_CONTEXT", 8192);
+    numerical_overrides =
+        ResolveQwenNumericalOverrides(config_, policy_, max_context_);
+    if (numerical_overrides.sparse_attention) {
+      sparse_config.sink_blocks = numerical_overrides.sparse_sink_blocks;
+      sparse_config.local_blocks = numerical_overrides.sparse_local_blocks;
+      sparse_config.top_blocks = numerical_overrides.sparse_top_blocks;
+      sparse_config.min_context = numerical_overrides.sparse_min_context;
       HIP_CHECK(hipMalloc(&d_sparse_pooled,
                           SparseAttentionPooledBytes(
                               config_.FullAttentionLayerCount(),
@@ -1155,6 +1145,7 @@ QwenGpuArena::QwenGpuArena(QwenGpuArena&& other) noexcept
   sparse_pooled_end = std::move(other.sparse_pooled_end);
   sparse_config = other.sparse_config;
   sparse_enabled = other.sparse_enabled;
+  numerical_overrides = other.numerical_overrides;
   d_kv_cache = other.d_kv_cache;
   d_ssm_conv_state = other.d_ssm_conv_state;
   d_ssm_deltanet_state = other.d_ssm_deltanet_state;
@@ -1275,6 +1266,7 @@ QwenGpuArena& QwenGpuArena::operator=(QwenGpuArena&& other) noexcept {
     sparse_pooled_end = std::move(other.sparse_pooled_end);
     sparse_config = other.sparse_config;
     sparse_enabled = other.sparse_enabled;
+    numerical_overrides = other.numerical_overrides;
     d_kv_cache = other.d_kv_cache;
     d_ssm_conv_state = other.d_ssm_conv_state;
     d_ssm_deltanet_state = other.d_ssm_deltanet_state;

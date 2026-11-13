@@ -317,7 +317,8 @@ std::vector<std::uint8_t> QwenFlashNextCompatibilityIdentity(
 std::vector<std::uint8_t> QwenCompatibilityIdentity(
     std::string_view artifact_fingerprint,
     std::string_view draft_artifact_fingerprint, std::uint32_t max_context,
-    const hip::QwenExecutionPolicy& execution_policy, bool speculative,
+    const hip::QwenExecutionPolicy& execution_policy,
+    const hip::QwenNumericalOverrides& numerical_overrides, bool speculative,
     const speculative::SpeculativeOptions& speculative_options,
     std::string_view draft_kind = "dflash2") {
   if (!IsSha256Hex(artifact_fingerprint)) {
@@ -346,6 +347,8 @@ std::vector<std::uint8_t> QwenCompatibilityIdentity(
            // prefix. Their payload has no readiness tag to distinguish them.
            << "checkpoint_frontier=complete-prefix-v1\n"
            << "numerics=qwen-bf16-fp32-prefill-v1\n"
+           // Opt-in arithmetic overrides; nothing for the default policy.
+           << numerical_overrides.CacheIdentity()
            << "rmsnorm=fused-square-sum-v1\n"
            << "prefill_attention=visible-causal-tail-v1\n"
            << "attention_split_min_context="
@@ -1041,14 +1044,16 @@ public:
         drafts_(std::move(drafts)),
         max_context_(max_context),
         speculative_options_(speculative_options),
-        execution_policy_(hip::QwenExecutionPolicy::Production()) {
+        execution_policy_(hip::QwenExecutionPolicy::Production()),
+        numerical_overrides_(hip::ResolveQwenNumericalOverrides(
+            model_->GetConfig(), execution_policy_, max_context_)) {
     if (!artifact_fingerprint.empty()) {
       const bool speculative = drafts_.Enabled();
       persistence_ = TextRunnerPersistenceDescriptor{
           .compatibility_identity = QwenCompatibilityIdentity(
               artifact_fingerprint, draft_artifact_fingerprint, max_context_,
-              execution_policy_, speculative, speculative_options_,
-              drafts_.Kind()),
+              execution_policy_, numerical_overrides_, speculative,
+              speculative_options_, drafts_.Kind()),
           .payload_version = kQwenPersistentPayloadVersion,
       };
     }
@@ -1214,8 +1219,15 @@ public:
   }
 
   [[nodiscard]] std::unique_ptr<TextRunnerState> CreateState() const override {
-    return std::make_unique<QwenTextRunnerState>(
+    auto state = std::make_unique<QwenTextRunnerState>(
         model_, max_context_, drafts_, speculative_options_, execution_policy_);
+    // The persistence identity names the arithmetic of every stored state.
+    if (state->executor().GetNumericalOverrides() != numerical_overrides_) {
+      throw std::runtime_error(
+          "Qwen session arithmetic overrides differ from the runner's cache "
+          "identity");
+    }
+    return state;
   }
 
   void PreparePrefixReuse(
@@ -1683,6 +1695,8 @@ private:
   std::uint32_t max_context_;
   speculative::SpeculativeOptions speculative_options_;
   hip::QwenExecutionPolicy execution_policy_;
+  /// What the sessions' arenas resolve; part of the persistence identity.
+  hip::QwenNumericalOverrides numerical_overrides_;
   std::optional<TextRunnerPersistenceDescriptor> persistence_;
 };
 

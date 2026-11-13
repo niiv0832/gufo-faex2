@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "src/core/crypto/sha256.hpp"
+#include "src/models/qwen/hip/numerical_overrides.hpp"
 
 namespace {
 
@@ -409,6 +410,66 @@ void TestRestartRestoreAndCompatibilityIdentity() {
                         {1, 2, 3, 4})
               .restored,
          "different compatibility identity is a deterministic cache miss");
+}
+
+// One directory shared by Qwen sessions of different arithmetic overrides:
+// each policy restores only the state it stored, and a state of another
+// policy is a miss that leaves the stored files intact.
+void TestNumericalOverridesIsolateSnapshots() {
+  using gufo::hip::QwenNumericalOverrides;
+  const auto runner = [](const QwenNumericalOverrides& overrides) {
+    return FakeRunner("artifact-A\n" + overrides.CacheIdentity());
+  };
+  QwenNumericalOverrides sparse;
+  sparse.sparse_attention = true;
+  auto sparse_top = sparse;
+  sparse_top.sparse_top_blocks = 64;
+  auto sparse_local = sparse;
+  sparse_local.sparse_local_blocks = 8;
+  auto sparse_sink = sparse;
+  sparse_sink.sparse_sink_blocks = 1;
+  auto sparse_min_context = sparse;
+  sparse_min_context.sparse_min_context = 4096;
+  QwenNumericalOverrides rowwise;
+  rowwise.grouped_moe_prefill = false;
+  const std::array policies = {
+      QwenNumericalOverrides{}, sparse, sparse_top, sparse_local, sparse_sink,
+      sparse_min_context,       rowwise};
+
+  TemporaryDirectory directory;
+  {
+    ContinuationDiskStore store(StoreOptions(directory.path()));
+    const auto writer = runner(policies[0]);
+    const auto snapshot = MakeSnapshot(writer, 1000, 3);
+    Expect(SaveTokens(store, writer, {1, 2, 3}, *snapshot).stored,
+           "the default policy stores its snapshot");
+  }
+  {
+    ContinuationDiskStore store(StoreOptions(directory.path()));
+    for (std::size_t i = 1; i < policies.size(); ++i) {
+      const auto reader = runner(policies[i]);
+      auto state = reader.CreateState();
+      Expect(!RestoreTokens(store, reader, *state, {1, 2, 3, 4}).restored &&
+                 RequireFakeState(*state).position == 0,
+             "a snapshot of the default arithmetic is a miss under an "
+             "override and leaves the session untouched");
+      const auto snapshot = MakeSnapshot(reader, 1000 + i, 3);
+      Expect(SaveTokens(store, reader, {1, 2, 3}, *snapshot).stored,
+             "an override stores its own snapshot of the same tokens");
+    }
+    Expect(store.entry_count() == policies.size(),
+           "every policy keeps a separate entry for the same tokens");
+  }
+  ContinuationDiskStore restarted(StoreOptions(directory.path()));
+  for (std::size_t i = 0; i < policies.size(); ++i) {
+    const auto reader = runner(policies[i]);
+    auto state = reader.CreateState();
+    const auto restored =
+        RestoreTokens(restarted, reader, *state, {1, 2, 3, 4});
+    Expect(restored.restored && restored.token_count == 3 &&
+               RequireFakeState(*state).value == 1000 + i,
+           "each policy restores exactly the state stored under it");
+  }
 }
 
 void TestLongestPrefixAndForcedHashCollision() {
@@ -1222,6 +1283,7 @@ int main() {
   TestSharedPrefixBoundariesAndExactDedup();
   TestSha256KnownVector();
   TestRestartRestoreAndCompatibilityIdentity();
+  TestNumericalOverridesIsolateSnapshots();
   TestLongestPrefixAndForcedHashCollision();
   TestCorruptionBecomesDeterministicMissAndRemoval();
   TestByteAndStagingLimits();

@@ -52,6 +52,9 @@ add_qwen_cpu_test(qwen_l1_ssm_module_test
 add_qwen_cpu_test(qwen_fusion_route_test
   tests/models/qwen/hip/execution_policy_test.cpp
   "cpu;models;qwen;hip;policy;fusion")
+add_qwen_cpu_test(qwen_numerical_overrides_test
+  tests/models/qwen/hip/numerical_overrides_test.cpp
+  "cpu;models;qwen;hip;policy;cache")
 add_qwen_cpu_test(qwen_attention_policy_test
   tests/models/qwen/hip/attention_policy_test.cpp
   "cpu;models;qwen;hip;attention;dispatch")

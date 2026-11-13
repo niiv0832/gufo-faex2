@@ -43,7 +43,7 @@ if (ENGINE_ENABLE_HIP)
     ${PROJECT_SOURCE_DIR}/src/cli/serve/inference_backend.cpp)
   target_link_libraries(qwen_serving_test_support PUBLIC gufo_logging
     gufo_core gufo_deepseek_v4_flash gufo_qwen38_flash_next gufo_flint
-    gufo_glm53_flash_engine hip::host)
+    gufo_laguna gufo_glm53_flash_engine hip::host)
   add_executable(inference_backend_gpu_test serving_test.cpp)
   target_link_libraries(inference_backend_gpu_test PRIVATE qwen_serving_test_support)
   add_executable(qwen_vision_serving_test ../qwen/vision_serving_test.cpp)
@@ -52,6 +52,17 @@ if (ENGINE_ENABLE_HIP)
   set_tests_properties(qwen_vision_serving_test PROPERTIES
     LABELS "qwen27b;qwen38-flash-next;hip;gpu;vision;external-model"
     SKIP_RETURN_CODE 77)
+  # A disk snapshot written under another arithmetic override is a miss; each
+  # policy restores its own. Skipped without the model.
+  add_executable(qwen_cache_policy_serving_test
+    ../qwen/cache_policy_serving_test.cpp)
+  target_link_libraries(qwen_cache_policy_serving_test
+    PRIVATE qwen_serving_test_support)
+  add_test(NAME qwen_cache_policy_serving_test
+    COMMAND qwen_cache_policy_serving_test)
+  set_tests_properties(qwen_cache_policy_serving_test PROPERTIES
+    LABELS "qwen27b;hip;gpu;server;cache;external-model"
+    SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
   add_qwen27b_test(qwen_vision_prepare_test ../qwen/vision_prepare_test.cpp
     "qwen38-flash-next;gpu;hip;vision;external-model")
   target_link_libraries(qwen_vision_prepare_test PRIVATE hip::host)

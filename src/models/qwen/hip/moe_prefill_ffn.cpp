@@ -1,6 +1,5 @@
 #if defined(ENGINE_ENABLE_HIP)
 #include <cstddef>
-#include <cstdlib>
 #include <stdexcept>
 #include <string>
 
@@ -56,11 +55,7 @@ void MoePrefillRouterLogitsFallback(hipblasHandle_t handle,
 bool QwenGpuExecutor::MoePrefillFfn(const models::QwenLayerWeights& layer,
                                     std::uint32_t layer_index,
                                     std::size_t batch_size) {
-  static const bool disabled = [] {
-    const char* v = std::getenv("GUFO_QWEN_MOE_PREFILL");
-    return v != nullptr && v[0] == '0';
-  }();
-  if (disabled) {
+  if (!arena_.numerical_overrides.grouped_moe_prefill) {
     return false;
   }
   const auto& config = weights_.config;

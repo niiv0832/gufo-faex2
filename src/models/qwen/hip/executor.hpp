@@ -31,6 +31,7 @@
 #include "src/models/qwen/hip/execution_policy.hpp"
 #include "src/models/qwen/hip/moe_prefill.hpp"
 #include "src/models/qwen/hip/npu_ffn.hpp"
+#include "src/models/qwen/hip/numerical_overrides.hpp"
 #include "src/models/qwen/hip/ops/attention.hpp"
 #include "src/models/qwen/hip/ops/gemm.hpp"
 #include "src/models/qwen/hip/ops/ssm.hpp"
@@ -399,6 +400,9 @@ public:
   std::vector<std::uint32_t> sparse_pooled_end;
   SparseAttentionConfig sparse_config{};
   bool sparse_enabled{false};
+  /// The arithmetic overrides this arena applies; `sparse_config` and
+  /// `sparse_enabled` mirror them.
+  QwenNumericalOverrides numerical_overrides{};
   void InvalidateSparseAttention() noexcept {
     std::fill(sparse_pooled_end.begin(), sparse_pooled_end.end(), 0u);
   }
@@ -554,6 +558,12 @@ public:
 
   [[nodiscard]] const QwenExecutionPolicy& GetExecutionPolicy() const noexcept {
     return policy_;
+  }
+
+  /// The arithmetic overrides this executor's arena applies.
+  [[nodiscard]] const QwenNumericalOverrides& GetNumericalOverrides()
+      const noexcept {
+    return arena_.numerical_overrides;
   }
 
   /// Runs one single token forward step on GPU, returning next token ID.
