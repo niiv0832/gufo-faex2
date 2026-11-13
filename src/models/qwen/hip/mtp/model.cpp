@@ -140,9 +140,7 @@ models::QwenTensorRef PackMatrixBf16(const models::QwenTensorRef& source,
 
 void ReleaseAllocations(std::vector<void*>& allocations) noexcept {
   for (void* allocation : allocations) {
-    if (allocation != nullptr) {
-      (void)hipFree(allocation);
-    }
+    detail::FreeDevice(allocation);
   }
   allocations.clear();
 }

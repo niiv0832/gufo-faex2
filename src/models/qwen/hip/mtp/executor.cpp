@@ -11,6 +11,7 @@
 
 #include "src/core/hip/hip_utils.hpp"
 #include "src/models/qwen/hip/detail/attention_policy.hpp"
+#include "src/models/qwen/hip/detail/memory_layout.hpp"
 #include "src/models/qwen/hip/moe_ffn.hpp"
 #include "src/models/qwen/hip/mtp.hpp"
 #include "src/models/qwen/hip/mtp/detail/allocation.hpp"
@@ -140,10 +141,8 @@ void QwenMtpGpuExecutor::Allocate() {
 
 void QwenMtpGpuExecutor::Free() noexcept {
   const auto free_buffer = [](auto*& pointer) {
-    if (pointer != nullptr) {
-      (void)hipFree(pointer);
-      pointer = nullptr;
-    }
+    detail::FreeDevice(pointer);
+    pointer = nullptr;
   };
   free_buffer(d_target_hidden_);
   free_buffer(d_embedding_);
@@ -377,12 +376,7 @@ std::vector<tokenization::TokenId> QwenMtpGpuExecutor::ScoreTogether(
       throw std::invalid_argument("MTP shared score mixes head configurations");
     }
   }
-  if (lead.d_shared_hidden_ == nullptr) {
-    AllocateBuffer(lead.d_shared_hidden_, kMaxSharedScoreRows * hidden);
-    AllocateBuffer(lead.d_shared_logits_,
-                   kMaxSharedScoreRows * config.vocab_size);
-    AllocateBuffer(lead.d_shared_tokens_, kMaxSharedScoreRows);
-  }
+  lead.EnsureSharedScoreWorkspace();
   // Each head finished its layer on its own stream; the rows meet on the
   // leading head's.
   for (std::size_t row = 0; row < heads.size(); ++row) {
@@ -420,8 +414,38 @@ std::vector<tokenization::TokenId> QwenMtpGpuExecutor::ScoreTogether(
   return tokens;
 }
 
+bool QwenMtpGpuExecutor::HoldsSharedScoreWorkspace() const noexcept {
+  return d_shared_hidden_ != nullptr && d_shared_logits_ != nullptr &&
+         d_shared_tokens_ != nullptr;
+}
+
+void QwenMtpGpuExecutor::EnsureSharedScoreWorkspace() {
+  if (HoldsSharedScoreWorkspace()) {
+    return;
+  }
+  const auto& config = model_->GetConfig();
+  // The members change only once every buffer exists: a refused allocation
+  // must not leave rows without their logits for the next pass to find.
+  detail::PendingDeviceBuffers pending;
+  auto* const hidden = pending.Allocate<float>(
+      kMaxSharedScoreRows * config.hidden_size * sizeof(float));
+  auto* const logits = pending.Allocate<float>(
+      kMaxSharedScoreRows * config.vocab_size * sizeof(float));
+  auto* const tokens = pending.Allocate<std::uint32_t>(kMaxSharedScoreRows *
+                                                       sizeof(std::uint32_t));
+  pending.Publish();
+  d_shared_hidden_ = hidden;
+  d_shared_logits_ = logits;
+  d_shared_tokens_ = tokens;
+}
+
+bool QwenMtpGpuExecutor::HoldsPrimeScratch() const noexcept {
+  return d_prime_buffer_ != nullptr && d_prime_tokens_ != nullptr &&
+         d_prime_bf16_ != nullptr;
+}
+
 void QwenMtpGpuExecutor::EnsurePrimeScratch() {
-  if (d_prime_buffer_ != nullptr) {
+  if (HoldsPrimeScratch()) {
     return;
   }
   const auto& config = model_->GetConfig();
@@ -429,14 +453,21 @@ void QwenMtpGpuExecutor::EnsurePrimeScratch() {
   const std::size_t attention = config.AttentionSize();
   const std::size_t kv =
       static_cast<std::size_t>(config.num_key_value_heads) * config.head_dim;
-  prime_buffer_elements_ =
+  const std::size_t elements =
       kPrimeChunk * ((8 * hidden) + (3 * kv) + (2 * attention));
-  AllocateBuffer(d_prime_buffer_, prime_buffer_elements_);
-  AllocateBuffer(d_prime_tokens_, kPrimeChunk);
-  d_prime_bf16_ =
-      detail::AllocateDevice(kPrimeChunk * 2 * hidden * sizeof(std::uint16_t));
-  HIP_CHECK(
-      hipMemset(d_prime_buffer_, 0, prime_buffer_elements_ * sizeof(float)));
+  // Published as one set, like the shared-score rows.
+  detail::PendingDeviceBuffers pending;
+  auto* const buffer = pending.Allocate<float>(elements * sizeof(float));
+  auto* const tokens =
+      pending.Allocate<std::uint32_t>(kPrimeChunk * sizeof(std::uint32_t));
+  void* const bf16 =
+      pending.Allocate(kPrimeChunk * 2 * hidden * sizeof(std::uint16_t));
+  HIP_CHECK(hipMemset(buffer, 0, elements * sizeof(float)));
+  pending.Publish();
+  prime_buffer_elements_ = elements;
+  d_prime_buffer_ = buffer;
+  d_prime_tokens_ = tokens;
+  d_prime_bf16_ = bf16;
 }
 
 void QwenMtpGpuExecutor::PrimeBatch(
@@ -621,26 +652,24 @@ void QwenMtpGpuExecutor::LoadState(std::span<const std::uint8_t> source) {
 QwenGpuMemoryUsage QwenMtpGpuExecutor::EstimateMemoryUsage(
     const QwenMtpGpuModel& model, std::uint32_t max_context) {
   const auto& config = model.GetConfig();
-  const std::size_t kv_values = 2 * static_cast<std::size_t>(max_context) *
-                                config.num_key_value_heads * config.head_dim;
-  const std::size_t hidden = config.hidden_size;
-  const std::size_t attention = config.AttentionSize();
-  const std::size_t scratch_floats =
-      kPrimeChunk *
-          ((8 * hidden) + (2 * config.num_key_value_heads * config.head_dim) +
-           (2 * attention)) +
-      config.vocab_size + (32 * hidden);
-  return {.request_state_bytes =
-              kv_values * (KeepsHalfKvOnly(config)
-                               ? sizeof(std::uint16_t)
-                               : sizeof(float) + sizeof(std::uint16_t)),
-          .temporary_scratch_bytes =
-              (scratch_floats * sizeof(float)) +
-              (kPrimeChunk * 2 * hidden * sizeof(std::uint16_t))};
+  const auto layout = detail::ComputeQwenMtpHeadMemoryLayout(
+      config, max_context, KeepsHalfKvOnly(config));
+  // The reserved maximum. Any head of a pool can lead a shared score and
+  // then keeps its rows, so each one reserves them.
+  return {.request_state_bytes = layout.kv_bytes,
+          .temporary_scratch_bytes = layout.ReservedScratchBytes()};
 }
 
 QwenGpuMemoryUsage QwenMtpGpuExecutor::GetMemoryUsage() const noexcept {
-  return EstimateMemoryUsage(*model_, max_context_);
+  const auto& config = model_->GetConfig();
+  const auto layout = detail::ComputeQwenMtpHeadMemoryLayout(
+      config, max_context_, KeepsHalfKvOnly(config));
+  // What is allocated now: the lazily built workspaces count once they exist.
+  return {.request_state_bytes = layout.kv_bytes,
+          .temporary_scratch_bytes =
+              layout.fixed_scratch_bytes +
+              (HoldsPrimeScratch() ? layout.prime_scratch_bytes : 0) +
+              (HoldsSharedScoreWorkspace() ? layout.shared_score_bytes : 0)};
 }
 
 std::span<const float> QwenMtpGpuExecutor::CopyLastHidden() {

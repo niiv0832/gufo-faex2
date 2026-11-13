@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "src/core/speculative/draft_backend.hpp"
+#include "src/models/qwen/hip/detail/memory_layout.hpp"
 #include "src/models/qwen/hip/executor.hpp"
 #include "src/models/qwen/mtp_reference.hpp"
 #include "src/models/qwen/tokenizer.hpp"
@@ -123,7 +124,11 @@ public:
       const core::ModelConfig& config, std::uint32_t position) noexcept;
   void SaveState(std::span<std::uint8_t> destination) const;
   void LoadState(std::span<const std::uint8_t> source);
+  /// Device memory this head holds now: its cache, its fixed scratch and
+  /// the priming and shared-score workspaces once they exist.
   [[nodiscard]] QwenGpuMemoryUsage GetMemoryUsage() const noexcept;
+  /// The most one head can hold, every lazily built workspace included;
+  /// GetMemoryUsage() never exceeds it.
   [[nodiscard]] static QwenGpuMemoryUsage EstimateMemoryUsage(
       const QwenMtpGpuModel& model, std::uint32_t max_context);
 
@@ -159,7 +164,8 @@ public:
   /// head pass a step with logits ends with.
   [[nodiscard]] tokenization::TokenId ScoreLast();
   /// Most heads one shared pass scores.
-  static constexpr std::size_t kMaxSharedScoreRows = 8;
+  static constexpr std::size_t kMaxSharedScoreRows =
+      detail::kMtpMaxSharedScoreRows;
   /// Whether ScoreTogether can serve these heads' LM head.
   [[nodiscard]] bool SupportsSharedScore() const noexcept;
   /// The draft tokens of two or more heads of one model that each finished a
@@ -170,6 +176,9 @@ public:
   /// `keep_logits`, CopyLastLogits() of every head returns its row.
   [[nodiscard]] static std::vector<tokenization::TokenId> ScoreTogether(
       std::span<QwenMtpGpuExecutor* const> heads, bool keep_logits);
+  /// Whether this head holds the rows of a shared score it led: every buffer
+  /// of the set, which stays allocated until the head is destroyed.
+  [[nodiscard]] bool HoldsSharedScoreWorkspace() const noexcept;
   /// Chooses the vocabulary of the following forward passes.
   void ScoreWholeVocabulary(bool whole) noexcept { whole_vocab_ = whole; }
 
@@ -234,14 +243,17 @@ private:
   void* d_kv_cache_f16_{nullptr};
   float* d_split_k_scratch_{nullptr};
   std::uint32_t* d_out_token_{nullptr};
-  // Rows of a shared score, owned by the head that leads it.
+  // Rows of a shared score, owned by the head that leads it: allocated as
+  // one set by EnsureSharedScoreWorkspace.
+  void EnsureSharedScoreWorkspace();
   float* d_shared_hidden_{nullptr};
   float* d_shared_logits_{nullptr};
   std::uint32_t* d_shared_tokens_{nullptr};
   // CopyLastLogits() already holds this head's row of a shared score.
   bool host_logits_ready_{false};
 
-  static constexpr std::size_t kPrimeChunk = 1024;
+  static constexpr std::size_t kPrimeChunk = detail::kMtpPrimeChunk;
+  [[nodiscard]] bool HoldsPrimeScratch() const noexcept;
   void EnsurePrimeScratch();
   std::uint32_t* d_prime_tokens_{nullptr};
   float* d_prime_buffer_{nullptr};
@@ -369,8 +381,9 @@ private:
   [[nodiscard]] speculative::DraftProposal SkipDraft(
       std::span<const tokenization::TokenId> prompt_tokens,
       std::uint32_t current_pos);
-  void CheckProposalFrontier(std::span<const tokenization::TokenId> prompt_tokens,
-                             std::uint32_t current_pos) const;
+  void CheckProposalFrontier(
+      std::span<const tokenization::TokenId> prompt_tokens,
+      std::uint32_t current_pos) const;
 
   std::unique_ptr<QwenMtpGpuExecutor> executor_;
   QwenMtpGpuDraftConfig config_;
