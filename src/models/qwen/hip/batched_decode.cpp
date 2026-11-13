@@ -200,19 +200,10 @@ void LaunchDecodeRowsSsmControls(const models::QwenTensorRef& alpha,
                                  float* beta_output, std::size_t rows,
                                  std::size_t time_step_rank,
                                  std::size_t hidden_size, hipStream_t stream) {
-  const auto shared = [](core::GgmlType type) {
-    return SupportsExactSharedProjection(type) || type == core::GgmlType::kBF16;
-  };
-  if (shared(alpha.type) && shared(beta.type)) {
-    LaunchProjection(alpha, input, alpha_output, rows, time_step_rank,
-                     hidden_size, stream);
-    LaunchProjection(beta, input, beta_output, rows, time_step_rank,
-                     hidden_size, stream);
-    return;
-  }
   // Single-token decode computes the controls in its fused input projection,
-  // whose sum tree differs from the plain GEMV. Run that kernel for the two
-  // control matrices alone, so each row keeps the bits it gets by itself.
+  // whose sum tree differs from the plain GEMV and from the shared row
+  // projections. Run that kernel for the two control matrices alone, for
+  // every weight type, so each row keeps the bits it gets by itself.
   for (std::size_t row = 0; row < rows; ++row) {
     LaunchFusedSSMInputProjections(
         nullptr, alpha.type, nullptr, alpha.type, alpha.data, alpha.type,

@@ -74,6 +74,7 @@ private:
 struct Checker {
   hipStream_t stream;
   bool passed = true;
+  std::size_t checks = 0;
 
   void Report(const std::string& label, const QwenTensorRef* weight,
               const DeviceBuffer& single, const DeviceBuffer& batched,
@@ -89,6 +90,7 @@ struct Checker {
       nonzero = nonzero || reference[index] != 0.0F;
     }
     const bool ok = nonzero && differing == 0;
+    ++checks;
     std::cout << label;
     if (weight != nullptr)
       std::cout << ",type=" << gufo::core::ToString(weight->type);
@@ -101,7 +103,7 @@ struct Checker {
   void Projection(const std::string& label, const QwenTensorRef& weight,
                   std::size_t outputs, std::size_t inputs, std::uint64_t seed) {
     if (weight.empty())
-      return;
+      throw std::runtime_error(label + ": the weight is missing");
     const DeviceBuffer x(kRows * inputs);
     const DeviceBuffer single(kRows * outputs);
     const DeviceBuffer batched(kRows * outputs);
@@ -288,6 +290,10 @@ int main(int argc, char** argv) {
     }
     check.Projection("output_head", weights.output, config.vocab_size, hidden,
                      0xA0761D6478BD642FULL);
+    // Both kinds of layer and the head were compared.
+    if (!seen_attention || !seen_recurrent || check.checks < 30)
+      throw std::runtime_error("too few operations were compared");
+    std::cout << "checks=" << check.checks << '\n';
     return check.passed ? 0 : 1;
   } catch (const std::exception& failure) {
     std::cerr << "qwen_decode_rows_ops_test: " << failure.what() << '\n';
