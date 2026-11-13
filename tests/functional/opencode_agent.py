@@ -373,6 +373,37 @@ def stop_process_group(proc):
     proc.wait(timeout=2)
 
 
+def probe_version(opencode, output, isolated, timeout=10):
+    """Collect provenance without exposing the isolated run to caller config."""
+    case = (output / "version").resolve()
+    case.mkdir()
+    save(case / "opencode.json", {"autoupdate": False})
+    env = case_environment(case, isolated)
+    result = {"version": "", "returncode": None}
+    proc = None
+    try:
+        with (case / "stdout.txt").open("w") as stdout, (case / "stderr.txt").open("w") as stderr:
+            proc = subprocess.Popen([opencode, "--version"], cwd=case, env=env,
+                                    stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr,
+                                    start_new_session=True)
+            try:
+                proc.wait(timeout=timeout)
+            finally:
+                stop_process_group(proc)
+    except Exception as exc:
+        result["error"] = repr(exc)
+    finally:
+        if proc is not None:
+            result["returncode"] = proc.returncode
+        stdout_path = case / "stdout.txt"
+        if stdout_path.exists():
+            result["version"] = stdout_path.read_text().strip()
+        save(output / "opencode-version.json", result)
+    if result.get("error") or result["returncode"] != 0 or not result["version"]:
+        raise RuntimeError(f"OpenCode version probe failed; see {output / 'opencode-version.json'}")
+    return result
+
+
 @contextmanager
 def private_opencode(opencode, case, cwd, env, deadline):
     """Own one V2 server and wait for its MCP catalog before the first prompt.
@@ -566,8 +597,7 @@ def main():
         parser.error("--isolated needs --output outside a git work tree: opencode would load "
                      "that repository's instructions and configuration")
     args.output.mkdir(parents=True, exist_ok=False)
-    version = subprocess.run([args.opencode, "--version"], capture_output=True, text=True)
-    save(args.output / "opencode-version.json", {"version": version.stdout.strip()})
+    probe_version(args.opencode, args.output, args.isolated, timeout=min(10, args.timeout))
     recorder = Recorder(args.base_url, args.output)
     import threading
     threading.Thread(target=recorder.serve_forever, daemon=True).start()

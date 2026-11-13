@@ -309,6 +309,78 @@ class OpenCodeResults(unittest.TestCase):
             self.assertTrue(opencode_agent.inside_git_tree(Path(directory) / "new" / "output"))
 
 
+class OpenCodeVersion(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        self.output = self.root / "results"
+        self.executable = self.root / "fake-opencode"
+
+    def executable_body(self, body):
+        self.executable.write_text(f"#!{sys.executable}\n" + body)
+        self.executable.chmod(0o755)
+
+    def run_main(self):
+        argv = ["opencode_agent.py", "--base-url", "http://127.0.0.1:1", "--model", "test",
+                "--opencode", str(self.executable), "--output", str(self.output),
+                "--isolated", "--passes", "0"]
+        with unittest.mock.patch.object(sys, "argv", argv):
+            return opencode_agent.main()
+
+    def test_main_probes_version_with_private_config_home_and_cwd(self):
+        (self.root / "canary").write_text("parent home must stay hidden")
+        (self.root / "opencode.json").write_text('{"plugin":["parent-canary"]}')
+        self.executable_body("""import json, os
+from pathlib import Path
+cwd = Path.cwd()
+assert cwd.name == 'version'
+assert Path(os.environ['HOME']) == cwd / 'home'
+assert not (Path(os.environ['HOME']) / 'canary').exists()
+assert os.environ['OPENCODE_CONFIG_PROJECT_DISABLE'] == '1'
+assert os.environ['OPENCODE_DISABLE_CLAUDE_CODE'] == '1'
+assert 'OPENAI_API_KEY' not in os.environ
+assert json.loads(Path(os.environ['OPENCODE_CONFIG']).read_text()) == {'autoupdate': False}
+assert all(Path(os.environ[name]).is_relative_to(cwd) for name in
+           ('XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_STATE_HOME', 'XDG_CACHE_HOME'))
+print('2.2.5')
+""")
+        with unittest.mock.patch.dict(os.environ, {"HOME": str(self.root), "OPENAI_API_KEY": "canary"}), \
+                unittest.mock.patch.object(opencode_agent, "Recorder") as recorder:
+            with self.assertRaises(SystemExit) as exited:
+                self.run_main()
+        self.assertEqual(exited.exception.code, 0)
+        metadata = json.loads((self.output / "opencode-version.json").read_text())
+        self.assertEqual(metadata["version"], "2.2.5")
+        self.assertEqual(metadata["returncode"], 0)
+        recorder.assert_called_once()
+
+    def test_main_rejects_empty_or_failed_version_before_starting_recorder(self):
+        for body, code in (("", 0), ("print('2.2.5')\nraise SystemExit(23)\n", 23)):
+            with self.subTest(code=code):
+                self.output = self.root / f"results-{code}"
+                self.executable_body(body)
+                with unittest.mock.patch.object(opencode_agent, "Recorder") as recorder:
+                    with self.assertRaisesRegex(RuntimeError, "version probe failed"):
+                        self.run_main()
+                    recorder.assert_not_called()
+                metadata = json.loads((self.output / "opencode-version.json").read_text())
+                self.assertEqual(metadata["returncode"], code)
+
+    def test_version_timeout_is_bounded_and_retains_failure_artifacts(self):
+        self.output.mkdir()
+        self.executable_body("import time\ntime.sleep(30)\n")
+        start = time.monotonic()
+        with self.assertRaisesRegex(RuntimeError, "version probe failed"):
+            opencode_agent.probe_version(str(self.executable), self.output, True, timeout=0.1)
+        self.assertLess(time.monotonic() - start, 3)
+        metadata = json.loads((self.output / "opencode-version.json").read_text())
+        self.assertIn("TimeoutExpired", metadata["error"])
+        self.assertIsNotNone(metadata["returncode"])
+        self.assertNotEqual(metadata["returncode"], 0)
+        self.assertTrue((self.output / "version" / "stderr.txt").exists())
+
+
 class RecorderCompletion(unittest.TestCase):
     """Задержанный loopback upstream воспроизводит позднюю ошибку после HTTP 200."""
 
