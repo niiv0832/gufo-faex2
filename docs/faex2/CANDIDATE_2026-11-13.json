@@ -1,6 +1,7 @@
 {
   "schema": "gufo-faex2.candidate.v1",
   "date": "2026-11-13",
+  "evidence_as_of": "2026-11-13T23:29:42+03:00",
   "status": "PREPARED_NOT_ACCEPTED",
   "ready_for_deployment": false,
   "deployment_performed": false,
@@ -47,7 +48,7 @@
       "sha256": "da63cb47a76763c712393f8a017070188a304fa39f8aeea6edc629ed7b975cfa"
     },
     "provenance_ref": ".local/remed-20261113/codex-closeout/remote-evidence/accept-out/final1/state.json",
-    "provenance_scope": "Хеши и окружение записаны в final1; это не новый модельный прогон 6d52ac57."
+    "provenance_scope": "Хеши и окружение взяты из final1. Новые модельные результаты OpenCode на 6d52ac57 и отдельная diagnostic2 описаны в verification; численные результаты прежнего кандидата не объявлены повторенными."
   },
   "intended_profile": {
     "mode": "mtp1",
@@ -66,18 +67,20 @@
     "experimental_numerical_overrides": "Не включать NPU, внешний hipBLASLt plan или иные незаявленные overrides."
   },
   "harness": {
-    "agent_source_sha": "292556a3ef6660acf1cfe609dfcf536fed453c44",
+    "agent_source_sha": "5ac224cd29f25df8c3d7f8894bcf2132928589b8",
+    "agent_script_sha256": "a1876468859470bc98b24d0474cf4119a1278d76563df0cdfde5e2ab1342c9b6",
     "composition_source_sha": "76bd2ef2cc0e19acc595b4fb610c48662b34a40e",
+    "revision_scope": "Source движка и бинарник кандидата закреплены в candidate: 6d52ac57/27ef2c9c. Agent и composition SHA обозначают клиенты проверки, не другие сборки движка.",
     "remote_composition_archive": "accept/source-76bd2ef2",
     "orchestrator_sha256_recorded_in_final1": "4e62cc27775cc202b2c1466a171208eadecac45f576b66d9528e3cbd8bd55c2b",
-    "requirement_for_next_window": "Записать SHA фактически использованных файлов и план; не подменять снимок завершённого final1."
+    "requirement_for_next_window": "Для каждого окна сохранять SHA фактически использованных файлов и план; не подменять снимки и результаты завершённых окон."
   },
   "verification": {
     "linux_numerical_identity_guard": "PASS",
     "linux_guard_scope": "Затронутый CPU-тест qwen_numerical_overrides_test, без заявления о новом GPU/model PASS.",
     "agent_harness_cpu_tests": {
       "status": "PASS",
-      "tests": 36
+      "tests": 39
     },
     "composition_harness_cpu_tests": {
       "status": "PASS",
@@ -87,7 +90,74 @@
       "status": "PASS_NO_MODEL",
       "runs": 4
     },
+    "opencode_model_scenarios": {
+      "status": "PASS",
+      "opencode_version": "2.2.5",
+      "opencode_binary_sha256": "4365edf9f61588d323bfde9e8fbee7ec90b564e3e92ee5714801178e61f56f84",
+      "candidate_cases_passed": 4,
+      "control_cases_passed": 4,
+      "cases": [
+        "tools",
+        "edit",
+        "verify",
+        "mcp"
+      ],
+      "foreground_requests_per_revision": 14,
+      "actual_tool_results_per_revision": 14,
+      "native_mcp_schemas_per_foreground_request": 25,
+      "cached_continuations_per_revision": 10,
+      "http_requests_finalized_total": 36,
+      "expected_cancelled_title_requests_total": 8,
+      "foreground_errors": 0,
+      "known_external_instruction_markers_found": 0,
+      "remaining_members_of_recorded_opencode_process_groups": 0,
+      "candidate_report_sha256": "6f634391867a9d8aa6c27b4d95b77998d3dea6b43b88eee42ed55b9622ae7171",
+      "control_report_sha256": "a43260fc53ce7ae7b14e85667416beddaf69cc2f51c503dcb5c19bdf941f0ab2",
+      "review_ref": ".local/remed-20261113/codex-closeout/opencode-actual-review.json",
+      "scope": "SSE tool calls сопоставлены с completed events, результатами в следующих запросах и файлами fixtures. Четыре коротких сценария на каждую ревизию; не soak, численная или скоростная квалификация. pi не установлен и не проверен."
+    },
+    "diagnostic2": {
+      "window": "codex-diagnostic2",
+      "recorded_window_status": "PASS",
+      "status_scope": "Завершение диагностического workload и восстановление main; не PASS сравнительной скорости.",
+      "schedule": "ABBA x 4, mixed и repetition C4",
+      "cases_completed": 32,
+      "preparation_requests": 128,
+      "measured_requests": 128,
+      "measured_output_cache_invariants": "PASS",
+      "script_sha256": "e0badc5ca10fb0ac99323df391156e45415f15a6d133c1b1062fe58ac5e69b32",
+      "control_instrumented_binary_sha256": "a1414a7ea122d3637cee3a9b26c6ad584b5a4ef89f662464b45b1e16e6d60cae",
+      "candidate_instrumented_binary_sha256": "a8eb3a0ecb8a7d73cd4aaa2819357cc9fd3213a485839eca855e26b03e78dd87",
+      "binary_scope": "Отдельные диагностические сборки 1195d154 и 6d52ac57; не бинарники перевода.",
+      "comparative_timing_status": "INCONCLUSIVE",
+      "diagnostic_phase_rank_cells": {
+        "PASS": 156,
+        "INCONCLUSIVE": 36,
+        "REGRESSION": 0
+      },
+      "finding": "Общий механизм ожидания admission во время чужой первой работы воспроизведён на контроле и кандидате. Причинная связь пауз только с изменениями кандидата не подтверждена; исходные timing gates и FAIL сохранены.",
+      "main_restore_verified": true,
+      "kernel_status": "CLEAN",
+      "state_ref": ".local/remed-20261113/codex-closeout/remote-evidence/accept-out/codex-diagnostic2/state.json",
+      "review_ref": ".local/remed-20261113/codex-closeout/diagnostic2-acceptance-review.json"
+    },
     "final2_on_this_binary": "NOT_ACCEPTED",
+    "final2_composition": {
+      "window": "codex-final2",
+      "status": "RUNNING",
+      "acceptance": "NOT_ACCEPTED",
+      "observed_at": "2026-11-13T23:29:42+03:00",
+      "fill_finished_at": "2026-11-13T23:28:55+03:00",
+      "filled_session_depths": [
+        117756,
+        117756,
+        117756,
+        117756
+      ],
+      "failures_observed_at_snapshot": [],
+      "completion_and_main_restore": "PENDING",
+      "required_load_seconds_after_warmup": 3600
+    },
     "api_and_disk_recovery_on_this_binary": "PENDING",
     "deployment_and_rollback_rehearsal": "PENDING"
   },
@@ -121,19 +191,14 @@
   },
   "blocking_reasons": [
     {
-      "id": "AGENT",
-      "status": "PENDING",
-      "reason": "Нужен настоящий OpenCode-прогон с исправленным harness на точном новом бинарнике; no-model preflight его не заменяет. pi не установлен и не считается проверенным."
-    },
-    {
       "id": "SOAK",
-      "status": "PENDING",
-      "reason": "Нужно новое полное окно после исправления refill: не менее 3600 с нагрузки после прогрева, correctness, C4 drafts, отмены, память и kernel. final1 остаётся FAIL."
+      "status": "RUNNING_NOT_ACCEPTED",
+      "reason": "codex-final2 идёт на точном кандидате после исправления refill. Четыре истории заполнены; нужны полные 3600 с нагрузки после прогрева, correctness, C4 drafts, отмены, память, kernel и подтверждённый возврат main. Пустой список ошибок раннего снимка не является PASS; final1 остаётся FAIL."
     },
     {
       "id": "C4_TIMING",
-      "status": "OPEN",
-      "reason": "Queue/server TTFT/client TTFT mixed-MTP C4: исходные 3 REGRESSION не закрыты, speed3 INCONCLUSIVE. Нужны диагностика и подтверждение затронутых фаз/запросов без изменения 5% и 3 мс."
+      "status": "INCONCLUSIVE",
+      "reason": "diagnostic2 завершена и воспроизвела общий механизм пауз на обеих ревизиях. Это не закрывает сравнительные queue/server TTFT/client TTFT gates mixed-MTP C4: исходные 3 REGRESSION speed1 сохранены. Пороги 5% и 3 мс действуют для каждой фазы/ранга; matched-cohort разбор не заменяет исходную совокупность запросов."
     },
     {
       "id": "QUALITY_CONTRACT",
