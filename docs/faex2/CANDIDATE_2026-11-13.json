@@ -1,0 +1,173 @@
+{
+  "schema": "gufo-faex2.candidate.v1",
+  "date": "2026-11-13",
+  "status": "PREPARED_NOT_ACCEPTED",
+  "ready_for_deployment": false,
+  "deployment_performed": false,
+  "authorization": {
+    "scope": "Только подготовка пакета для проверки.",
+    "owner_quality_acceptance": false,
+    "owner_deployment_approval": false,
+    "historical_approvals_apply": false
+  },
+  "candidate": {
+    "source_sha": "6d52ac57224b4d91d23fcbaba6fe053a411d65dc",
+    "binary_sha256": "27ef2c9c5f63ab0f829784818b27f1b55a585f77e4a91b0483c34b71aa5bc614",
+    "expected_version": "gufo version development (6d52ac57224b4d91d23fcbaba6fe053a411d65dc)",
+    "built_at": "2026-11-13T22:43:25+03:00",
+    "build_status": "COMPLETED",
+    "source_tree_clean_at_build": true,
+    "deployed_as_main": false,
+    "change_from_previous_candidate": "Запрет persistent identity для NPU и внешнего hipBLASLt plan-файла без отпечатка содержимого; арифметика и default GPU cache identity не изменены.",
+    "full_private_manifest_ref": ".local/remed-20261113/codex-closeout/remote-evidence/cand/6d52ac57224b4d91d23fcbaba6fe053a411d65dc/MANIFEST.json",
+    "configure_log_ref": ".local/remed-20261113/codex-closeout/remote-evidence/cand/6d52ac57224b4d91d23fcbaba6fe053a411d65dc/configure.log"
+  },
+  "build_environment": {
+    "target": "Linux x86-64 gfx1151",
+    "build_type": "RelWithDebInfo",
+    "npu_enabled": false,
+    "toolchain_distribution": "TheRock 10.1.0",
+    "c_and_cxx_compiler": "GCC 16.2.1 20260810",
+    "hip_compiler": "AMD clang 24.0.0git",
+    "hip_compiler_revision": "d6f6cb691863e9258034ab48c1dfce21689d5606",
+    "python_on_stand": "3.14.9",
+    "recorded_kernel": "7.3.3-1-cachyos",
+    "configure_warning": "AMDGPU_TARGETS не используется; configure отдельно подтвердил HIP target gfx1151.",
+    "private_paths_and_linked_libraries": "Полный непубличный MANIFEST и configure.log; абсолютные пути сюда не перенесены."
+  },
+  "assets": {
+    "model": {
+      "name": "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
+      "bytes": 22853663008,
+      "sha256": "55983c5a75a1ab969824077b3bb3de4146e82a9234072b48ad4e8f92ad3fe9f1"
+    },
+    "mmproj": {
+      "name": "mmproj-BF16.gguf",
+      "bytes": 902822528,
+      "sha256": "da63cb47a76763c712393f8a017070188a304fa39f8aeea6edc629ed7b975cfa"
+    },
+    "provenance_ref": ".local/remed-20261113/codex-closeout/remote-evidence/accept-out/final1/state.json",
+    "provenance_scope": "Хеши и окружение записаны в final1; это не новый модельный прогон 6d52ac57."
+  },
+  "intended_profile": {
+    "mode": "mtp1",
+    "draft_tokens": 1,
+    "sessions": 4,
+    "context_per_session": 131072,
+    "vision": true,
+    "reasoning_budget_tokens": 512,
+    "ram_cache_gib": 16,
+    "disk_cache_gib": 64,
+    "environment": {
+      "HSA_ENABLE_SDMA": "0",
+      "GUFO_MTP_MOE_MAX_COHORT": "4"
+    },
+    "library_path": "Путь TheRock из проверенного эксплуатационного manifest; не угадывать.",
+    "experimental_numerical_overrides": "Не включать NPU, внешний hipBLASLt plan или иные незаявленные overrides."
+  },
+  "harness": {
+    "agent_source_sha": "292556a3ef6660acf1cfe609dfcf536fed453c44",
+    "composition_source_sha": "76bd2ef2cc0e19acc595b4fb610c48662b34a40e",
+    "remote_composition_archive": "accept/source-76bd2ef2",
+    "orchestrator_sha256_recorded_in_final1": "4e62cc27775cc202b2c1466a171208eadecac45f576b66d9528e3cbd8bd55c2b",
+    "requirement_for_next_window": "Записать SHA фактически использованных файлов и план; не подменять снимок завершённого final1."
+  },
+  "verification": {
+    "linux_numerical_identity_guard": "PASS",
+    "linux_guard_scope": "Затронутый CPU-тест qwen_numerical_overrides_test, без заявления о новом GPU/model PASS.",
+    "agent_harness_cpu_tests": {
+      "status": "PASS",
+      "tests": 36
+    },
+    "composition_harness_cpu_tests": {
+      "status": "PASS",
+      "tests": 47
+    },
+    "isolated_opencode_cold_preflight": {
+      "status": "PASS_NO_MODEL",
+      "runs": 4
+    },
+    "final2_on_this_binary": "NOT_ACCEPTED",
+    "api_and_disk_recovery_on_this_binary": "PENDING",
+    "deployment_and_rollback_rehearsal": "PENDING"
+  },
+  "previous_candidate_evidence": {
+    "source_sha": "feae3fc66032f7b1d3760fddb238d7ea7e386c7c",
+    "binary_sha256": "d4df0f6864ed01cac05cd0bbcf7096e29502d155a96729662104f5b7c015fd96",
+    "reuse_basis": "Diff src до 6d52ac57 затрагивает только guard persistent identity. Численная арифметика и default GPU identity сохранены.",
+    "allowed_scope": "Повторное использование доказательств неизменившихся вычислительных путей с исходными SHA, режимами и ограничениями.",
+    "freshly_tested_on_current_binary": false,
+    "preserved_results": {
+      "final1": "FAIL",
+      "speed1": {
+        "PASS": 217,
+        "INCONCLUSIVE": 14,
+        "REGRESSION": 3
+      },
+      "speed2": "HARNESS_FAILURE_BEFORE_GPU",
+      "speed3_early": {
+        "PASS": 58,
+        "INCONCLUSIVE": 38
+      },
+      "speed3_late": {
+        "PASS": 93,
+        "INCONCLUSIVE": 3
+      },
+      "vision_cold_prefill": "FAIL",
+      "numerical_quality": "NOT_ACCEPTED"
+    },
+    "public_evidence_ref": "docs/faex2/CLOSEOUT_2026-11-13.md",
+    "speed_review_ref": ".local/remed-20261113/codex-closeout/acceptance-speed3-review.json"
+  },
+  "blocking_reasons": [
+    {
+      "id": "AGENT",
+      "status": "PENDING",
+      "reason": "Нужен настоящий OpenCode-прогон с исправленным harness на точном новом бинарнике; no-model preflight его не заменяет. pi не установлен и не считается проверенным."
+    },
+    {
+      "id": "SOAK",
+      "status": "PENDING",
+      "reason": "Нужно новое полное окно после исправления refill: не менее 3600 с нагрузки после прогрева, correctness, C4 drafts, отмены, память и kernel. final1 остаётся FAIL."
+    },
+    {
+      "id": "C4_TIMING",
+      "status": "OPEN",
+      "reason": "Queue/server TTFT/client TTFT mixed-MTP C4: исходные 3 REGRESSION не закрыты, speed3 INCONCLUSIVE. Нужны диагностика и подтверждение затронутых фаз/запросов без изменения 5% и 3 мс."
+    },
+    {
+      "id": "QUALITY_CONTRACT",
+      "status": "DRAFT_NOT_APPROVED",
+      "reason": "Владелец выбрал подготовку проекта контракта, не принятие потерь качества. Prefill quality и vision FAIL остаются видимыми; exact/lossless не объявлены."
+    },
+    {
+      "id": "CUTOVER",
+      "status": "NOT_AUTHORIZED",
+      "reason": "Нужны все согласованные gates, проверенный комплект launcher/recovery и отдельное одобрение владельца этого кандидата."
+    }
+  ],
+  "cache_compatibility": {
+    "numerical_identity": "qwen-bf16-fp32-prefill-v2",
+    "means_snapshot_file_format_version": false,
+    "old_working_numeric_state_must_restore": false,
+    "expected_old_state_behavior": "Несовместимая численная identity даёт cache miss; старые state не переименовывать и не принудительно загружать.",
+    "current_candidate_own_state": "Обязан восстановиться после перезапуска с подтверждённой identity и правильным ответом.",
+    "operational_policy": "Новый отдельный namespace; старые каталоги, launcher snapshot и бинарники сохраняются для отката."
+  },
+  "rollback": {
+    "source_sha": "1195d15427a43c45516ab9e7dd90777f8216b326",
+    "binary_sha256": "e319b5f5b5198dc60e089d8b57b3e8826728aed5b6ba9f1534adf0b18a67d607",
+    "expected_version": "gufo version development (1195d15427a43c45516ab9e7dd90777f8216b326)",
+    "release_directory_name": "1195d154-e319b5f5",
+    "current_launcher_baseline": "v13; перепроверить перед подготовкой",
+    "future_recovery_role": "Нынешний main 1195d154 должен стать recovery только в новом проверенном комплекте launcher.",
+    "launcher_backup_required": [
+      "faex2_owner.py",
+      "faex2-launch.json",
+      "fork_restart.sh",
+      "SHA256SUMS"
+    ],
+    "without_rebuild": true
+  },
+  "procedure_ref": "docs/faex2/CANDIDATE_SWITCH_2026-11-13.md"
+}
