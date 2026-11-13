@@ -6,11 +6,24 @@
 #include <cstdlib>
 #include <functional>
 #include <string>
+#include <string_view>
 
 #include "src/core/model_config.hpp"
 #include "src/models/qwen/hip/execution_policy.hpp"
 
 namespace gufo::hip {
+
+/// Version of the arithmetic a stored Qwen state was computed with. Bump it
+/// whenever a change can alter the bits of the K/V cache, recurrent state or
+/// logits a session reaches for the same tokens, in ordinary decoding,
+/// batched decoding or speculative verification: a state of the older
+/// arithmetic must be a cache miss, not a restore.
+///   v1: speculative verification and batched decoding computed the
+///       recurrent step controls with a different sum tree than single-token
+///       decoding.
+///   v2: every row operation equals single-token decoding bit for bit.
+inline constexpr std::string_view kQwenNumericsIdentity =
+    "qwen-bf16-fp32-prefill-v2";
 
 /// Opt-in environment overrides that change the arithmetic of a Qwen session:
 /// block-sparse attention (GUFO_QWEN_SPARSE_ATTN and its parameters) and the
@@ -27,22 +40,22 @@ struct QwenNumericalOverrides {
 
   [[nodiscard]] bool operator==(const QwenNumericalOverrides&) const = default;
 
-  /// Lines for a continuation-cache compatibility identity. The defaults add
-  /// nothing, so states stored without an override stay addressable; the
-  /// parameters of a disabled sparse attention do not participate.
+  /// Lines for a continuation-cache compatibility identity. Every policy,
+  /// the default included, names its attention and expert prefill, so a
+  /// state stored without these lines is never taken for the default policy.
+  /// The parameters of a disabled sparse attention do not participate.
   [[nodiscard]] std::string CacheIdentity() const {
-    std::string identity;
+    std::string identity = "attention=dense-v1\n";
     if (sparse_attention) {
-      identity +=
-          "sparse_attention=block-v1\nsparse_sink_blocks=" +
+      identity =
+          "attention=block-sparse-v1\nsparse_sink_blocks=" +
           std::to_string(sparse_sink_blocks) +
           "\nsparse_local_blocks=" + std::to_string(sparse_local_blocks) +
           "\nsparse_top_blocks=" + std::to_string(sparse_top_blocks) +
           "\nsparse_min_context=" + std::to_string(sparse_min_context) + '\n';
     }
-    if (!grouped_moe_prefill) {
-      identity += "moe_prefill=row-wise-v1\n";
-    }
+    identity += grouped_moe_prefill ? "moe_prefill=grouped-v1\n"
+                                    : "moe_prefill=row-wise-v1\n";
     return identity;
   }
 };

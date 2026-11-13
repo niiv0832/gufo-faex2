@@ -438,6 +438,20 @@ void TestNumericalOverridesIsolateSnapshots() {
 
   TemporaryDirectory directory;
   {
+    // A state stored before the policy was part of the identity carries no
+    // policy lines. It is not the default policy's state.
+    ContinuationDiskStore store(StoreOptions(directory.path()));
+    const FakeRunner legacy("artifact-A\n");
+    const auto legacy_snapshot = MakeSnapshot(legacy, 999, 3);
+    Expect(SaveTokens(store, legacy, {1, 2, 3}, *legacy_snapshot).stored,
+           "a state without policy lines is stored under its own identity");
+    const auto reader = runner(policies[0]);
+    auto state = reader.CreateState();
+    Expect(!RestoreTokens(store, reader, *state, {1, 2, 3, 4}).restored &&
+               RequireFakeState(*state).position == 0,
+           "a state without policy lines is a miss for the default policy");
+  }
+  {
     ContinuationDiskStore store(StoreOptions(directory.path()));
     const auto writer = runner(policies[0]);
     const auto snapshot = MakeSnapshot(writer, 1000, 3);
@@ -457,8 +471,9 @@ void TestNumericalOverridesIsolateSnapshots() {
       Expect(SaveTokens(store, reader, {1, 2, 3}, *snapshot).stored,
              "an override stores its own snapshot of the same tokens");
     }
-    Expect(store.entry_count() == policies.size(),
-           "every policy keeps a separate entry for the same tokens");
+    Expect(store.entry_count() == policies.size() + 1,
+           "every policy and the legacy state keep separate entries for the "
+           "same tokens");
   }
   ContinuationDiskStore restarted(StoreOptions(directory.path()));
   for (std::size_t i = 0; i < policies.size(); ++i) {

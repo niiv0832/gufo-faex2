@@ -346,8 +346,9 @@ std::vector<std::uint8_t> QwenCompatibilityIdentity(
            // Older learned boundaries could keep logits from an earlier
            // prefix. Their payload has no readiness tag to distinguish them.
            << "checkpoint_frontier=complete-prefix-v1\n"
-           << "numerics=qwen-bf16-fp32-prefill-v1\n"
-           // Opt-in arithmetic overrides; nothing for the default policy.
+           << "numerics=" << hip::kQwenNumericsIdentity
+           << '\n'
+           // The attention and expert prefill arithmetic in effect.
            << numerical_overrides.CacheIdentity()
            << "rmsnorm=fused-square-sum-v1\n"
            << "prefill_attention=visible-causal-tail-v1\n"

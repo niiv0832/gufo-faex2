@@ -43,8 +43,14 @@ QwenNumericalOverrides Resolve(
 
 int main() {
   const QwenNumericalOverrides defaults;
-  Expect(Resolve({}) == defaults && defaults.CacheIdentity().empty(),
-         "an empty environment is the default policy and adds no identity");
+  Expect(Resolve({}) == defaults &&
+             defaults.CacheIdentity() ==
+                 "attention=dense-v1\nmoe_prefill=grouped-v1\n",
+         "an empty environment is the default policy, named explicitly so a "
+         "state stored without these lines is not taken for it");
+  // The tag of the arithmetic before verification rows equalled decoding.
+  Expect(gufo::hip::kQwenNumericsIdentity != "qwen-bf16-fp32-prefill-v1",
+         "states of the older row arithmetic have another numerics version");
   Expect(!defaults.sparse_attention && defaults.grouped_moe_prefill,
          "the default policy is dense attention with grouped expert prefill");
   Expect(Resolve({{"GUFO_QWEN_SPARSE_ATTN", "0"},
