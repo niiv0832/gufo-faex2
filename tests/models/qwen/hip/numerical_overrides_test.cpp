@@ -1,14 +1,16 @@
 // The arithmetic overrides of a Qwen session and their part of the
-// continuation-cache identity: the default policy adds nothing, and sparse
-// attention, each of its parameters and the expert prefill switch each change
-// it.
+// continuation-cache identity: defaults are explicit, supported policies have
+// distinct identities, and external arithmetic without a content fingerprint
+// cannot create persistent state.
 #include "src/models/qwen/hip/numerical_overrides.hpp"
 
 #include <cstdlib>
 #include <iostream>
 #include <map>
 #include <set>
+#include <stdexcept>
 #include <string>
+#include <string_view>
 
 namespace {
 using namespace gufo::hip;
@@ -38,6 +40,24 @@ QwenNumericalOverrides Resolve(
         const auto found = environment.find(name);
         return found == environment.end() ? nullptr : found->second.c_str();
       });
+}
+
+bool RejectsPersistence(const QwenNumericalOverrides& overrides,
+                        std::string_view variable) {
+  try {
+    (void)overrides.CacheIdentity();
+  } catch (const std::invalid_argument& error) {
+    const std::string_view message = error.what();
+    Expect(message.find(variable) != std::string_view::npos &&
+               message.find("disk cache") != std::string_view::npos &&
+               message.find("fingerprint") != std::string_view::npos,
+           "persistence rejection identifies the external arithmetic and its "
+           "missing fingerprint");
+    return true;
+  }
+  std::cerr << "FAIL: persistence accepted unfingerprinted " << variable
+            << '\n';
+  return false;
 }
 }  // namespace
 
@@ -71,6 +91,38 @@ int main() {
   Expect(Resolve(sparse) == sparse_defaults &&
              Resolve(sparse).CacheIdentity() == sparse_defaults.CacheIdentity(),
          "the same policy has the same identity");
+  Expect(sparse_defaults.CacheIdentity() ==
+             "attention=block-sparse-v1\nsparse_sink_blocks=2\n"
+             "sparse_local_blocks=32\nsparse_top_blocks=256\n"
+             "sparse_min_context=8192\nmoe_prefill=grouped-v1\n"
+             "prefill_ffn=gpu-v1\nhipblaslt_plans=default\n",
+         "the supported sparse policy keeps its stored identity");
+
+  // A directory/boolean or plan pathname cannot identify its content. Resolve
+  // still permits the experimental route without persistent caching, but a
+  // request for a persistent identity must fail closed for every such route.
+  std::size_t rejected = 0;
+  for (const Environment& environment :
+       {Environment{{"GUFO_NPU_DIR", "/npu-a"}},
+        Environment{{"GUFO_NPU_DIR", "/npu-b"},
+                    {"GUFO_QWEN_NPU_QKV_SLICES", "0"}},
+        Environment{{"GUFO_NPU_DIR", ""}}}) {
+    const auto overrides = Resolve(environment);
+    Expect(overrides.npu_prefill,
+           "resolving an NPU route does not itself require persistence");
+    rejected += RejectsPersistence(overrides, "GUFO_NPU_DIR");
+  }
+  for (const std::string path : {"/plans-a", "/plans-b"}) {
+    const auto overrides = Resolve({{"GUFO_HIPBLASLT_PLAN_CACHE", path}});
+    Expect(overrides.hipblaslt_plan_cache == path,
+           "resolving a plan route does not itself require persistence");
+    rejected += RejectsPersistence(overrides, "GUFO_HIPBLASLT_PLAN_CACHE");
+  }
+  Expect(rejected == 5,
+         "all arithmetic without a content fingerprint rejects persistence");
+  Expect(Resolve({{"GUFO_HIPBLASLT_PLAN_CACHE", ""}}).CacheIdentity() ==
+             defaults.CacheIdentity(),
+         "an empty plan path keeps the default arithmetic identity");
 
   // Every distinct effective policy must have a distinct identity.
   std::set<std::string> identities = {defaults.CacheIdentity()};
@@ -79,12 +131,6 @@ int main() {
     Expect(identities.insert(overrides.CacheIdentity()).second, message);
   };
   distinct(sparse_defaults, "sparse attention changes the identity");
-  distinct(Resolve({{"GUFO_NPU_DIR", "/npu"}}),
-           "NPU prompt layers change the identity");
-  distinct(Resolve({{"GUFO_HIPBLASLT_PLAN_CACHE", "/plans-a"}}),
-           "a hipBLASLt plan file changes the identity");
-  distinct(Resolve({{"GUFO_HIPBLASLT_PLAN_CACHE", "/plans-b"}}),
-           "another hipBLASLt plan file changes the identity");
   struct Parameter {
     const char* name;
     std::uint32_t QwenNumericalOverrides::* field;
@@ -109,6 +155,10 @@ int main() {
   const auto rowwise = Resolve({{"GUFO_QWEN_MOE_PREFILL", "0"}});
   Expect(!rowwise.grouped_moe_prefill && !rowwise.sparse_attention,
          "GUFO_QWEN_MOE_PREFILL=0 disables only the grouped expert prefill");
+  Expect(rowwise.CacheIdentity() ==
+             "attention=dense-v1\nmoe_prefill=row-wise-v1\n"
+             "prefill_ffn=gpu-v1\nhipblaslt_plans=default\n",
+         "the supported row-wise policy keeps its stored identity");
   distinct(rowwise, "the expert prefill switch changes the identity");
   auto both = sparse;
   both["GUFO_QWEN_MOE_PREFILL"] = "0";

@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <functional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 
@@ -53,7 +54,21 @@ struct QwenNumericalOverrides {
   /// the default included, names its attention and expert prefill, so a
   /// state stored without these lines is never taken for the default policy.
   /// The parameters of a disabled sparse attention do not participate.
+  /// External arithmetic without a content fingerprint cannot be persisted:
+  /// a pathname or an enabled flag does not identify the state it computes.
   [[nodiscard]] std::string CacheIdentity() const {
+    if (npu_prefill) {
+      throw std::invalid_argument(
+          "Qwen disk cache cannot use GUFO_NPU_DIR without a content and "
+          "effective-parameter fingerprint; disable disk caching or unset "
+          "GUFO_NPU_DIR");
+    }
+    if (!hipblaslt_plan_cache.empty()) {
+      throw std::invalid_argument(
+          "Qwen disk cache cannot use GUFO_HIPBLASLT_PLAN_CACHE without a "
+          "content fingerprint; disable disk caching or unset "
+          "GUFO_HIPBLASLT_PLAN_CACHE");
+    }
     std::string identity = "attention=dense-v1\n";
     if (sparse_attention) {
       identity =
@@ -65,12 +80,7 @@ struct QwenNumericalOverrides {
     }
     identity += grouped_moe_prefill ? "moe_prefill=grouped-v1\n"
                                     : "moe_prefill=row-wise-v1\n";
-    identity += npu_prefill ? "prefill_ffn=npu-v1\n" : "prefill_ffn=gpu-v1\n";
-    identity +=
-        "hipblaslt_plans=" +
-        (hipblaslt_plan_cache.empty() ? std::string("default")
-                                      : "file:" + hipblaslt_plan_cache) +
-        '\n';
+    identity += "prefill_ffn=gpu-v1\nhipblaslt_plans=default\n";
     return identity;
   }
 };
