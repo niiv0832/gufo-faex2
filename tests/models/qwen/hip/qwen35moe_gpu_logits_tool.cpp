@@ -7,6 +7,21 @@
 //   without n_gen: writes <out> as raw float32 logits of the last position.
 //   with n_gen:    writes <out> as n_gen greedy token ids, space separated.
 //
+// QUALITY_PREFILL=<n>: prefills the first n ids, feeds the rest one token at a
+// time and writes the logits rows of positions n - 1 on (the row at position p
+// predicts token p + 1). n = 0 reads the whole history through ForwardToken
+// from position 0: the decode arithmetic, with no prompt pass at all.
+//   QUALITY_STRIDE=<s>      every s-th row only.
+//   QUALITY_WINDOWS=a:n,... only rows of positions a .. a + n - 1 of each
+//                           window, in ascending order.
+//   QUALITY_KV=fp32         FP32 attention keys and values instead of FP16.
+//   QUALITY_BATCH=1         <ids.txt> is a list of "ids-file out-file" lines;
+//                           every document runs after a Reset on one model.
+//   QUALITY_TIME=<repeats>  no rows: after one warm-up pass, times reading
+//                           the whole ids file <repeats> times and prints the
+//                           median (prefill n = chunked prompt pass, n = 0 =
+//                           token by token).
+//
 // TWO_SESSIONS=<ids2.txt> with TWO_SESSIONS_HEAD=<n>: two executors share one
 // model, as serve sessions do. Each prefills the first n ids of its own
 // sequence without a final synchronization, one right after the other, then
@@ -14,6 +29,7 @@
 // reference; exits 1 otherwise. n >= 64 takes the grouped MoE prefill, a
 // smaller n the per-token one.
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -23,12 +39,68 @@
 #include <iostream>
 #include <memory>
 #include <span>
+#include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "src/core/gguf_reader.hpp"
 #include "src/models/qwen/hip/executor.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/npu_gemm.hpp"
+
+namespace {
+
+using Ids = std::vector<gufo::tokenization::TokenId>;
+
+Ids ReadIds(const std::string& path) {
+  Ids ids;
+  std::ifstream in(path);
+  for (std::uint32_t id; in >> id;)
+    ids.push_back(id);
+  return ids;
+}
+
+// Positions [first, first + count) of each "first:count" item.
+std::vector<std::pair<std::size_t, std::size_t>> ParseWindows(
+    const char* text) {
+  std::vector<std::pair<std::size_t, std::size_t>> windows;
+  std::stringstream stream(text != nullptr ? text : "");
+  for (std::string item; std::getline(stream, item, ',');) {
+    const auto colon = item.find(':');
+    if (colon == std::string::npos)
+      throw std::invalid_argument("QUALITY_WINDOWS item needs first:count");
+    windows.emplace_back(std::stoul(item.substr(0, colon)),
+                         std::stoul(item.substr(colon + 1)));
+  }
+  return windows;
+}
+
+// Reads `ids` with `prefill` leading ids in one prompt pass (none for 0) and
+// the rest token by token; returns the number of rows `on_row` accepted.
+std::size_t ReadDocument(
+    gufo::hip::QwenGpuExecutor& executor, const Ids& ids, std::size_t prefill,
+    const std::function<bool(std::size_t position)>& wants_row,
+    const std::function<void(std::span<const float>)>& on_row) {
+  std::size_t rows = 0;
+  const auto row = [&](std::size_t position) {
+    if (wants_row(position)) {
+      on_row(executor.CopyLastLogits());
+      ++rows;
+    }
+  };
+  if (prefill != 0) {
+    (void)executor.ForwardPromptBatch(std::span(ids).first(prefill), 0, true);
+    row(prefill - 1);
+  }
+  // The last id is only ever a gold label.
+  for (std::size_t i = prefill; i + 1 < ids.size(); ++i) {
+    (void)executor.ForwardToken(ids[i], static_cast<std::uint32_t>(i));
+    row(i);
+  }
+  return rows;
+}
+
+}  // namespace
 
 int main(int argc, char** argv) {
   if (argc != 4 && argc != 5) {
@@ -126,50 +198,104 @@ int main(int argc, char** argv) {
         head, unstable, mismatches, rounds * 2, worst);
     return unstable == 0 && mismatches == 0 ? 0 : 1;
   }
+  auto policy = gufo::hip::QwenExecutionPolicy::Production();
+  if (const char* kv = std::getenv("QUALITY_KV")) {
+    if (std::string(kv) != "fp32") {
+      std::cerr << "QUALITY_KV accepts fp32 only\n";
+      return 2;
+    }
+    policy.kv_cache_storage = gufo::hip::QwenKvCacheStorage::kFp32;
+  }
   auto executor = gufo::hip::QwenGpuExecutor::CreateFromGguf(
       reader, &error,
       std::getenv("QUALITY_CTX") != nullptr
           ? static_cast<std::uint32_t>(std::stoul(std::getenv("QUALITY_CTX")))
-          : 4096U);
+          : 4096U,
+      policy);
   if (!executor) {
     std::cerr << "executor failed: " << error << '\n';
     return 1;
   }
-  std::vector<gufo::tokenization::TokenId> ids;
-  std::ifstream in(argv[2]);
-  for (std::uint32_t id; in >> id;)
-    ids.push_back(id);
   if (const char* prefill_env = std::getenv("QUALITY_PREFILL")) {
-    // Prefill the first N ids, feed the rest one token at a time and dump the
-    // logits row of every stride-th position from N - 1 on (the row at
-    // position p predicts token p + 1).
     const std::size_t prefill = std::stoul(prefill_env);
     const char* stride_env = std::getenv("QUALITY_STRIDE");
     const std::size_t stride =
         stride_env != nullptr ? std::stoul(stride_env) : 1;
-    if (prefill == 0 || prefill > ids.size())
-      return 2;
-    const std::vector<gufo::tokenization::TokenId> head(ids.begin(),
-                                                        ids.begin() + prefill);
-    std::ofstream out(argv[3], std::ios::binary);
-    const auto write_row = [&] {
-      const auto logits = executor->CopyLastLogits();
-      out.write(reinterpret_cast<const char*>(logits.data()),
-                static_cast<std::streamsize>(logits.size() * sizeof(float)));
+    const auto windows = ParseWindows(std::getenv("QUALITY_WINDOWS"));
+    const std::size_t first_row = prefill != 0 ? prefill - 1 : 0;
+    const auto wants_row = [&](std::size_t position) {
+      if ((position - first_row) % stride != 0)
+        return false;
+      if (windows.empty())
+        return true;
+      for (const auto& [first, count] : windows)
+        if (position >= first && position - first < count)
+          return true;
+      return false;
     };
-    (void)executor->ForwardPromptBatch(head, 0, true);
-    write_row();
-    std::size_t rows = 1;
-    for (std::size_t i = prefill; i + 1 < ids.size(); ++i) {
-      (void)executor->ForwardToken(ids[i], static_cast<std::uint32_t>(i));
-      if ((i - (prefill - 1)) % stride == 0) {
-        write_row();
-        ++rows;
+    if (const char* time_env = std::getenv("QUALITY_TIME")) {
+      const Ids ids = ReadIds(argv[2]);
+      if (prefill > ids.size() || ids.size() < 2)
+        return 2;
+      // One more id than is read, as ReadDocument keeps the last for a label.
+      std::vector<double> seconds;
+      const int repeats = std::stoi(time_env);
+      for (int pass = 0; pass <= repeats; ++pass) {
+        executor->Reset();
+        const auto start = std::chrono::steady_clock::now();
+        (void)ReadDocument(
+            *executor, ids, prefill != 0 ? ids.size() - 1 : 0,
+            [](std::size_t) { return false; }, [](std::span<const float>) {});
+        // The copy waits for everything queued on the stream.
+        (void)executor->CopyLastLogits();
+        const std::chrono::duration<double> elapsed =
+            std::chrono::steady_clock::now() - start;
+        if (pass != 0)
+          seconds.push_back(elapsed.count());
       }
+      std::sort(seconds.begin(), seconds.end());
+      std::printf(
+          "read %zu tokens %s: median %.4f s of %d (min %.4f max "
+          "%.4f), %.1f tokens/s\n",
+          ids.size() - 1, prefill != 0 ? "prompt pass" : "token by token",
+          seconds[seconds.size() / 2], repeats, seconds.front(), seconds.back(),
+          static_cast<double>(ids.size() - 1) / seconds[seconds.size() / 2]);
+      return 0;
     }
-    std::fprintf(stderr, "wrote %zu rows\n", rows);
+    std::vector<std::pair<std::string, std::string>> documents;
+    if (std::getenv("QUALITY_BATCH") != nullptr) {
+      std::ifstream list(argv[2]);
+      for (std::string ids_path, out_path; list >> ids_path >> out_path;)
+        documents.emplace_back(ids_path, out_path);
+    } else {
+      documents.emplace_back(argv[2], argv[3]);
+    }
+    for (const auto& [ids_path, out_path] : documents) {
+      const Ids ids = ReadIds(ids_path);
+      if (prefill > ids.size() || ids.size() < 2) {
+        std::cerr << ids_path << ": too few ids\n";
+        return 2;
+      }
+      executor->Reset();
+      std::ofstream out(out_path, std::ios::binary);
+      const std::size_t rows = ReadDocument(
+          *executor, ids, prefill, wants_row,
+          [&](std::span<const float> logits) {
+            out.write(
+                reinterpret_cast<const char*>(logits.data()),
+                static_cast<std::streamsize>(logits.size() * sizeof(float)));
+          });
+      out.flush();
+      if (!out) {
+        std::cerr << out_path << ": write failed\n";
+        return 1;
+      }
+      std::fprintf(stderr, "%s: prefill %zu, %zu ids, wrote %zu rows\n",
+                   out_path.c_str(), prefill, ids.size(), rows);
+    }
     return 0;
   }
+  const Ids ids = ReadIds(argv[2]);
   if (const char* rows_env = std::getenv("VERIFY_ROWS")) {
     const std::size_t rows = std::stoul(rows_env);
     const std::vector<gufo::tokenization::TokenId> head(ids.begin(),
