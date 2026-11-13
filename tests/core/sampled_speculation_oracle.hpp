@@ -7,11 +7,21 @@
 // definitions, so a test can hold the production CPU and GPU samplers to
 // them.
 //
-// A draft token x is drawn from a sparse row q. The verifier accepts it with
-// probability min(1, p(x) / q(x)); otherwise it emits a token of the residual
-// r(x) = max(0, p(x) - q(x)) / Z. The emitted token then has the distribution
-//   P(x) = min(p(x), q(x)) + (1 - sum_y min(p(y), q(y))) * r(x),
-// which equals p(x) for every row q that sums to one.
+// A draft row reports probabilities q for its candidates. The verifier
+// accepts a draft token x with probability a(x) = min(1, p(x) / q(x));
+// otherwise it emits a token of the residual r(x) = max(0, p(x) - q(x)) / Z,
+// or of p itself when no residual remains. The reported row is a row of
+// rounded floats and need not sum to one, so the candidates are not drawn
+// with exactly the probabilities reported: an inverse-CDF draw over [0, 1)
+// gives every candidate the interval its reported probability spans, cuts
+// the row at one, and leaves what the row is short of one to its last
+// positive candidate. With q' those probabilities, the emitted token has
+//   P(x) = q'(x) a(x) + (sum_y q'(y) (1 - a(y))) r(x).
+// P equals p when the row sums to one. In general
+//   sum_x |P(x) - p(x)| <= 2 |sum(q) - 1|:
+// with the reported masses in place of q' the law is p + (sum(q) - 1) r,
+// the law is linear in the masses with coefficients of total weight one, and
+// q' differs from q by |sum(q) - 1| in total.
 
 #include <algorithm>
 #include <cmath>
@@ -167,13 +177,11 @@ struct Verification {
   double acceptance{0.0};
   /// sum_x max(0, p(x) - q(x)).
   double residual_mass{0.0};
-  /// 1 - sum_y min(p(y), q(y)): the chance that a draft drawn from q is
-  /// rejected. Equals residual_mass when q sums to one.
+  /// 1 - sum_y min(p(y), q(y)): the rejected share of the reported masses.
+  /// Equals residual_mass when q sums to one.
   double rejection_mass{0.0};
   /// r, in the order of p; empty when residual_mass is zero.
   std::vector<Candidate> residual;
-  /// max_x |P(x) - p(x)| for the emitted token.
-  double identity_error{0.0};
 };
 
 inline Verification Verify(std::span<const Candidate> target,
@@ -197,13 +205,90 @@ inline Verification Verify(std::span<const Candidate> target,
   result.rejection_mass = 1.0 - overlap;
   for (Candidate& candidate : result.residual)
     candidate.probability /= result.residual_mass;
-  for (const Candidate& candidate : target) {
-    const double emitted =
-        std::min(candidate.probability, draft.Probability(candidate.token)) +
-        result.rejection_mass * ProbabilityOf(result.residual, candidate.token);
-    result.identity_error = std::max(result.identity_error,
-                                     std::abs(emitted - candidate.probability));
+  return result;
+}
+
+/// The probability with which an inverse-CDF draw over [0, 1) proposes each
+/// slot of `draft`: slots own consecutive intervals of their reported
+/// probabilities, the row is cut at one, and the last positive slot also
+/// owns what the row is short of one.
+inline std::vector<double> ProposedProbabilities(const DraftRow& draft) {
+  std::vector<double> proposed(draft.ids.size(), 0.0);
+  double begin = 0.0;
+  std::size_t last = draft.ids.size();
+  for (std::size_t slot = 0; slot < draft.ids.size(); ++slot) {
+    if (!(draft.probabilities[slot] > 0.0F))
+      continue;
+    const double end = begin + static_cast<double>(draft.probabilities[slot]);
+    proposed[slot] = std::min(end, 1.0) - std::min(begin, 1.0);
+    begin = end;
+    last = slot;
   }
+  if (last == draft.ids.size())
+    throw std::runtime_error("oracle: the draft row has no mass");
+  if (begin < 1.0)
+    proposed[last] += 1.0 - begin;
+  return proposed;
+}
+
+/// The law of the token a propose-verify step emits.
+struct Emitted {
+  /// P, in the order of p.
+  std::vector<Candidate> law;
+  /// The chance that the draft is accepted.
+  double acceptance_rate{0.0};
+  /// max_x |P(x) - p(x)| and sum_x |P(x) - p(x)|.
+  double max_error{0.0};
+  double total_error{0.0};
+  /// 2 |sum(q) - 1|, the bound of total_error.
+  double bound{0.0};
+};
+
+inline Emitted EmittedLaw(std::span<const Candidate> target,
+                          const DraftRow& draft) {
+  const auto proposed = ProposedProbabilities(draft);
+  std::vector<Candidate> residual;
+  double residual_mass = 0.0;
+  for (const Candidate& candidate : target) {
+    const double excess = std::max(
+        0.0, candidate.probability - draft.Probability(candidate.token));
+    if (excess > 0.0) {
+      residual.push_back({candidate.token, candidate.logit, excess});
+      residual_mass += excess;
+    }
+  }
+  for (Candidate& candidate : residual)
+    candidate.probability /= residual_mass;
+  // Without a residual a rejected draft is replaced from p.
+  const std::span<const Candidate> correction =
+      residual.empty() ? target : std::span<const Candidate>(residual);
+
+  Emitted result;
+  for (std::size_t slot = 0; slot < draft.ids.size(); ++slot) {
+    if (proposed[slot] > 0.0)
+      result.acceptance_rate +=
+          proposed[slot] *
+          std::min(1.0, ProbabilityOf(target, draft.ids[slot]) /
+                            static_cast<double>(draft.probabilities[slot]));
+  }
+  for (const Candidate& candidate : target) {
+    double accepted = 0.0;
+    for (std::size_t slot = 0; slot < draft.ids.size(); ++slot) {
+      if (draft.ids[slot] == candidate.token && proposed[slot] > 0.0)
+        accepted =
+            proposed[slot] *
+            std::min(1.0, candidate.probability /
+                              static_cast<double>(draft.probabilities[slot]));
+    }
+    const double value =
+        accepted + ((1.0 - result.acceptance_rate) *
+                    ProbabilityOf(correction, candidate.token));
+    result.law.push_back({candidate.token, candidate.logit, value});
+    const double error = std::abs(value - candidate.probability);
+    result.max_error = std::max(result.max_error, error);
+    result.total_error += error;
+  }
+  result.bound = 2.0 * std::abs(draft.Sum() - 1.0);
   return result;
 }
 

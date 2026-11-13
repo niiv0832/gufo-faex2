@@ -233,6 +233,22 @@ inline std::vector<Case> All(std::size_t dense = 4096) {
     test.drafts = {{{0, 1}, {0.500004F, 0.500004F}}};
     cases.push_back(test);
   }
+  {
+    // Rows of rounded probabilities that sum to a little less or more than
+    // one (within the verifier's 1e-5), with zero slots at either end.
+    Case test;
+    test.name = "unnormalized";
+    test.logits = {1.0F, 0.5F, 0.0F, -0.5F};
+    test.drafts = {
+        {{0, 1, 2, 3}, {0.4F, 0.3F, 0.2F, 0.099995F}},
+        {{0, 1, 2, 3}, {0.4F, 0.3F, 0.2F, 0.100005F}},
+        {{3, 2, 1, 0}, {0.0F, 0.250004F, 0.250004F, 0.5F}},
+        {{0, 1, 2, 3}, {0.6F, 0.399995F, 0.0F, 0.0F}},
+        {{1, 0}, {0.500004F, 0.500004F}},
+        {{3, 0}, {0.999995F, 0.0F}},
+    };
+    cases.push_back(test);
+  }
   cases.push_back(Dense("plain", dense, {}, 11));
   cases.push_back(Dense("profile", 4096, kProfile, 12));
   {

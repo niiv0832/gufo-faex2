@@ -127,25 +127,35 @@ void CheckCase(const Case& test) {
            test.name + ": Sample does not draw p");
   }
 
-  double worst_identity = 0.0;
+  double worst_law = 0.0;
+  double worst_bound = 0.0;
   double worst_residual = 0.0;
   for (const DraftRow& draft : test.drafts) {
-    const double draft_sum = draft.Sum();
-    for (std::size_t slot = 0; slot < draft.ids.size(); ++slot) {
-      if (!(draft.probabilities[slot] > 0.0F))
-        continue;
-      const Token draft_token = draft.ids[slot];
-      const auto expected = sampled_oracle::Verify(target, draft, draft_token);
-      // The scheme emits p up to the mass q is short of one.
-      worst_identity = std::max(worst_identity, expected.identity_error);
-      Expect(expected.identity_error <= std::abs(1.0 - draft_sum) + 0x1.0p-50,
-             test.name + ": the reference scheme does not emit p");
-      // The production acceptance test reads this p; it is checked above.
-      Expect(
-          expected.acceptance ==
-              std::min(1.0, sampled_oracle::ProbabilityOf(target, draft_token) /
-                                draft.probabilities[slot]),
-          test.name + ": acceptance");
+    // The law of the emitted token: p, up to what the row is off one by.
+    const auto emitted = sampled_oracle::EmittedLaw(target, draft);
+    worst_law = std::max(worst_law, emitted.total_error);
+    worst_bound = std::max(worst_bound, emitted.bound);
+    Expect(emitted.total_error <= emitted.bound + 0x1.0p-48,
+           test.name + ": the emitted law is " +
+               std::to_string(emitted.total_error) + " from p, bound " +
+               std::to_string(emitted.bound));
+    // The draft policy proposes each candidate with the probability the
+    // reference derives from the reported row.
+    {
+      const auto proposed = sampled_oracle::ProposedProbabilities(draft);
+      const auto drawn = sampled_oracle::MeasureRuns(
+          sampled_oracle::RecoverRuns([&](double uniform) {
+            return static_cast<std::int64_t>(gufo::speculative::MtpSampleRow(
+                draft.ids, draft.probabilities, uniform));
+          }));
+      for (std::size_t slot = 0; slot < draft.ids.size(); ++slot) {
+        const auto found = drawn.length.find(draft.ids[slot]);
+        Expect(std::abs((found == drawn.length.end() ? 0.0 : found->second) -
+                        proposed[slot]) <= 0x1.0p-50,
+               test.name +
+                   ": a candidate is proposed with another "
+                   "probability than the reference derives");
+      }
     }
 
     // The residual does not depend on the draft token.
@@ -210,7 +220,7 @@ void CheckCase(const Case& test) {
   }
   std::cout << test.name << ",support=" << target.size()
             << ",drafts=" << test.drafts.size() << ",p_rel_err=" << worst_p
-            << ",identity_err=" << worst_identity
+            << ",law_err=" << worst_law << ",law_bound=" << worst_bound
             << ",residual_err=" << worst_residual << '\n';
 }
 
@@ -248,7 +258,8 @@ void CheckConstraintMask() {
            "mask: p of an allowed token");
   for (const DraftRow& draft : test.drafts) {
     const auto expected = sampled_oracle::Verify(target, draft, draft.ids[0]);
-    Expect(expected.identity_error <= 0x1.0p-50, "mask: identity");
+    Expect(sampled_oracle::EmittedLaw(target, draft).total_error <= 0x1.0p-48,
+           "mask: the emitted law");
     // The draft row is unconstrained: its forbidden tokens have p = 0, are
     // never accepted, and the residual stays inside the mask.
     Expect(sampled_oracle::ProbabilityOf(target, 0) == 0.0 &&
@@ -335,6 +346,26 @@ void CheckDraftPolicy() {
   }
 }
 
+// A row that sums to 1 + 8e-6, derived by hand. p = {1/2, 1/2} and both
+// candidates report q. The draw gives token 0 the interval [0, q) and token 1
+// what is left of [0, 1), 1 - q. Either is accepted with a = (1/2) / q; a
+// rejection, of probability 1 - a, emits p, as no residual remains. Hence
+//   P(0) = q a + (1 - a) / 2 = 1/2 + (1 - a) / 2.
+void CheckUnnormalizedRowByHand() {
+  const Case test = sampled_cases::Named("empty-residual");
+  const auto target =
+      sampled_oracle::TargetDistribution(test.logits, test.filters);
+  const double q = test.drafts[0].probabilities[0];
+  const double a = 0.5 / q;
+  const double by_hand = std::abs(((q * a) + ((1.0 - a) * 0.5)) - 0.5);
+  const double reference =
+      sampled_oracle::EmittedLaw(target, test.drafts[0]).max_error;
+  std::cout << "unnormalized-by-hand,law_err=" << by_hand
+            << ",reference_law_err=" << reference << '\n';
+  Expect(by_hand > 3e-6 && std::abs(reference - by_hand) <= 0x1.0p-50,
+         "the reference misstates the law of an unnormalized row");
+}
+
 // The generator the reference inverts is the one production draws from.
 void CheckRandomNumbers() {
   for (std::uint64_t seed :
@@ -386,6 +417,7 @@ void CheckRowValidation() {
 int main() {
   try {
     CheckRandomNumbers();
+    CheckUnnormalizedRowByHand();
     for (const Case& test : sampled_cases::All())
       CheckCase(test);
     CheckConstraintMask();
