@@ -8,8 +8,9 @@
 ответ, SSE и времена сохраняются до любой проверки.
 
 Каждая проверка — отдельный именованный gate со статусом PASS, FAIL,
-NOT_EXERCISED либо INHERITED_FAIL (сложное изображение, одинаково неверное у
-контрольного бинарника). В PASS не превращаются: невыполненное условие сценария,
+NOT_EXERCISED, INHERITED_FAIL (сложное изображение, одинаково неверное у
+контрольного бинарника) либо MODEL_LIMIT (неверный ответ модели после обрезанного
+на лимите рассуждения). В PASS не превращаются: невыполненное условие сценария,
 отсутствующая обязательная метрика, неподтверждённая сервером отмена.
 
     faex2_remediation.py check --base-url http://127.0.0.1:13346 --output NEW \
@@ -51,11 +52,17 @@ GROUPS = ("zero_prefill", "reasoning", "images", "images_complex", "drafts", "se
 SESSIONS = (("OWL_142", 17), ("MOON_853", 23), ("PINE_627", 29), ("LAKE_394", 31))
 ARCHIVE_RECORD = ("Архивная запись: в библиотеке проверили каталоги, расставили книги "
                   "по полкам и записали результат в журнал. Новых поручений нет.\n")
+DISK_LINES = 250      # ~19 токенов на строку: prompt дисковых gates заметно длиннее шага 2048.
+# Формат ответа задан явно: в первом окне модель отвечала блоком кода на «ответь только кодом».
+ASK = "\nНе пиши код и пояснения. Ответ — ровно одно слово: {}."
+# Рассуждение естественно длиннее 512 токенов (десятки проверок делимости), видимый ответ — одно
+# число. Простых чисел от 1000 до 1100 ровно 16: 1009, 1013, 1019, 1021, 1031, 1033, 1039, 1049,
+# 1051, 1061, 1063, 1069, 1087, 1091, 1093, 1097.
 REASONING_TASK = (
-    "Найди x из уравнения 3(x − 2) = 15. Перед ответом в рассуждении подробно, строка за "
-    "строкой, выпиши всю таблицу умножения от 1×1 до 12×12, затем реши уравнение и проверь "
-    "решение подстановкой. В видимом ответе напиши только число — значение x.")
-
+    "Сколько простых чисел в диапазоне от 1000 до 1100 включительно? Проверь делимость каждого "
+    "нечётного числа диапазона на простые числа до 31. Видимый ответ — только одно число, без слов "
+    "и пояснений.")
+REASONING_ANSWER = "16"
 
 class GateFail(Exception):
     def __init__(self, message, evidence=None):
@@ -69,6 +76,10 @@ class NotExercised(GateFail):
 
 class Recorded(GateFail):
     """Режим записи: ответ сохранён без оценки содержания (контрольный бинарник)."""
+
+
+class ModelLimit(GateFail):
+    """Сервер выполнил свою часть; неверен ответ модели после обрезанного рассуждения."""
 
 
 class Inherited(GateFail):
@@ -133,7 +144,9 @@ def reasoning_tokens(result):
 
 
 def plain(text):
-    return text.strip().rstrip(".").strip()
+    """Ответ без обрамления: пробелы, кавычки, завершающая точка. Блок кода обрамлением не считается."""
+    value = text.strip().strip("\"'«»").strip().rstrip(".").strip()
+    return value.strip("\"'«»").strip()
 
 
 def json_answer(result):
@@ -145,9 +158,11 @@ def json_answer(result):
 
 def product_case(nonce, tag, marker, factor, temperature, turns=0, long=False):
     """Независимая беседа с собственным маркером; (запрос, ожидаемый JSON либо None)."""
-    messages = [{"role": "system", "content": f"Независимая беседа {marker}, сеанс {nonce}-{tag}."}]
+    # Одно значение, которое надо вернуть дословно: в первом окне «идентификатор беседы» модель
+    # понимала то как имя беседы, то как номер сеанса из системного сообщения.
+    messages = [{"role": "system", "content": f"Маркер беседы: {marker}. Запись {nonce}-{tag}."}]
     for turn in range(turns):
-        messages += [{"role": "user", "content": f"Заметка {turn + 1} беседы {marker}.\n" + lines(6, marker)},
+        messages += [{"role": "user", "content": f"Заметка {turn + 1}.\n" + lines(6, marker)},
                      {"role": "assistant", "content": "Принято."}]
     if long:
         task = (f"Напиши двадцать предложений о порядке в библиотеке. Каждое предложение начинай "
@@ -155,11 +170,11 @@ def product_case(nonce, tag, marker, factor, temperature, turns=0, long=False):
         return chat(messages + [{"role": "user", "content": task}], temperature=temperature,
                     cache=False, max_tokens=400), None
     task = (f"Вычисли произведения числа {factor} на числа от 20 до 27 включительно. Верни только JSON "
-            "ровно с двумя полями: session — идентификатор этой беседы, products — восемь произведений "
-            "по порядку.")
+            f"ровно с двумя полями: marker — строка \"{marker}\" дословно, products — массив из восьми "
+            "произведений по порядку.")
     request = chat(messages + [{"role": "user", "content": task}], temperature=temperature, cache=False,
                    max_tokens=160, response_format={"type": "json_object"})
-    return request, {"session": marker, "products": [factor * value for value in range(20, 28)]}
+    return request, {"marker": marker, "products": [factor * value for value in range(20, 28)]}
 
 
 class ServerLog:
@@ -261,6 +276,7 @@ class Checks:
     def __init__(self, evidence, log, nonce, *, late_attempts=4, settle=15.0, control=None,
                  record_only=False):
         self.e, self.log, self.nonce, self.record_only = evidence, log, nonce, record_only
+        self.reasoning_answers, self.late_answers = {}, {}
         self.late_attempts, self.settle = late_attempts, settle
         self.control = control or {}
         self.gates = {}
@@ -281,6 +297,8 @@ class Checks:
             row.update(status="RECORDED", reason=str(error), evidence=error.evidence)
         except Inherited as error:
             row.update(status="INHERITED_FAIL", reason=str(error), evidence=error.evidence)
+        except ModelLimit as error:
+            row.update(status="MODEL_LIMIT", reason=str(error), evidence=error.evidence)
         except GateFail as error:
             row.update(status="FAIL", error=str(error), evidence=error.evidence)
         except Exception as error:  # Ошибка клиента — тоже отказ, не пропуск.
@@ -315,11 +333,11 @@ class Checks:
         return evidence
 
     # --- точное восстановление без чтения остатка ------------------------
-    def code_request(self, tag, content=None, code=None):
+    def code_request(self, tag, content=None, code=None, count=12):
         code = code or f"CODE_{tag.upper()}_{self.nonce}"
-        text = lines(12, tag) + f"\nОтветь только кодом {code}."
+        text = lines(count, tag) + ASK.format(code)
         user = [*content, {"type": "text", "text": text}] if content else text
-        return chat([self.system(tag), {"role": "user", "content": user}], max_tokens=32), code
+        return chat([self.system(tag), {"role": "user", "content": user}], max_tokens=48), code
 
     def exact_repeat(self, tag, request, code):
         """Холодный запрос и побайтно тот же повтор: весь prompt из RAM, prefill 0."""
@@ -342,8 +360,8 @@ class Checks:
         evidence.update(self.crosscheck(row, {"prefill_tokens": 0, "cached_tokens": total, "cache": "memory"}))
         return first, evidence
 
-    def continuation(self, tag):
-        request, code = self.code_request(tag)
+    def continuation(self, tag, count=12):
+        request, code = self.code_request(tag, count=count)
         first = done(self.e.send(tag + "-turn1", request))
         need(plain(first["text"]) == code, tag + ": wrong first answer", {"text": first["text"]})
         depth, _, _ = work(first)
@@ -351,7 +369,7 @@ class Checks:
         continued = deepcopy(request)
         continued["body"]["messages"] += [
             {"role": "assistant", "content": first["text"]},
-            {"role": "user", "content": f"Теперь ответь только кодом {second_code}."}]
+            {"role": "user", "content": "Следующий вопрос." + ASK.format(second_code)}]
         second = done(self.e.send(tag + "-turn2", continued))
         need(plain(second["text"]) == second_code, tag + ": wrong continuation answer",
              {"text": second["text"]})
@@ -400,65 +418,59 @@ class Checks:
         return evidence
 
     # --- диск: фаза до перезапуска ---------------------------------------
-    def branch_boundary(self, tag, request):
-        """Стабильная граница хода: её восстанавливает запрос, расходящийся после сообщения."""
-        probe = deepcopy(request)
-        probe["body"]["messages"] += [{"role": "assistant", "content": "Принято."},
-                                      {"role": "user", "content": "Ответь только словом ГОТОВО."}]
-        result = done(self.e.send(tag + "-boundary", probe))
-        _, cached, _ = work(result)
-        need(cached > 0, tag + ": stable boundary snapshot was not reused in RAM")
-        return cached
+    def published(self, offset, total, exact=False):
+        """Дождаться записи checkpoint этого prompt на диск и вернуть все записанные числа токенов.
 
-    def published(self, offset, boundaries):
-        """Ждать запись checkpoint на диск; без журнала публикация остаётся неподтверждённой."""
+        Какие именно границы пишутся, решает сервер (граница хода, сетка, шаг 2048): клиент их не
+        угадывает, а читает из журнала. Подходит checkpoint не дальше шага от конца prompt (при
+        exact — ровно полный prompt). Без журнала публикация остаётся неподтверждённой.
+        """
         if self.log.path is None:
             time.sleep(self.settle)
             return {"publication": "UNVERIFIED_NO_SERVER_LOG", "stored_tokens": None}
-        deadline = time.monotonic() + max(self.settle, 60)
+        deadline, quiet = time.monotonic() + max(self.settle, 60), min(self.settle, 2.0)
+        seen, since = None, time.monotonic()
         while True:
             stored = self.log.stored(offset)
-            if set(stored) & set(boundaries):
+            usable = [value for value in stored if value == total or not exact and 0 < total - value < GRID]
+            if stored != seen:
+                seen, since = stored, time.monotonic()
+            elif usable and time.monotonic() - since >= quiet:  # Запись идёт фоном: ждём, пока список стихнет.
                 return {"publication": "LOGGED", "stored_tokens": stored}
-            need(time.monotonic() < deadline, "no disk checkpoint was stored for the request",
-                 {"expected_any_of": boundaries, "stored_tokens": stored})
-            time.sleep(.25)
+            need(time.monotonic() < deadline, "no disk checkpoint near the end of the prompt was stored",
+                 {"prompt": total, "stored_tokens": stored})
+            time.sleep(.1)
 
     def disk_before(self, state_path):
-        state = {"version": 1, "nonce": self.nonce, "cases": {}}
+        state = {"version": 2, "nonce": self.nonce, "cases": {}}
 
         def single(tag, content=None):
             def run():
                 offset = self.log.size()
-                request, code = self.code_request(tag, content)
+                request, code = self.code_request(tag, content, count=DISK_LINES)
                 first, evidence = self.exact_repeat(tag, request, code)
                 total = work(first)[0]
-                boundary = self.branch_boundary(tag, request)
-                need(0 < total - boundary < GRID, tag + ": implausible stable boundary",
-                     {"prompt": total, "boundary": boundary})
-                publication = self.published(offset, [boundary])
+                need(total > GRID + 256, tag + ": prompt is not longer than the disk checkpoint step",
+                     {"prompt": total})
+                publication = self.published(offset, total)
                 state["cases"][tag] = {"request": request, "text": first["text"], "prompt_tokens": total,
-                                       "boundaries": [boundary], **publication}
-                return self.need_log({**evidence, "boundary": boundary, **publication})
+                                       **publication}
+                return self.need_log({**evidence, **publication})
             return run
-        note = ("подготовка дискового восстановления: холодный запрос, точный RAM-повтор, измерение "
-                "стабильной границы расходящимся запросом и ожидание записи checkpoint (журнал "
-                "event=disk_cache action=stored; без --server-log — NOT_EXERCISED). Сам по себе "
-                "перезапуск не доказывает.")
+        note = ("подготовка дискового восстановления: холодный запрос длиннее шага 2048, точный RAM-повтор и "
+                "ожидание записи checkpoint не дальше шага от конца prompt (журнал event=disk_cache "
+                "action=stored; без --server-log — NOT_EXERCISED). Сам по себе перезапуск не доказывает.")
         self.gate("disk_prepare_text", "Текст: " + note, single("dkt"))
         self.gate("disk_prepare_image", "Изображение: " + note, single("dki", [images.colour_image("blue")]))
 
         def conversation():
             offset = self.log.size()
-            first_request, _ = self.code_request("dkc")
-            continued, code, evidence = self.continuation("dkc")
-            first_boundary = self.branch_boundary("dkc-turn1", first_request)
-            second_boundary = self.branch_boundary("dkc-turn2", continued)
+            continued, code, evidence = self.continuation("dkc", DISK_LINES)
             total = evidence["turn2"]["prompt"]
-            publication = self.published(offset, [first_boundary, second_boundary])
-            state["cases"]["dkc"] = {"request": continued, "text": code, "prompt_tokens": total,
-                                     "boundaries": [first_boundary, second_boundary], **publication}
-            return self.need_log({**evidence, "boundaries": [first_boundary, second_boundary], **publication})
+            need(total > GRID + 256, "dkc: prompt is not longer than the disk checkpoint step", evidence)
+            publication = self.published(offset, total)
+            state["cases"]["dkc"] = {"request": continued, "text": code, "prompt_tokens": total, **publication}
+            return self.need_log({**evidence, **publication})
         self.gate("disk_prepare_continuation", "Продолжение диалога: " + note, conversation)
 
         def raw():
@@ -471,9 +483,9 @@ class Checks:
             if total > GRID:
                 raise NotExercised("raw prompt crossed the 2048-token grid: the complete prompt is not "
                                    "persisted by the minimum-step policy", {"prompt": total})
-            publication = self.published(offset, [total])
+            publication = self.published(offset, total, exact=True)
             state["cases"]["dkr"] = {"request": request, "text": result["text"], "prompt_tokens": total,
-                                     "boundaries": [total], **publication}
+                                     **publication}
             return self.need_log({"prompt": total, **publication})
         self.gate("disk_prepare_raw_completion",
                   "/v1/completions без шаблона чата: checkpoint снимается на полном prompt (нет изменяемой "
@@ -507,7 +519,7 @@ class Checks:
                 disk = cache_flags(result)[1]
                 logged = log["server_log"].get("cache") if isinstance(log["server_log"], dict) else None
                 evidence = {"prompt": total, "cached": cached, "prefill": prefill, "cache_disk_hit": disk,
-                            "boundaries": saved["boundaries"], "stored_tokens": saved.get("stored_tokens"),
+                            "stored_tokens": saved.get("stored_tokens"),
                             "publication": saved.get("publication"), **log}
                 need(total == saved["prompt_tokens"], tag + ": prompt token count changed", evidence)
                 need(disk is True or logged == "disk",
@@ -519,11 +531,13 @@ class Checks:
                         raise GateFail(tag + ": disk restore left a nonzero remainder",
                                        {**evidence, "observed": "RESTORE_WITH_REMAINDER"})
                     return self.need_log(evidence)
-                need(cached in saved["boundaries"], tag + ": restored at an unexpected boundary", evidence)
-                stored = [value for value in saved.get("stored_tokens") or [] if value <= total]
-                if stored:
-                    need(cached == max(stored), tag + ": not the longest stored checkpoint", evidence)
                 need(0 < prefill < GRID, tag + ": remainder outside the framing/step bound", evidence)
+                if saved.get("stored_tokens") is None:
+                    raise NotExercised("the before phase had no server log: the stored checkpoints are unknown",
+                                       evidence)
+                stored = [value for value in saved["stored_tokens"] if value <= total]
+                need(stored and cached == max(stored), tag + ": not restored at the longest stored checkpoint",
+                     evidence)
                 evidence["observed"] = "RESTORE_WITH_REMAINDER_BY_DESIGN"
                 return self.need_log(evidence)
             return run
@@ -531,8 +545,8 @@ class Checks:
                   "После перезапуска тот же /v1/completions: disk hit, cached == prompt, prefill == 0, тот же "
                   "текст. Единственный HTTP-путь, где диск хранит полный prompt; не покрывает шаблон чата.",
                   restore("dkr", True))
-        boundary = ("После перезапуска тот же запрос: disk hit, cached точно равен записанной стабильной "
-                    "границе (самый длинный сохранённый checkpoint), prefill == prompt − cached, 0 < prefill "
+        boundary = ("После перезапуска тот же запрос (prompt > 2048 + 256): disk hit, cached точно равен самому "
+                    "длинному checkpoint, записанному до перезапуска (числа из журнала), 0 < prefill "
                     "< 2048, тот же ответ. Это НЕ zero-prefill: полный prompt чата на диск не пишется "
                     "(continuation_disk_store.cpp, min_step), читается изменяемая разметка ассистента.")
         self.gate("disk_restore_boundary_text", "Текст. " + boundary, restore("dkt", False))
@@ -543,17 +557,18 @@ class Checks:
     # --- граница рассуждений ---------------------------------------------
     def reasoning_request(self, tag, temperature, stream, seed, budget=None):
         extra = {} if budget is None else {"reasoning_budget_tokens": budget}
+        # Запас: видимый ответ обязан завершиться сам (finish=stop), даже если модель многословна.
         return chat([self.system(tag), {"role": "user", "content": REASONING_TASK}],
                     temperature=temperature, seed=seed, cache=False, think=True, stream=stream,
-                    max_tokens=(budget or BUDGET) + 256, **extra)
+                    max_tokens=(budget or BUDGET) + 1024, **extra)
 
     def reasoned(self, row, stream):
+        """(reasoning_tokens, evidence, ответ верен): граница и верность ответа оцениваются раздельно."""
         result = done(row)
         count = reasoning_tokens(result)
-        evidence = {"reasoning_tokens": count, "text": result["text"], "finish": result["finish"],
+        evidence = {"reasoning_tokens": count, "text": result["text"][:400], "finish": result["finish"],
                     "completion_tokens": result["metrics"].get("completion_tokens")}
         need(result.get("reasoning", "").strip(), row["id"] + ": reasoning text absent", evidence)
-        need(plain(result["text"]) == "7", row["id"] + ": wrong answer after the reasoning", evidence)
         if stream:
             raw = self.e.raw_path(row["id"]).read_bytes()
             seen_content = False
@@ -563,7 +578,7 @@ class Checks:
                     need(not (seen_content and delta.get("reasoning_content")),
                          row["id"] + ": reasoning resumed after visible content", evidence)
                     seen_content |= bool(delta.get("content"))
-        return count, evidence
+        return count, evidence, plain(result["text"]) == REASONING_ANSWER
 
     def reasoning(self):
         for sampled in (False, True):
@@ -573,22 +588,40 @@ class Checks:
                 def run(sampled=sampled, stream=stream, name=name):
                     request = self.reasoning_request(name.replace("_", "-"), 1 if sampled else 0, stream,
                                                      91 if stream else 742)
-                    count, evidence = self.reasoned(self.e.send(name.replace("_", "-"), request, 300), stream)
+                    count, evidence, correct = self.reasoned(
+                        self.e.send(name.replace("_", "-"), request, 300), stream)
+                    self.reasoning_answers[name] = (count, evidence, correct)
                     need(count <= BUDGET, "reasoning exceeded the server budget", evidence)
                     if count < BUDGET:
                         raise NotExercised("reasoning ended before the 512-token budget", evidence)
                     return evidence
-                self.gate(name, "think on, лимит сервера 512: reasoning_tokens == 512 (достигнут и не "
-                          "превышен), затем непустой ответ «7», finish=stop, в потоке рассуждение не "
-                          "возобновляется после ответа. Рассуждение короче 512 — NOT_EXERCISED.", run)
+                self.gate(name, "Граница: think on, лимит сервера 512 — reasoning_tokens == 512 (достигнут и не "
+                          "превышен), затем непустой видимый ответ, finish=stop, в потоке рассуждение не "
+                          "возобновляется после ответа. Рассуждение короче 512 — NOT_EXERCISED. Верность "
+                          "ответа сюда не входит: её оценивает отдельный gate *_answer.", run)
+
+                def answer(name=name):
+                    if name not in self.reasoning_answers:
+                        raise NotExercised("the boundary request did not complete")
+                    count, evidence, correct = self.reasoning_answers[name]
+                    evidence = {**evidence, "expected": REASONING_ANSWER}
+                    if correct:
+                        return evidence
+                    if count >= BUDGET:
+                        raise ModelLimit("wrong answer after the reasoning was cut at the budget", evidence)
+                    raise GateFail("wrong answer although the reasoning was not cut", evidence)
+                self.gate(name + "_answer", "Верность ответа того же запроса: число простых от 1000 до 1100 "
+                          f"равно {REASONING_ANSWER}. Неверный ответ после обрезанного на лимите рассуждения — "
+                          "MODEL_LIMIT (ограничение модели, не PASS и не отказ сервера); неверный ответ при "
+                          "необрезанном рассуждении — FAIL.", answer)
 
         def isolation():
             wide = self.reasoning_request("rb-wide", 0, True, 742, budget=2048)
             narrow = self.reasoning_request("rb-narrow", 0, True, 742)
             rows = self.e.parallel([("rb-wide", wide), ("rb-narrow", narrow)], 420)
-            wide_count, wide_evidence = self.reasoned(rows[0], True)
-            narrow_count, narrow_evidence = self.reasoned(rows[1], True)
-            later_count, later_evidence = self.reasoned(self.e.send("rb-narrow-after", narrow, 300), True)
+            wide_count, wide_evidence, _ = self.reasoned(rows[0], True)
+            narrow_count, narrow_evidence, _ = self.reasoned(rows[1], True)
+            later_count, later_evidence, _ = self.reasoned(self.e.send("rb-narrow-after", narrow, 300), True)
             evidence = {"with_field_2048": wide_evidence, "neighbour": narrow_evidence,
                         "after": later_evidence}
             need(wide_count <= 2048 and narrow_count <= BUDGET and later_count <= BUDGET,
@@ -599,7 +632,8 @@ class Checks:
             return evidence
         self.gate("reasoning_budget_isolation",
                   "Запрос с reasoning_budget_tokens=2048 рассуждает дольше 512 (и не дольше 2048); "
-                  "одновременный и последующий запросы без поля остаются ровно на 512; ответы «7».",
+                  "одновременный и последующий запросы без поля остаются ровно на 512; каждый завершается "
+                  "непустым ответом и finish=stop. Верность ответов здесь не оценивается.",
                   isolation)
 
     # --- изображения ------------------------------------------------------
@@ -800,7 +834,7 @@ class Checks:
                 raise NotExercised("server-side cancellation is not confirmed by the server log", evidence)
             return evidence
         self.gate("sessions_after_cancel", "Один из четырёх диалогов отменён посреди ответа (журнал: "
-                  "finish=cancelled); остальные три во время отмены дают полный верный ответ (session и "
+                  "finish=cancelled); остальные три во время отмены дают полный верный ответ (marker и "
                   "все восемь произведений) без чужих маркеров; затем все четыре повторены так же. "
                   "Без подтверждения журналом — NOT_EXERCISED.", after_cancel)
 
@@ -869,17 +903,17 @@ class Checks:
     # --- поздний общий префикс (находка № 3) -----------------------------
     def late_requests(self, nonce, geometry, code):
         system = {"role": "system", "content":
-                  f"Сеанс {nonce}. Архив наблюдений. Отвечай только кодом, который просит пользователь.\n"
+                  f"Сеанс {nonce}. Архив наблюдений. Отвечай одним словом, которое просит пользователь.\n"
                   + lines(geometry["system_lines"], "общий")}
         body = lines(geometry["user_lines"], "лидер").splitlines()
-        ask = "\nОтветь только кодом {}."
+        ask = ASK
         leader = chat([system, {"role": "user", "content": "\n".join(body) + ask.format(code + "_L")}],
-                      max_tokens=12, return_progress=True)
+                      max_tokens=48, return_progress=True)
         follower = chat([system, {"role": "user", "content": lines(4, "хвост") + ask.format(code + "_F")}],
-                        max_tokens=12, return_progress=True)
+                        max_tokens=48, return_progress=True)
         edited = chat([system, {"role": "user", "content": "\n".join(
             body[:geometry["edit_line"]] + ["Запись изменена: проверка редактирования."])
-            + ask.format(code + "_E")}], max_tokens=12)
+            + ask.format(code + "_E")}], max_tokens=48)
         prefix = chat([system, {"role": "user", "content": "\n".join(body[:geometry["edit_line"]])}],
                       cache=False, max_tokens=1)
         stem = chat([system, {"role": "user", "content": "Z"}], cache=False, max_tokens=1)
@@ -966,9 +1000,14 @@ class Checks:
             follower_first = self.first_byte(f"{tag}-follower", 60)
         for thread in threads:
             thread.join()
-        leader = done(rows["leader"])
+        # Формат ответов — отдельная проверка (gate late_shared_prefix_answers): неудачный формат
+        # не должен обрывать сценарий до редактированного запроса, ради которого он ставится.
+        finished = ("stop", "length")
+        answers = self.late_answers.setdefault(tag, {})
+        leader = done(rows["leader"], finished)
         need(decoding is not None and leader_first is not None, tag + ": neighbour or leader did not start")
-        need(plain(leader["text"]) == code + "_L", tag + ": wrong leader answer", {"text": leader["text"]})
+        answers["leader"] = {"text": leader["text"][:80], "ok": plain(leader["text"]) == code + "_L"
+                             and leader["finish"] == "stop"}
         need(rows["neighbour"]["status"] == "PASS" and rows["neighbour"]["result"].get("text", "").strip(),
              tag + ": neighbour failed while the leader was read")
         total, cached, _ = work(leader)
@@ -979,9 +1018,9 @@ class Checks:
         need(total >= 3500, tag + ": leader prompt is shorter than 3500 tokens", evidence)
         exercised = False
         if delay is not None:
-            follower = done(rows["follower"])
-            need(plain(follower["text"]) == code + "_F", tag + ": wrong follower answer",
-                 {"text": follower["text"]})
+            follower = done(rows["follower"], finished)
+            answers["follower"] = {"text": follower["text"][:80], "ok": plain(follower["text"]) == code + "_F"
+                                   and follower["finish"] == "stop"}
             follower_total, follower_cached, follower_prefill = work(follower)  # Полный учёт токенов.
             queue_ms = follower["metrics"].get("queue_ms")
             evidence["follower"] = {"prompt": follower_total, "cached": follower_cached,
@@ -994,8 +1033,10 @@ class Checks:
                                       "follower_admitted_before_grid_s": grid_at - follower_first - queue_ms / 1000}
                 exercised = (cached == 0 and follower_first + queue_ms / 1000 < grid_at
                              and type(layered) in (int, float) and layered >= 2)
-        edited = done(self.e.send(f"{tag}-edited", requests["edited"]))
-        need(plain(edited["text"]) == code + "_E", tag + ": wrong edited answer", {"text": edited["text"]})
+        edited = done(self.e.send(f"{tag}-edited", requests["edited"]), finished)
+        answers["edited"] = {"text": edited["text"][:80], "ok": plain(edited["text"]) == code + "_E"
+                             and edited["finish"] == "stop"}
+        evidence["answers"] = answers
         edited_total, edited_cached, edited_prefill = work(edited)
         evidence["edited"] = {"prompt": edited_total, "cached": edited_cached, "prefill": edited_prefill}
         evidence["exercised"] = exercised
@@ -1024,11 +1065,25 @@ class Checks:
                   "Сосед декодирует; холодный лидер (>= 3500 токенов) читает; последователь с общим "
                   "префиксом ~1200 допущен до того, как лидер достиг сетки 2048 (по времени prompt_progress "
                   "лидера, queue_ms последователя, max_prefill_layer_groups >= 2). Затем редактированный "
-                  "запрос лидера: cached >= 2048, читается только хвост; ответы всех верны; у последователя "
-                  "cached + prefill == prompt. Контроль без последователя обязан дать то же. Условие по "
+                  "запрос лидера: cached >= 2048, читается только хвост; у последователя "
+                  "cached + prefill == prompt; все запросы завершены (формат и верность ответов — отдельный "
+                  "gate late_shared_prefix_answers). Контроль без последователя обязан дать то же. Условие по "
                   "времени не возникло за N попыток — NOT_EXERCISED. Внутреннее чередование слоёв по HTTP "
                   "не наблюдаемо: его детерминированно закрывает TestLayeredPrefillKeepsCheckpointAfterSharedArrival.",
                   run)
+
+        def answers():
+            if not self.late_answers:
+                raise NotExercised("the scenario did not reach any answer")
+            wrong = {f"{tag}-{name}": row["text"] for tag, rows in self.late_answers.items()
+                     for name, row in rows.items() if not row["ok"]}
+            need(not wrong, "wrong or malformed answers: " + ", ".join(sorted(wrong)),
+                 {"wrong": wrong, "answers": self.late_answers})
+            return {"answers": self.late_answers}
+        self.gate("late_shared_prefix_answers",
+                  "Ответы лидера, последователя и редактированного запроса во всех попытках — ровно "
+                  "запрошенное слово, finish=stop. Отделено от проверки кэша: формат ответа модели не "
+                  "должен скрывать либо подменять результат сценария checkpoint.", answers)
 
 
 def overall(gates):
@@ -1041,7 +1096,7 @@ def overall(gates):
         return "RECORDED" if statuses == {"RECORDED"} else "FAIL"
     if "NOT_EXERCISED" in statuses:
         return "INCOMPLETE"
-    return "KNOWN_FAILURES" if "INHERITED_FAIL" in statuses else "PASS"
+    return "KNOWN_FAILURES" if statuses & {"INHERITED_FAIL", "MODEL_LIMIT"} else "PASS"
 
 
 def control_answers(path):

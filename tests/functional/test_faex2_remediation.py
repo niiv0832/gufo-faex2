@@ -95,6 +95,7 @@ class GateTests(unittest.TestCase):
         self.assertEqual(exact["repeat"]["cached"], exact["repeat"]["prompt"])
         self.assertEqual(exact["server_log"]["cache"], "memory")
         self.assertEqual(report["gates"]["reasoning_512_sampled_sse"]["evidence"]["reasoning_tokens"], 512)
+        self.assertEqual(report["gates"]["reasoning_512_sampled_sse_answer"]["evidence"]["text"], "16")
         wide = report["gates"]["reasoning_budget_isolation"]["evidence"]
         self.assertEqual((wide["with_field_2048"]["reasoning_tokens"], wide["neighbour"]["reasoning_tokens"]),
                          (900, 512))
@@ -126,6 +127,21 @@ class GateTests(unittest.TestCase):
         self.assertEqual(attempt["follower"]["cached"] + attempt["follower"]["prefill"],
                          attempt["follower"]["prompt"])
         self.assertGreater(attempt["timing"]["follower_admitted_before_grid_s"], 0)
+        self.assertEqual(report["gates"]["late_shared_prefix_answers"]["status"], "PASS")
+        self.assertEqual(set(attempt["answers"]), {"leader", "follower", "edited"})
+
+    def test_malformed_follower_answer_does_not_stop_the_checkpoint_scenario(self):
+        # Первое окно: последователь ответил блоком кода и оборвался по лимиту — сценарий не дошёл
+        # до редактированного запроса. Теперь формат ответа — отдельный gate.
+        code, report, _ = self.bench(["follower_code_block"], pace=2).check("late_prefix")
+        gate = report["gates"]["late_shared_prefix"]
+        self.assertEqual(gate["status"], "PASS", gate)
+        attempt = gate["evidence"]["attempts"][-1]
+        self.assertEqual(attempt["edited"]["cached"], 2048)
+        self.assertFalse(attempt["answers"]["follower"]["ok"])
+        answers = report["gates"]["late_shared_prefix_answers"]
+        self.assertEqual((answers["status"], code), ("FAIL", 1))
+        self.assertIn("late-1-follower", answers["error"])
 
     def test_late_shared_prefix_without_the_race_is_not_exercised(self):
         # Чтение лидера короче запуска последователя: условие гонки не возникает.
@@ -150,7 +166,9 @@ class GateTests(unittest.TestCase):
             evidence = after["gates"]["disk_restore_boundary_" + name]["evidence"]
             self.assertEqual(evidence["observed"], "RESTORE_WITH_REMAINDER_BY_DESIGN")
             self.assertGreater(evidence["prefill"], 0)
-            self.assertIn(evidence["cached"], evidence["boundaries"])
+            self.assertGreater(evidence["prompt"], 2048 + 256)   # Длиннее шага дисковых checkpoint.
+            self.assertEqual(evidence["cached"],
+                             max(value for value in evidence["stored_tokens"] if value <= evidence["prompt"]))
             self.assertEqual(evidence["server_log"]["cache"], "disk")
 
     def test_after_phase_without_prepared_state_is_not_exercised(self):
@@ -221,12 +239,30 @@ class GateTests(unittest.TestCase):
                 self.assertIn(text, gate.get("error") or gate.get("reason"))
                 self.assertNotEqual(code, 0)
 
+    def test_wrong_answer_after_cut_reasoning_is_a_model_limit_not_a_boundary_failure(self):
+        code, report, _ = self.bench(["reasoning_wrong_answer"], pace=.3).check("reasoning")
+        statuses = self.statuses(report)
+        for name in ("reasoning_512_greedy_json", "reasoning_512_sampled_sse", "reasoning_budget_isolation"):
+            self.assertEqual(statuses[name], "PASS")          # Граница соблюдена…
+        for name in ("reasoning_512_greedy_json_answer", "reasoning_512_sampled_sse_answer"):
+            self.assertEqual(statuses[name], "MODEL_LIMIT")   # …а неверный ответ не смешан с ней и не PASS.
+        self.assertEqual((code, report["status"]), (2, "KNOWN_FAILURES"))
+        # Рассуждение не обрезано, а ответ неверен: это уже не ограничение обрезки.
+        _, report, _ = self.bench(["reasoning_wrong_answer", "reasoning_short"], pace=.3).check("reasoning")
+        statuses = self.statuses(report)
+        self.assertEqual((statuses["reasoning_512_greedy_sse"], statuses["reasoning_512_greedy_sse_answer"]),
+                         ("NOT_EXERCISED", "FAIL"))
+        # Запрос не завершился: ответ оценивать не по чему.
+        _, report, _ = self.bench(["empty_after_reasoning"], pace=.3).check("reasoning")
+        self.assertEqual(self.statuses(report)["reasoning_512_greedy_sse_answer"], "NOT_EXERCISED")
+
     def test_request_budget_leaking_into_a_neighbour_fails(self):
         _, report, _ = self.bench(["budget_leak"], pace=.3).check("reasoning")
         gate = report["gates"]["reasoning_budget_isolation"]
-        # Сосед без поля получил чужой лимит: рассуждение не уместилось в его max_completion_tokens.
+        # Сосед без поля получил чужой лимит.
         self.assertEqual(gate["status"], "FAIL", gate)
-        self.assertIn("rb-narrow", gate["error"])
+        self.assertIn("budget was exceeded", gate["error"])
+        self.assertGreater(gate["evidence"]["after"]["reasoning_tokens"], 512)
 
     def test_draft_defects(self):
         for defect, expected in (("no_drafts", {"drafts_c1_sampled": "FAIL", "drafts_c4_greedy": "FAIL"}),
@@ -422,7 +458,7 @@ class GateTests(unittest.TestCase):
 
     def compose(self, defects=(), log=True, extra=()):
         bench = self.bench(defects, pace=.05)
-        argv = ["--duration", "1", "--allow-short", "--records", "6400", *extra]
+        argv = ["--duration", "1", "--allow-short", "--records", "2136", *extra]
         if log:
             argv += ["--server-log", str(bench.log)]
         code, output = self.run_command(bench, "compose", *argv)
@@ -483,12 +519,28 @@ class GateTests(unittest.TestCase):
 
 
 class PureTests(unittest.TestCase):
+    def test_tasks_state_one_unambiguous_answer(self):
+        request, expected = remediation.product_case("n1", "drafts-c1", "OWL_142", 17, 0, turns=2)
+        text = json.dumps(request["body"]["messages"], ensure_ascii=False)
+        self.assertEqual(expected, {"marker": "OWL_142", "products": [340, 357, 374, 391, 408, 425, 442, 459]})
+        # В первом окне модель возвращала то имя беседы, то номер сеанса из системного сообщения.
+        self.assertNotIn("идентификатор", text)
+        self.assertNotIn("сеанс", text.lower())
+        self.assertIn('marker — строка \\"OWL_142\\" дословно', text)
+        self.assertEqual(remediation.plain(' "CODE_X". '), "CODE_X")
+        self.assertNotEqual(remediation.plain('```python\nCODE_X = 1'), "CODE_X")
+        self.assertIn("ровно одно слово", remediation.ASK)
+        self.assertEqual(remediation.REASONING_ANSWER, str(sum(
+            all(number % divisor for divisor in range(2, 32)) for number in range(1000, 1101))))
+
     def test_overall_status_never_promotes_unexercised_or_inherited(self):
         def gates(*statuses):
             return {str(index): {"status": status} for index, status in enumerate(statuses)}
         self.assertEqual(remediation.overall(gates("PASS", "PASS")), "PASS")
         self.assertEqual(remediation.overall(gates("PASS", "NOT_EXERCISED")), "INCOMPLETE")
         self.assertEqual(remediation.overall(gates("PASS", "INHERITED_FAIL")), "KNOWN_FAILURES")
+        self.assertEqual(remediation.overall(gates("PASS", "MODEL_LIMIT")), "KNOWN_FAILURES")
+        self.assertEqual(remediation.overall(gates("FAIL", "MODEL_LIMIT")), "FAIL")
         self.assertEqual(remediation.overall(gates("NOT_EXERCISED", "INHERITED_FAIL")), "INCOMPLETE")
         self.assertEqual(remediation.overall(gates("PASS", "NOT_EXERCISED", "FAIL")), "FAIL")
         self.assertEqual(remediation.overall(gates("PASS", "RUNNING")), "FAIL")
@@ -516,6 +568,28 @@ class PureTests(unittest.TestCase):
             self.assertIsNone(log.completed("r70", timeout=0))
             self.assertEqual(log.stored(0), [259])
             self.assertEqual(log.stored(path.stat().st_size), [])
+            # Строки настоящего журнала первого окна (сокращены только хвосты).
+            path.write_text(
+                "2026-11-13 20:22:34 [INFO] [http] request=r20 event=received method=POST "
+                "path=/v1/chat/completions body_bytes=1272\n"
+                "2026-11-13 20:22:34 [WARN] [http] request=r20 event=completed method=POST "
+                "path=/v1/chat/completions status=200 duration_ms=259.2 outcome=disconnected prompt_tokens=146 "
+                "prefill_tokens=146 generated_tokens=5 finish=cancelled cache=miss cached_tokens=0 "
+                "cache_restore_ms=0.0 queue_depth=1 resident_at_admission=1 queue_ms=4.3 batch_width=1\n"
+                "2026-11-13 20:21:29 [INFO] [http] request=r3 event=completed method=POST "
+                "path=/v1/chat/completions status=200 duration_ms=128.7 outcome=completed prompt_tokens=300 "
+                "prefill_tokens=0 generated_tokens=11 finish=stop cache=memory cached_tokens=300 batch_width=1\n"
+                "2026-11-13 20:21:28 [INFO] [cache] event=disk_cache_configured capacity_bytes=68719476736\n"
+                "2026-11-13 20:21:28 [INFO] [cache] event=disk_cache action=stored reason=saved "
+                "file_bytes=74449391 payload_bytes=74447141 tokens=293 retained_bytes=74449391 write_ms=58.2901\n"
+                "2026-11-13 20:21:28 [INFO] [cache] event=disk_cache action=skipped reason=min_step file_bytes=0 "
+                "payload_bytes=0 tokens=300 retained_bytes=74449391\n")
+            cancelled, repeated = log.completed("r20", timeout=0), log.completed("r3", timeout=0)
+            self.assertEqual((cancelled["finish"], cancelled["outcome"]), ("cancelled", "disconnected"))
+            self.assertEqual((repeated["cache"], repeated["cached_tokens"], repeated["prefill_tokens"]),
+                             ("memory", "300", "0"))
+            self.assertIsNone(log.completed("r2", timeout=0))
+            self.assertEqual(log.stored(0), [293])
         self.assertIsNone(remediation.ServerLog(None).completed("r7", timeout=0))
 
     def test_complex_images_are_deterministic_png_with_exact_goldens(self):

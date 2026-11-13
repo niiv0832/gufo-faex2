@@ -64,6 +64,8 @@ class Fake:
 
     # --- журнал и кэш ---------------------------------------------------
     def log(self, line):
+        # Формат настоящего журнала: время, уровень и подсистема перед полями key=value.
+        line = time.strftime("%Y-%m-%d %H:%M:%S") + " [INFO] [fake] " + line
         with self.lock:
             if self.log_path:
                 with open(self.log_path, "a") as output:
@@ -126,7 +128,8 @@ class Fake:
             for part in parts:
                 if part.get("type") in ("text", "input_text", "output_text"):
                     text += part["text"] + " "
-                    tokens.extend(part["text"].split())
+                    # Около трёх токенов на слово, как у настоящего токенизатора на русском тексте.
+                    tokens.extend(piece for word in part["text"].split() for piece in (word, word + "+", word + "++"))
                 elif part.get("type") == "image_url":
                     url = part["image_url"]["url"]
                     urls.append(url)
@@ -150,7 +153,7 @@ class Fake:
             for (known, question), expected in self.answers.items():
                 if known == sha and question in last:
                     return "NO" if "image_wrong" in self.defects else expected
-            codes = re.findall(r"ответь только кодом (\S+?)\.", last, re.IGNORECASE)
+            codes = re.findall(r"(?:ответь только кодом|ровно одно слово:) (\S+?)\.", last, re.IGNORECASE)
             if codes:
                 return codes[-1]
             names = [COLOURS.get(first_pixel(url), "white") for url in urls]
@@ -164,22 +167,24 @@ class Fake:
             return ",".join(names)
         factor = re.search(r"произведения числа (\d+)", last)
         if factor:
-            marker = re.search(r"беседа (\w+)", system).group(1)
+            marker = re.search(r"Маркер беседы: (\w+)", system).group(1)
             if "cross_talk" in self.defects:
                 marker = "MOON_853" if marker != "MOON_853" else "OWL_142"
             products = [int(factor.group(1)) * value for value in range(20, 28)]
             if "zero_products_during_cancel" in self.defects and "ses-c" in system:
                 products = [0] * 8
-            return json.dumps({"session": marker, "products": products})
+            # Как настоящая модель: JSON с отступами, поле marker дословно.
+            return json.dumps({"marker": marker, "products": products}, indent=2)
         if "ключ" in last.lower() and "JSON" in last:
             history = " ".join(text for _, text in texts)
             return json.dumps({name: re.search(rf"Ключ {name} = (\S+)", history).group(1)
                                for name in ("start", "middle", "end")}, ensure_ascii=False)
-        codes = re.findall(r"ответь только (?:кодом|словом) (\S+?)\.", last, re.IGNORECASE)
+        codes = re.findall(r"(?:ответь только (?:кодом|словом)|ровно одно слово:) (\S+?)\.", last,
+                           re.IGNORECASE)
         if codes:
             return codes[-1]
-        if "уравнения" in last:
-            return "7"
+        if "простых чисел" in last:
+            return "15" if "reasoning_wrong_answer" in self.defects else "16"
         if "17 × 23" in last:
             return "391"
         if "7 умножить на 8" in last:
@@ -383,6 +388,9 @@ def handler(fake):
                 text = ""
             else:
                 text = fake.answer(body, texts, pictures)
+                if follower and "follower_code_block" in fake.defects:
+                    # Поведение из первого окна: блок кода вместо одного слова, обрыв по лимиту.
+                    text = "```python\n" + text + ' = "011, 048, 085, 122, 159, 196, 233, 270, 307, 344, 381"'
             reasoning = self.reasoning_tokens(body)
             if reasoning and "empty_after_reasoning" in fake.defects:
                 text = ""
