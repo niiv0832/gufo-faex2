@@ -195,6 +195,7 @@ class Proxy(http.server.BaseHTTPRequestHandler):
                         row["usage"] = event["usage"]
                     if event.get("response", {}).get("usage"):
                         row["usage"] = event["response"]["usage"]
+            validate_stream_completion(self.path, json.loads(body), b"".join(chunks))
             row["metrics"], row["output_sha256"] = summarize(
                 parts, json.loads(body).get("stream", False), True,
                 (self.path, json.loads(body), response.status))
@@ -223,6 +224,53 @@ def require_assertions():
     """Every check here is an assert statement: an optimized run would pass everything."""
     if sys.flags.optimize:
         raise SystemExit("run without -O and PYTHONOPTIMIZE: the checks are assert statements")
+
+
+def validate_stream_completion(path, body, raw):
+    """Agent streams must terminate on wire, not merely close their HTTP socket.
+
+    Chat uses a terminal choice, usage, then DONE; Responses uses its terminal
+    lifecycle event and never DONE. Shared summarize already checks the wider
+    schema/timing contract, but intentionally does not require the DONE marker.
+    """
+    require_assertions()
+    if not body.get("stream"):
+        return None
+    records = [line[5:].strip() for line in raw.splitlines() if line.startswith(b"data:")]
+    responses = path == "/v1/responses"
+    if responses:
+        assert records and b"[DONE]" not in records, "Responses stream has missing/unexpected terminal event"
+    else:
+        assert records and records[-1] == b"[DONE]" and records.count(b"[DONE]") == 1, \
+            "stream missing terminal DONE or has events after DONE"
+        records = records[:-1]
+    events = [json.loads(record) for record in records]
+    assert events and all(isinstance(event, dict) and not event.get("error") for event in events), \
+        "empty stream or server error event"
+    if responses:
+        terminal = events[-1]
+        response = terminal.get("response", {})
+        assert terminal.get("type") in ("response.completed", "response.incomplete") \
+            and terminal["type"] == "response." + response.get("status", "") \
+            and not response.get("error"), "missing terminal Responses output"
+        usage = response.get("usage")
+        names = ("input_tokens", "output_tokens")
+    else:
+        finishes = {}
+        for event in events:
+            for choice in event.get("choices", []):
+                index = choice.get("index", 0)
+                assert index not in finishes or finishes[index] is None, "choice after terminal finish"
+                finishes[index] = choice.get("finish_reason")
+        assert finishes and all(reason in ("stop", "length", "tool_calls", "content_filter", "function_call")
+                                for reason in finishes.values()), "missing terminal choice"
+        usage = events[-1].get("usage")
+        names = ("prompt_tokens", "completion_tokens")
+    assert isinstance(usage, dict) and usage, "missing terminal usage"
+    assert all(type(usage.get(name)) is int and usage[name] > 0 for name in names), "invalid terminal token counts"
+    assert type(usage.get("total_tokens")) is int \
+        and usage["total_tokens"] == sum(usage[name] for name in names), "inconsistent terminal usage total"
+    return usage
 
 
 def messages(path):
@@ -521,6 +569,8 @@ def main():
     parser.add_argument("--sampling", type=json.loads, default={}, help="Optional request overrides as JSON; otherwise server defaults")
     args = parser.parse_args()
     require_assertions()
+    if args.passes <= 0:
+        parser.error("--passes must be positive: an empty acceptance run cannot pass")
     upstream = urllib.parse.urlsplit(args.base_url)
     assert upstream.scheme == "http" and upstream.hostname in {"127.0.0.1", "localhost", "::1"}, "Loopback Gufo only"
     assert not args.output.exists(), "Use a fresh output directory; preserve previous evidence"

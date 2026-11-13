@@ -516,6 +516,16 @@ OpenCode слушает случайный loopback-порт; перед пер�
 сохраняется рядом с сырыми запросами. Такие результаты относятся к OpenCode;
 они не подменяют неисполненный сценарий `pi_agent.py`.
 
+В обоих агентских harness `--passes` должен быть положительным: пустой прогон
+не считается приёмкой.
+Сбор `--version` тоже использует отдельные HOME/XDG/config/cwd при `--isolated`,
+ограничен таймаутом и требует непустой версии с exit 0. Каждый foreground
+проверяется после финализации HTTP: Chat требует terminal choice, итоговый
+usage и единственный завершающий `[DONE]`; Responses использует свой terminal
+event без `[DONE]`. EOF без завершения, событие ошибки и отсутствующий usage —
+отказ. Общий Recorder проверяет этот wire-контракт и для Pi. Исключение остаётся
+только для распознанного отменённого фонового title OpenCode; timeout не исключается.
+
 Cache checks use real assistant replies and run cold controls after the warm
 history, so the controls cannot hide a missed checkpoint. `cache-edits` checks
 latest-message edits, shortened tool results and rewinds. `cache-growth` checks

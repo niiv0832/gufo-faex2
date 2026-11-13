@@ -80,7 +80,9 @@
     "linux_guard_scope": "Затронутый CPU-тест qwen_numerical_overrides_test, без заявления о новом GPU/model PASS.",
     "agent_harness_cpu_tests": {
       "status": "PASS",
-      "tests": 39
+      "tests": 44,
+      "scope": "Последний усиленный валидатор после реальных прогонов на 5ac224cd; эти изменения не меняют движок и не являются новым модельным прогоном.",
+      "log_ref": ".local/remed-20261113/codex-closeout/final-harness-green.log"
     },
     "composition_harness_cpu_tests": {
       "status": "PASS",
@@ -159,7 +161,19 @@
       "required_load_seconds_after_warmup": 3600
     },
     "api_and_disk_recovery_on_this_binary": "PENDING",
-    "deployment_and_rollback_rehearsal": "PENDING"
+    "deployment_and_rollback_rehearsal": "PENDING",
+    "opencode_stricter_validator_replay": {
+      "status": "PASS_OFFLINE",
+      "cases": 8,
+      "foreground_requests": 28,
+      "new_api_requests": 0,
+      "review_ref": ".local/remed-20261113/codex-closeout/final-harness-offline-replay.json",
+      "source_file_sha256": {
+        "tests/functional/opencode_agent.py": "3677959a13b6e019d6d00e1aba01a9b7f48bcc21b297d4719f1318fdad972e82",
+        "tests/functional/pi_agent.py": "0febc5ce4fafdf482494e025d1272b51504cf4094639b72d66e69ad6b3e34a92",
+        "tests/functional/test_faex2_agents.py": "ec5fa248272f7278cb077c0417d750bb92e7379c2503f8c06af6a2112815a9fe"
+      }
+    }
   },
   "previous_candidate_evidence": {
     "source_sha": "feae3fc66032f7b1d3760fddb238d7ea7e386c7c",

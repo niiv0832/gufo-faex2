@@ -34,7 +34,18 @@ def chat_body(*steps):
              "function": {"name": name, "arguments": json.dumps(arguments)}}]})
         if result is not None:
             messages.append({"role": "tool", "tool_call_id": f"call{index}", "content": result})
-    return {"messages": messages, "tools": [{"type": "function", "function": {"name": "bash"}}]}
+    return {"stream": True, "messages": messages,
+            "tools": [{"type": "function", "function": {"name": "bash"}}]}
+
+
+STREAM_USAGE = {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12,
+                "cached_tokens": 5}
+
+
+def complete_stream(content="ok"):
+    events = [{"choices": [{"index": 0, "delta": {"content": content}, "finish_reason": "stop"}]},
+              {"choices": [], "usage": STREAM_USAGE}]
+    return "".join("data: " + json.dumps(event) + "\n\n" for event in events) + "data: [DONE]\n\n"
 
 
 class OpenCodeResults(unittest.TestCase):
@@ -87,10 +98,10 @@ class OpenCodeResults(unittest.TestCase):
             agent = chat_body(("shell", {"command": "cat hello.txt"}, "bonjour"))
             for index, body in enumerate((title, agent)):
                 (output / f"request-{index:04d}.json").write_text(json.dumps(body))
-                (output / f"request-{index:04d}.sse").write_text("data: [DONE]\n")
+                (output / f"request-{index:04d}.sse").write_text(complete_stream())
             cancelled = {"index": 0, "status": 200, "finalized": True,
                          "error": "BrokenPipeError(32, 'Broken pipe')"}
-            completed = {"index": 1, "status": 200, "finalized": True}
+            completed = {"index": 1, "status": 200, "finalized": True, "usage": STREAM_USAGE}
             self.assertEqual(opencode_agent.validate_requests([cancelled, completed], output), [completed])
             for rows in ([{**cancelled, "status": 500}, completed],
                          [{**cancelled, "error": "TimeoutError()"}, completed],
@@ -101,21 +112,20 @@ class OpenCodeResults(unittest.TestCase):
     def test_no_tools_foreground_is_not_mistaken_for_background_title(self):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory)
-            native = {"messages": [{"role": "user", "content": "task"}], "tools": [
+            native = {"stream": True, "messages": [{"role": "user", "content": "task"}], "tools": [
                 {"type": "function", "function": {"name": "catalog_" + tool["name"],
                  "parameters": tool["inputSchema"]}} for tool in opencode_agent.MCP_TOOLS]}
-            missing_tools = {"messages": [{"role": "user", "content": "finish task"}]}
+            missing_tools = {"stream": True, "messages": [{"role": "user", "content": "finish task"}]}
             for index, body in enumerate((native, missing_tools)):
                 (output / f"request-{index:04d}.json").write_text(json.dumps(body))
-                (output / f"request-{index:04d}.sse").write_text("data: [DONE]\n")
+                (output / f"request-{index:04d}.sse").write_text(complete_stream())
             rows = [{"index": index, "status": 200, "finalized": True,
-                     "usage": {"prompt_tokens": 10, "cached_tokens": 5},
+                     "usage": STREAM_USAGE,
                      "metrics": {"prefill_tokens": 5}} for index in range(2)]
             self.assertEqual(opencode_agent.validate_requests(rows[:1], output, native_mcp=True), rows[:1])
             with self.assertRaisesRegex(AssertionError, "native MCP tool missing"):
                 opencode_agent.validate_requests(rows, output, native_mcp=True)
-            (output / "request-0001.sse").write_text('data: {"choices":[{"delta":{"content":'
-                                                   '"<invoke forbidden framing"}}]}\n')
+            (output / "request-0001.sse").write_text(complete_stream("<invoke forbidden framing"))
             with self.assertRaisesRegex(AssertionError, "framing reached content"):
                 opencode_agent.validate_requests(rows, output)
 
@@ -131,6 +141,50 @@ class OpenCodeResults(unittest.TestCase):
             row.update(finalized=True, wall_ms=10, error="TimeoutError('late upstream error')")
             with self.assertRaises(AssertionError):
                 opencode_agent.validate_requests([row], output)
+
+    def test_completed_first_turn_requires_done_terminal_choice_and_usage(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            (output / "request-0000.json").write_text(json.dumps(chat_body()))
+            stream = output / "request-0000.sse"
+            row = {"index": 0, "status": 200, "finalized": True, "usage": STREAM_USAGE}
+            good = complete_stream()
+            stream.write_text(good)
+            self.assertEqual(opencode_agent.validate_requests([row], output), [row])
+            for name, raw in (
+                    ("empty", ""),
+                    ("missing DONE", good.replace("data: [DONE]\n\n", "")),
+                    ("duplicate DONE", good + "data: [DONE]\n\n"),
+                    ("event after DONE", good + 'data: {}\n\n'),
+                    ("missing usage", good.split('data: {"choices": [],')[0] + "data: [DONE]\n\n"),
+                    ("missing terminal choice", good.replace('"finish_reason": "stop"', '"finish_reason": null')),
+                    ("server error", good.replace("data: [DONE]", 'data: {"error":{"message":"late error"}}\n\ndata: [DONE]'))):
+                with self.subTest(name=name), self.assertRaises(AssertionError):
+                    stream.write_text(raw)
+                    opencode_agent.validate_requests([row], output)
+            stream.write_text(good)
+            for usage in (None, {}, {**STREAM_USAGE, "completion_tokens": 1}):
+                with self.subTest(usage=usage), self.assertRaises(AssertionError):
+                    opencode_agent.validate_requests([{**row, "usage": usage}], output)
+
+    def test_shared_stream_completion_distinguishes_responses_from_chat(self):
+        usage = {"input_tokens": 10, "output_tokens": 2, "total_tokens": 12}
+        encode = lambda event: ("data: " + json.dumps(event) + "\n\n").encode()
+        for status in ("completed", "incomplete"):
+            terminal = {"type": "response." + status, "response": {"status": status, "usage": usage}}
+            if status == "incomplete":
+                terminal["response"]["incomplete_details"] = {"reason": "max_output_tokens"}
+            with self.subTest(status=status):
+                self.assertEqual(pi_agent.validate_stream_completion(
+                    "/v1/responses", {"stream": True}, encode(terminal)), usage)
+        for label, broken in (
+                ("unexpected DONE", encode(terminal) + b"data: [DONE]\n\n"),
+                ("no terminal", encode({"type": "response.created"})),
+                ("failed", encode({"type": "response.failed", "response": {"status": "failed", "usage": usage}})),
+                ("status mismatch", encode({"type": "response.completed", "response": {"status": "incomplete", "usage": usage}})),
+                ("missing usage", encode({"type": "response.completed", "response": {"status": "completed"}}))):
+            with self.subTest(label=label), self.assertRaises(AssertionError):
+                pi_agent.validate_stream_completion("/v1/responses", {"stream": True}, broken)
 
     def test_edit_task_needs_original_source_and_passing_run(self):
         good = self.history(("read", {"filePath": "calc.py"}, "00001| def add(a, b):\n00002|     return a - b"),
@@ -321,10 +375,10 @@ class OpenCodeVersion(unittest.TestCase):
         self.executable.write_text(f"#!{sys.executable}\n" + body)
         self.executable.chmod(0o755)
 
-    def run_main(self):
+    def run_main(self, passes=1):
         argv = ["opencode_agent.py", "--base-url", "http://127.0.0.1:1", "--model", "test",
                 "--opencode", str(self.executable), "--output", str(self.output),
-                "--isolated", "--passes", "0"]
+                "--isolated", "--passes", str(passes), "--case", "tools"]
         with unittest.mock.patch.object(sys, "argv", argv):
             return opencode_agent.main()
 
@@ -346,7 +400,8 @@ assert all(Path(os.environ[name]).is_relative_to(cwd) for name in
 print('2.2.5')
 """)
         with unittest.mock.patch.dict(os.environ, {"HOME": str(self.root), "OPENAI_API_KEY": "canary"}), \
-                unittest.mock.patch.object(opencode_agent, "Recorder") as recorder:
+                unittest.mock.patch.object(opencode_agent, "Recorder") as recorder, \
+                unittest.mock.patch.object(opencode_agent, "run_case", return_value={"case": "00-tools", "status": "pass"}):
             with self.assertRaises(SystemExit) as exited:
                 self.run_main()
         self.assertEqual(exited.exception.code, 0)
@@ -354,6 +409,19 @@ print('2.2.5')
         self.assertEqual(metadata["version"], "2.2.5")
         self.assertEqual(metadata["returncode"], 0)
         recorder.assert_called_once()
+
+    def test_main_rejects_nonpositive_passes_before_any_probe_or_recorder(self):
+        for passes in (0, -1):
+            self.output = self.root / f"results-{passes}"
+            with self.subTest(passes=passes), \
+                    unittest.mock.patch.object(opencode_agent, "probe_version") as version, \
+                    unittest.mock.patch.object(opencode_agent, "Recorder") as recorder:
+                with self.assertRaises(SystemExit) as exited:
+                    self.run_main(passes)
+                self.assertEqual(exited.exception.code, 2)
+                version.assert_not_called()
+                recorder.assert_not_called()
+                self.assertFalse(self.output.exists())
 
     def test_main_rejects_empty_or_failed_version_before_starting_recorder(self):
         for body, code in (("", 0), ("print('2.2.5')\nraise SystemExit(23)\n", 23)):
@@ -366,6 +434,22 @@ print('2.2.5')
                     recorder.assert_not_called()
                 metadata = json.loads((self.output / "opencode-version.json").read_text())
                 self.assertEqual(metadata["returncode"], code)
+
+    def test_pi_main_rejects_nonpositive_passes_with_explicit_case(self):
+        for passes in (0, -1):
+            output = self.root / f"pi-results-{passes}"
+            argv = ["pi_agent.py", "--base-url", "http://127.0.0.1:1", "--pi", "/unused/pi",
+                    "--model", "test", "--output", str(output), "--server-log", str(self.root / "server.log"),
+                    "--case", "simple", "--passes", str(passes)]
+            with self.subTest(passes=passes), unittest.mock.patch.object(sys, "argv", argv), \
+                    unittest.mock.patch.object(pi_agent.subprocess, "check_output", return_value="0.87.0") as version, \
+                    unittest.mock.patch.object(pi_agent, "Recorder") as recorder:
+                with self.assertRaises(SystemExit) as exited:
+                    pi_agent.main()
+                self.assertEqual(exited.exception.code, 2)
+                version.assert_not_called()
+                recorder.assert_not_called()
+                self.assertFalse(output.exists())
 
     def test_version_timeout_is_bounded_and_retains_failure_artifacts(self):
         self.output.mkdir()
@@ -401,7 +485,8 @@ class RecorderCompletion(unittest.TestCase):
                 self.send_header("Content-Type", "text/event-stream")
                 self.send_header("Connection", "close")
                 self.end_headers()
-                self.wfile.write(b'data: {"choices":[{"delta":{"content":"title"}}]}\n\n')
+                self.wfile.write(getattr(self.server, "payload",
+                                        b'data: {"choices":[{"delta":{"content":"title"}}]}\n\n'))
                 self.wfile.flush()
                 release.wait(3)
 
@@ -467,6 +552,18 @@ class RecorderCompletion(unittest.TestCase):
         timeout_error = rows[0]["error"]
         live["error"] = "later mutation"
         self.assertEqual(rows[0]["error"], timeout_error)  # Report owns an immutable snapshot.
+
+    def test_proxy_rejects_http_eof_without_done_even_after_terminal_usage(self):
+        self.upstream.payload = complete_stream().replace("data: [DONE]\n\n", "").encode()
+        self.release.set()
+        self.post("eof")
+        rows, report = self.recorder.drain_case("eof", timeout=1)
+        self.assertTrue(report["complete"])
+        self.assertEqual(rows[0]["status"], 200)
+        self.assertTrue(rows[0]["finalized"])
+        self.assertEqual(rows[0]["usage"], STREAM_USAGE)
+        self.assertIn("missing terminal DONE", rows[0]["error"])
+        self.assertEqual((self.output / "request-0000.sse").read_bytes(), self.upstream.payload)
 
     def test_bounded_drain_aborts_only_the_current_case_and_cannot_pass(self):
         one = self.post("one")

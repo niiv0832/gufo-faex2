@@ -29,7 +29,7 @@ import sys
 import time
 from urllib.parse import urlsplit
 
-from pi_agent import Recorder, save
+from pi_agent import Recorder, save, validate_stream_completion
 from tool_native import NEIGHBORS
 
 # Tags that are only framing. A turn that leaks one also stores it in the
@@ -199,6 +199,9 @@ def validate_requests(rows, output, *, native_mcp=False):
         assert row.get("status") == 200 and (not row.get("error") or cancelled_title), row
         if title:
             continue  # opencode's title request has its own prompt
+        usage = validate_stream_completion(row.get("path", "/v1/chat/completions"), body,
+                                           (output / f"request-{row['index']:04d}.sse").read_bytes())
+        assert usage and row.get("usage") == usage, ("missing/inconsistent recorded terminal usage", row)
         if native_mcp:
             validate_native_mcp(body)
         content, calls = sse_output(output / f"request-{row['index']:04d}.sse")
@@ -593,6 +596,8 @@ def main():
                              "requires --output outside any git work tree")
     args = parser.parse_args()
     require_assertions()
+    if args.passes <= 0:
+        parser.error("--passes must be positive: an empty acceptance run cannot pass")
     if args.isolated and inside_git_tree(args.output.resolve().parent):
         parser.error("--isolated needs --output outside a git work tree: opencode would load "
                      "that repository's instructions and configuration")
