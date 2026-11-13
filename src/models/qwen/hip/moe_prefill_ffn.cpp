@@ -1,9 +1,12 @@
 #if defined(ENGINE_ENABLE_HIP)
 #include <cstddef>
 #include <cstdlib>
+#include <stdexcept>
+#include <string>
 
 #include "src/core/hip/hip_utils.hpp"
 #include "src/models/qwen/hip/executor.hpp"
+#include "src/models/qwen/hip/moe_ffn.hpp"
 #include "src/models/qwen/hip/ops.hpp"
 #include "src/models/qwen/hip/ops/moe.hpp"
 #include "src/models/qwen/hip/ops/prefill_fp16.hpp"
@@ -16,6 +19,39 @@ namespace {
 // tokens 53 against 48, 63 tokens 133 against 65 (2026-11-12).
 constexpr std::size_t kMinGroupedRows = 16;
 }  // namespace
+
+void MoePrefillRouterLogitsFallback(hipblasHandle_t handle,
+                                    const models::QwenTensorRef& router,
+                                    const models::QwenTensorRef& shared_gate,
+                                    const float* x, float* router_logits,
+                                    float* shared_logit, std::size_t rows,
+                                    std::size_t experts, std::size_t hidden,
+                                    void* bf16_scratch, hipStream_t stream) {
+  const auto is_f32 = [](const models::QwenTensorRef& tensor) {
+    return tensor.type == core::GgmlType::kF32;
+  };
+  const auto is_supported = [&is_f32](const models::QwenTensorRef& tensor) {
+    return is_f32(tensor) || tensor.type == core::GgmlType::kBF16;
+  };
+  if (!is_supported(router) || !is_supported(shared_gate)) {
+    throw std::invalid_argument(
+        "Qwen MoE router and shared-expert gate must be F32 or BF16, found " +
+        std::string(core::ToString(router.type)) + " and " +
+        std::string(core::ToString(shared_gate.type)));
+  }
+  if (is_f32(router) && is_f32(shared_gate)) {
+    LaunchHipblasGEMM(handle, router.data, false, x, router_logits, rows,
+                      experts, hidden, bf16_scratch, stream);
+    LaunchHipblasGEMM(handle, shared_gate.data, false, x, shared_logit, rows, 1,
+                      hidden, bf16_scratch, stream);
+    return;
+  }
+  // SGEMM would read BF16 words as floats. The row kernel reads each tensor
+  // by its type and keeps the activations in fp32.
+  LaunchMoeRouterLogits(router.data, router.type, shared_gate.data,
+                        shared_gate.type, x, router_logits, shared_logit,
+                        experts, hidden, stream, rows);
+}
 
 bool QwenGpuExecutor::MoePrefillFfn(const models::QwenLayerWeights& layer,
                                     std::uint32_t layer_index,
@@ -58,13 +94,10 @@ bool QwenGpuExecutor::MoePrefillFfn(const models::QwenLayerWeights& layer,
     split_weights = nullptr;
   }
   if (split_weights == nullptr) {
-    LaunchHipblasGEMM(arena_.hipblas_handle, layer.ffn_gate_inp.data, false,
-                      arena_.d_normed, scratch.router_logits, batch_size,
-                      config.num_experts, hidden, arena_.d_scratch_bf16,
-                      stream);
-    LaunchHipblasGEMM(arena_.hipblas_handle, layer.ffn_gate_inp_shexp.data,
-                      false, arena_.d_normed, scratch.shared_logit, batch_size,
-                      1, hidden, arena_.d_scratch_bf16, stream);
+    MoePrefillRouterLogitsFallback(
+        arena_.hipblas_handle, layer.ffn_gate_inp, layer.ffn_gate_inp_shexp,
+        arena_.d_normed, scratch.router_logits, scratch.shared_logit,
+        batch_size, config.num_experts, hidden, arena_.d_scratch_bf16, stream);
   }
   // Dense shared expert: gate/up projections, SwiGLU, down projection.
   LaunchBatchedQuantGEMM(layer.ffn_gate_shexp.type, layer.ffn_gate_shexp.data,

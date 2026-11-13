@@ -176,6 +176,12 @@ if (ENGINE_ENABLE_HIP)
     tests/models/qwen/hip/moe_tail_ops_test.cpp
     "hip;gpu;kernels;qwen;moe;l2")
 
+  # The grouped prefill's router fallback reads F32 and BF16 router tensors by
+  # their own type and refuses the rest.
+  add_qwen_hip_test(qwen_moe_router_fallback_ops_test
+    tests/models/qwen/hip/moe_router_fallback_ops_test.cpp
+    "hip;gpu;kernels;qwen;moe;l2")
+
   # MoE feed-forward for several rows equals the single-token decode path bit
   # for bit. Skipped without the model.
   add_qwen_hip_test(qwen_moe_rows_test

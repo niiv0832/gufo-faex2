@@ -41,6 +41,21 @@ void MoeFfnDecodeToken(const models::QwenLayerWeights& layer,
                        const QwenMoeScratch& scratch, const float* x,
                        float* out, hipStream_t stream);
 
+/// Router and shared-gate logits of the grouped-expert prefill when the split
+/// BF16 GEMM is unavailable: router_logits [rows][experts] and shared_logit
+/// [rows] from `rows` rows of `hidden` floats. Two F32 tensors take hipBLAS
+/// SGEMM (`bf16_scratch` is its conversion buffer). A BF16 tensor takes the
+/// typed row kernel of the decode path instead, which reads each tensor by
+/// its own type. Any other tensor type throws std::invalid_argument before a
+/// launch.
+void MoePrefillRouterLogitsFallback(hipblasHandle_t handle,
+                                    const models::QwenTensorRef& router,
+                                    const models::QwenTensorRef& shared_gate,
+                                    const float* x, float* router_logits,
+                                    float* shared_logit, std::size_t rows,
+                                    std::size_t experts, std::size_t hidden,
+                                    void* bf16_scratch, hipStream_t stream);
+
 /// Runs every layer's expert kernels once outside graph capture so the matrix
 /// library's workspace pool is sized before the decode graph is captured.
 void WarmMoeDecode(const models::QwenModelWeights& weights,
