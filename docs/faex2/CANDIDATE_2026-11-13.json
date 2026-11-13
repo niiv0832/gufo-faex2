@@ -1,7 +1,7 @@
 {
   "schema": "gufo-faex2.candidate.v1",
   "date": "2026-11-13",
-  "evidence_as_of": "2026-11-14T01:36:55.192549+03:00",
+  "evidence_as_of": "2026-11-14T02:01:27.419973+03:00",
   "status": "PREPARED_NOT_ACCEPTED",
   "ready_for_deployment": false,
   "deployment_performed": false,
@@ -188,7 +188,7 @@
         "gtt_growth_median_bytes": -81788928,
         "gpu_total_growth_median_bytes": -81092608,
         "rule": "Рост максимума ИЛИ медианы выше 1 GiB означает FAIL. Снижение медиан не отменяет превышение максимумов; критерий не изменён.",
-        "cause_status": "UNRESOLVED_AFTER_BOUNDED_DIAGNOSTIC"
+        "cause_status": "COMPARABLE_TRANSIENT_MECHANISM_REPRODUCED_ORIGINAL_GATE_FAIL_PRESERVED"
       },
       "continuation_cache_observation": {
         "status": "OPEN",
@@ -255,8 +255,8 @@
       ],
       "original_full_misses": "NOT_REPRODUCED",
       "memory_peak_scenario": "NOT_EXECUTED",
-      "reproducer_setup_status": "DEFECT_OPEN",
-      "reproducer_setup_issue": "Plain seed 910 не гарантирует совместимый JSON prefix target 965; готовится проверенный план с JSON seed 912. Простое увеличение бюджета не устраняет дефект.",
+      "reproducer_setup_status": "CORRECTED_AND_EXERCISED_IN_CODEX_CACHE4",
+      "reproducer_setup_issue": "Cache3 использовал неподходящий plain seed; plan-v3 заменил его JSON seed 912, runtime boundary и целевая форма проверены в cache4. Сам cache3 остаётся INCOMPLETE.",
       "memory_gate": "NOT_REEVALUATED",
       "original_final2_fail_preserved": true,
       "paired_snapshot_lifetimes": 88,
@@ -274,6 +274,57 @@
       "review_ref": ".local/remed-20261113/codex-closeout/cache3-final-memory-analysis.json",
       "live_restore_ref": ".local/remed-20261113/codex-closeout/cache3-live-restore.json",
       "archive_sha256": "fd5c92521ab8b2cff2e4d97ccc7ccb71cc687a3fdce889af59fd82cf1fd41c05"
+    },
+    "cache_memory_focused_diagnostic": {
+      "window": "codex-cache4",
+      "window_status": "PASS",
+      "window_status_scope": "Исполнение диагностики и восстановление main; не приёмка памяти или скорости.",
+      "acceptance": "NOT_QUALIFIED",
+      "mechanism": "OBSERVED",
+      "requests_recorded": 14,
+      "exact_complete_responses": 13,
+      "confirmed_cancellations": 1,
+      "client_seconds": 723.2254219055176,
+      "budget_seconds": 900,
+      "corrected_json_seed": 912,
+      "disk_cached_tokens": 128309,
+      "disk_prefill_tokens": 583,
+      "live_cached_tokens": [
+        117825,
+        117825,
+        117825
+      ],
+      "live_prefill_tokens": [
+        30,
+        30,
+        30
+      ],
+      "actual_c4_width": 4,
+      "live_snapshot_overlap_restore_seconds": 2.017225,
+      "three_live_snapshot_gpu_payload_bytes": 7439708160,
+      "target_gtt_before_bytes": 61434843136,
+      "target_gtt_peak_bytes": 68877635584,
+      "target_gtt_growth_bytes": 7442792448,
+      "unattributed_growth_bytes": 3084288,
+      "paired_snapshot_lifetimes": 56,
+      "paired_disk_jobs": 29,
+      "paired_host_buffers": 11,
+      "paired_capture_reservations": 7,
+      "observed_budget_checks": 129,
+      "observed_budget_violations": 0,
+      "final_observed_logical_counters": 0,
+      "original_memory_gate": "NOT_REEVALUATED_FAIL_PRESERVED",
+      "original_cache_misses": "NOT_EXECUTED_IN_THIS_PLAN",
+      "main_restore_verified": true,
+      "kernel_status": "CLEAN",
+      "production_downtime_seconds": 752.82217669487,
+      "plan_sha256": "81cb156cf7d4ebe54139e5f41afeba6037b9011050cce4ffcea49d58628b2975",
+      "runner_sha256": "0dc8aa9c376c33c044a7e209cc65e2d98a54f8252cafb6e08b8e4c9f4b1e4d29",
+      "instrumented_binary_sha256": "e08026a982583b57d537e8eff19a95232a916212aed351410a8bdd5c598a8bd3",
+      "archive_sha256": "089f16324cab8b083d19915df8f69198db756f023bcecb70a86331ba1559b1fe",
+      "state_ref": ".local/remed-20261113/codex-closeout/remote-evidence/accept-out/codex-cache4/state.json",
+      "review_ref": ".local/remed-20261113/codex-closeout/cache4-strict-manual-review.json",
+      "live_restore_ref": ".local/remed-20261113/codex-closeout/cache4-live-restore.json"
     }
   },
   "previous_candidate_evidence": {
