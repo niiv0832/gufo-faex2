@@ -332,7 +332,7 @@ def run_case(args, recorder, index, name):
     # A private server: the default background service may belong to the
     # user's own opencode and carry their configuration.
     command = [args.opencode, "run", *(["--standalone"] if args.isolated else []),
-               "--pure", "--auto", "--format", "json", "-m", f"gufo/{args.model}", PROMPTS[name]]
+               "--auto", "--format", "json", "-m", f"gufo/{args.model}", PROMPTS[name]]
     save(case / "command.json", command)
     recorder.case = case.name
     row = {"case": case.name, "start_request": len(recorder.requests)}
