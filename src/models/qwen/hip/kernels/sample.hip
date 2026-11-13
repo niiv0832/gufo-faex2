@@ -332,6 +332,9 @@ __global__ void LinearSpeculativeSamplingKernel(
   __shared__ float shared_max[kSamplingThreads];
   __shared__ float segment_sums[kSamplingThreads];
   __shared__ float segment_prefix[kSamplingThreads];
+  // Not shared_max: a thread with a short range would overwrite the maximum
+  // before the other threads have read it.
+  __shared__ float draft_weights[kSamplingThreads];
   __shared__ float target_total;
   __shared__ float draft_target_probability;
   __shared__ bool accepted;
@@ -380,7 +383,7 @@ __global__ void LinearSpeculativeSamplingKernel(
     }
   }
   segment_sums[tid] = local_sum;
-  shared_max[tid] = local_draft_weight;
+  draft_weights[tid] = local_draft_weight;
   __syncthreads();
 
   if (tid == 0) {
@@ -388,7 +391,7 @@ __global__ void LinearSpeculativeSamplingKernel(
     draft_target_probability = 0.0F;
     for (std::size_t segment = 0; segment < blockDim.x; ++segment) {
       target_total += segment_sums[segment];
-      draft_target_probability += shared_max[segment];
+      draft_target_probability += draft_weights[segment];
     }
     draft_target_probability /= target_total;
     accepted =
