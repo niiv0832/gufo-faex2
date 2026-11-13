@@ -260,6 +260,17 @@ if (ENGINE_ENABLE_HIP)
   set_tests_properties(qwen_moe_requant_test PROPERTIES
     RUN_SERIAL TRUE TIMEOUT 900)
 
+  # The grouped-expert prefill feed-forward and the prompt-pass projections
+  # against the decode arithmetic on the same real rows: exact router and
+  # top-k contracts, measured error by cause. Skipped without the model.
+  add_qwen_hip_test(qwen_moe_prefill_rows_test
+    tests/models/qwen/hip/moe_prefill_rows_test.cpp
+    "gpu;hip;qwen;moe;quant;external-model")
+  target_link_libraries(qwen_moe_prefill_rows_test PRIVATE
+    gufo_qwen38_flash_next)
+  set_tests_properties(qwen_moe_prefill_rows_test PROPERTIES
+    RUN_SERIAL TRUE TIMEOUT 1800)
+
   # Row operations of batched decode and verification equal the single-token
   # decode operations bit for bit on real weights. Skipped without the model.
   add_qwen_hip_test(qwen_decode_rows_ops_test
