@@ -14,7 +14,15 @@
 // Verifier (SpeculativeVerifier with a host target, the path of executors
 // without device sampling): the decision at a chosen draw, the emitted
 // tokens, the committed target state, the random numbers consumed, and the
-// refusal of malformed draft rows before anything advances.
+// refusal of malformed draft rows before anything advances; with a grammar
+// constraint on the request, the mask the target distribution carries.
+//
+// The verifier is built only with the HIP backend, so this is where the
+// acceptance decision of the production verifier is checked: the CPU test of
+// the reference covers the sampler functions it calls, not the decision.
+// Without a HIP device the whole test is skipped (exit 77), which is not a
+// pass. A run counts the checks it made and fails below their expected
+// number, so that an empty set of cases cannot pass.
 
 #include <algorithm>
 #include <cfloat>
@@ -32,6 +40,8 @@
 #if defined(ENGINE_ENABLE_HIP)
 #include <hip/hip_runtime.h>
 
+#include "src/core/json.hpp"
+#include "src/core/json_constraint.hpp"
 #include "src/core/sampling.hpp"
 #include "src/core/speculative/draft_backend.hpp"
 #include "src/core/speculative/speculative_verifier.hpp"
@@ -49,8 +59,16 @@ using sampled_oracle::DraftRow;
 using sampled_oracle::Token;
 
 bool g_passed = true;
+// What a run executed.
+std::size_t g_checks = 0;
+std::size_t g_verifier_cases = 0;
+std::size_t g_verifier_decisions = 0;
+std::size_t g_device_cases = 0;
+std::size_t g_accepted_checks = 0;
+std::size_t g_residual_rows = 0;
 
 void Expect(bool condition, const std::string& message) {
+  ++g_checks;
   if (!condition) {
     g_passed = false;
     std::cout << "FAIL: " << message << '\n';
@@ -216,6 +234,7 @@ void CheckDeviceCase(const Case& test) {
   double worst_residual = 0.0;
   double worst_conditional = 0.0;
   std::size_t residual_rows = 0;
+  std::size_t accepted_checks = 0;
   for (std::size_t index = 0; index < test.drafts.size(); ++index) {
     const DraftRow& draft = test.drafts[index];
     const std::string label = test.name + ",row=" + std::to_string(index);
@@ -279,15 +298,22 @@ void CheckDeviceCase(const Case& test) {
       while (kept < target.size() && target[kept].token != draft_token)
         ++kept;
       worst_accepted = std::max(worst_accepted, accepted_error);
+      ++accepted_checks;
       Expect(accepted_error <= bound.Accepted(kept, p, q),
              label + ",draft=" + std::to_string(draft_token) +
                  ": accepted up to " + std::to_string(high) + ", expected " +
                  std::to_string(expected));
     }
 
-    // The residual, reached through the candidate rejected most often.
-    if (!(least_acceptance < 1.0) ||
-        row.Verify(draft, least, sampled_oracle::kLastUniform, 0.5).accepted)
+    // The residual, reached through the candidate rejected most often. A
+    // row whose reference residual is not empty must reach it: a residual
+    // that was not checked fails the case.
+    const bool reached =
+        least_acceptance < 1.0 &&
+        !row.Verify(draft, least, sampled_oracle::kLastUniform, 0.5).accepted;
+    if (!reference.residual.empty())
+      Expect(reached, label + ": the residual of this row was not checked");
+    if (!reached)
       continue;
     ++residual_rows;
     const auto measure =
@@ -329,6 +355,11 @@ void CheckDeviceCase(const Case& test) {
             << ",residual_err=" << worst_conditional
             << ",emitted_err=" << worst_residual
             << ",launches=" << row.Launches() << '\n';
+  Expect(accepted_checks >= test.drafts.size(),
+         test.name + ": a draft row had no acceptance check");
+  ++g_device_cases;
+  g_accepted_checks += accepted_checks;
+  g_residual_rows += residual_rows;
 }
 
 // The same launch gives the same answer every time, on every route.
@@ -610,6 +641,118 @@ void CheckVerifierCase(const Case& test, Token stop) {
     }
   }
   std::cout << test.name << ",verifier_decisions=" << decisions << '\n';
+  Expect(decisions >= 2 * test.drafts.size(),
+         test.name + ": the verifier decided too few draws");
+  ++g_verifier_cases;
+  g_verifier_decisions += decisions;
+}
+
+// A grammar constraint on the request. The target distribution is the masked
+// one; the draft row ignores the mask. After "{" the schema admits only its
+// two values (tokens 1 and 2, written by hand in the case), and after either
+// of them only "}" (token 3), which is therefore the bonus token.
+void CheckVerifierMask() {
+  const Case test = sampled_cases::Named("mask");
+  const std::vector<std::string> pieces{"{", "\"v\":1", "\"v\":2", "}", "x"};
+  auto constraint = std::make_shared<gufo::sampling::TokenConstraint>();
+  constraint->grammar = gufo::sampling::JsonConstraint::Compile(
+      gufo::json::parse(
+          R"({"type":"object","properties":{"v":{"type":"integer","enum":[1,2]}},
+              "required":["v"],"additionalProperties":false})"),
+      false);
+  constraint->vocabulary =
+      std::make_shared<gufo::sampling::ConstraintVocabulary>(
+          pieces.size(), [&](std::uint32_t i) {
+            return gufo::sampling::ConstraintVocabulary::Piece{pieces[i],
+                                                               false};
+          });
+  const auto request = [&]() {
+    gufo::sampling::SamplingConfig config;
+    config.temperature = test.filters.temperature;
+    config.constraint = constraint;
+    config.seed = 0;
+    gufo::sampling::SamplerState sampler(config);
+    sampler.Accept(0);
+    return sampler;
+  };
+  const auto target = sampled_oracle::TargetDistribution(
+      test.logits, test.filters, {}, test.allowed);
+  const std::vector<float> bonus_row(test.logits.rbegin(), test.logits.rend());
+  const Token stop = static_cast<Token>(test.logits.size());
+  std::size_t decisions = 0;
+  std::size_t accepted = 0;
+  std::size_t rejected = 0;
+  for (std::size_t index = 0; index < test.drafts.size(); ++index) {
+    const DraftRow& draft = test.drafts[index];
+    for (std::size_t slot = 0; slot < draft.ids.size(); ++slot) {
+      const Token draft_token = draft.ids[slot];
+      const auto expected = sampled_oracle::Verify(target, draft, draft_token);
+      const double threshold = expected.acceptance;
+      for (const double wanted :
+           {0.0, threshold * 0.5, threshold * (1.0 - 1e-9),
+            threshold * (1.0 + 1e-9), (threshold + 1.0) * 0.5,
+            sampled_oracle::kLastUniform}) {
+        if (!(wanted < 1.0))
+          continue;
+        const double uniform = std::floor(wanted * 0x1.0p53) * 0x1.0p-53;
+        if (threshold > 0.0 && threshold < 1.0 &&
+            std::abs(uniform - threshold) <= 1e-12 * threshold)
+          continue;
+        const bool accept = uniform < threshold;
+        const std::string label = "mask,row=" + std::to_string(index) +
+                                  ",draft=" + std::to_string(draft_token) +
+                                  ",u=" + std::to_string(uniform);
+        HostTarget host({test.logits, bonus_row}, stop);
+        gufo::speculative::DraftProposal proposal;
+        proposal.tokens = {draft_token};
+        proposal.candidate_ids = draft.ids;
+        proposal.candidate_probabilities = draft.probabilities;
+        proposal.candidates_per_token = draft.ids.size();
+        proposal.start_pos = 1;
+        gufo::speculative::SpeculativeVerifier verifier(
+            host, std::make_unique<FixedDraft>(proposal), OneDraft());
+        const std::vector<Token> prompt{kPromptToken};
+        (void)verifier.Prime(prompt);
+        const std::vector<Token> sequence{kPromptToken, kCurrent};
+        auto sampler = request();
+        Expect(sampler.NeedsConstraintMask(),
+               label + ": the grammar does not restrict the tokens");
+        const std::uint64_t first = sampled_oracle::StateDrawing(uniform);
+        sampler.SetRngState(first);
+        const auto result =
+            verifier.VerifyStep(sequence, 1, kCurrent, stop, 2, sampler);
+        ++decisions;
+        const std::uint64_t after = sampled_oracle::NextState(first);
+        if (accept) {
+          ++accepted;
+          // Only "}" may follow: the bonus token needs no draw.
+          Expect(
+              test.allowed[draft_token] != 0 &&
+                  result.emitted_tokens == std::vector<Token>{draft_token, 3} &&
+                  sampler.rng_state() == after,
+              label + ": an accepted draft under the mask");
+          continue;
+        }
+        ++rejected;
+        std::uint64_t state = after;
+        const Token correction =
+            request()
+                .Distribution(test.logits)
+                .SampleResidual(draft.ids, draft.probabilities, &state);
+        Expect(result.emitted_tokens == std::vector<Token>{correction} &&
+                   test.allowed[correction] != 0 &&
+                   sampled_oracle::ProbabilityOf(expected.residual,
+                                                 correction) > 0.0 &&
+                   sampler.rng_state() == state,
+               label + ": a rejected draft is not replaced inside the mask");
+      }
+    }
+  }
+  Expect(accepted >= 4 && rejected >= 8, "the mask case decided too few draws");
+  std::cout << "mask,verifier_decisions=" << decisions
+            << ",accepted=" << accepted << ",rejected=" << rejected << '\n';
+  ++g_verifier_cases;
+  g_verifier_decisions += decisions;
 }
 
 // Draft rows the verifier must refuse before the target, the draft feedback
@@ -681,6 +824,7 @@ int main() {
                                     ? sampled_cases::kImEnd
                                     : static_cast<Token>(test.logits.size()));
     }
+    CheckVerifierMask();
     CheckVerifierValidation();
     CheckLaunchValidation();
     CheckRepeatability();
@@ -697,6 +841,17 @@ int main() {
     std::cerr << "qwen_sampled_verify_ops_test: " << failure.what() << '\n';
     return 1;
   }
+  // The cases of sampled_cases::All(): sixteen draw random numbers, each
+  // also spread over a larger vocabulary except the two of the real one.
+  std::cout << "checks=" << g_checks << ",verifier_cases=" << g_verifier_cases
+            << ",verifier_decisions=" << g_verifier_decisions
+            << ",device_cases=" << g_device_cases
+            << ",accepted_checks=" << g_accepted_checks
+            << ",residual_rows=" << g_residual_rows << '\n';
+  Expect(g_verifier_cases >= 17 && g_verifier_decisions >= 2000 &&
+             g_device_cases >= 30 && g_accepted_checks >= 88 &&
+             g_residual_rows >= 80 && g_checks >= 10000,
+         "the run executed fewer checks than its cases require");
   std::cout << (g_passed ? "PASS" : "FAIL") << '\n';
   return g_passed ? 0 : 1;
 #else

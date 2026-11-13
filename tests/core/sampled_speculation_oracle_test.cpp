@@ -1,10 +1,10 @@
 // The CPU sampler and the MTP draft policy against the independent reference
 // of tests/core/sampled_speculation_oracle.hpp.
 //
-// For each case the reference first proves the scheme itself: with the case's
-// target p and draft row q, accepting with min(1, p/q) and resampling from
-// max(0, p - q) emits exactly p. The production code is then held to the
-// reference:
+// For each case the reference first states the law of the emitted token for
+// the case's target p and draft row q, and its distance from p, which is
+// bounded by what the row is off one by. The production code is then held to
+// the reference:
 //   - SamplerState::Distribution is p;
 //   - SamplingDistribution::SampleResidual maps the uniforms [0, 1) onto the
 //     residual: each token owns one interval whose length is its residual
@@ -14,6 +14,12 @@
 //     MtpSampleRow draws from the row it reports.
 // Both sides compute in double precision; the tolerances are the rounding of
 // the sums involved and are derived where they are set.
+//
+// Not covered here: the acceptance decision of the production verifier. The
+// verifier is built only with the HIP backend; its decision is checked by
+// qwen_sampled_verify_ops_test, which needs a HIP build and is skipped, not
+// passed, without a device. A run counts what it checked and fails below
+// the number its cases require.
 
 #include "tests/core/sampled_speculation_oracle.hpp"
 
@@ -42,8 +48,14 @@ using sampled_oracle::DraftRow;
 using sampled_oracle::Token;
 
 bool g_passed = true;
+// What a run executed.
+std::size_t g_checks = 0;
+std::size_t g_cases = 0;
+std::size_t g_draft_rows = 0;
+std::size_t g_head_rows = 0;
 
 void Expect(bool condition, const std::string& message) {
+  ++g_checks;
   if (!condition) {
     g_passed = false;
     std::cout << "FAIL: " << message << '\n';
@@ -218,6 +230,9 @@ void CheckCase(const Case& test) {
           test.name + ": SamplerState::SampleResidual differs");
     }
   }
+  Expect(!test.drafts.empty(), test.name + ": the case has no draft row");
+  ++g_cases;
+  g_draft_rows += test.drafts.size();
   std::cout << test.name << ",support=" << target.size()
             << ",drafts=" << test.drafts.size() << ",p_rel_err=" << worst_p
             << ",law_err=" << worst_law << ",law_bound=" << worst_bound
@@ -341,6 +356,7 @@ void CheckDraftPolicy() {
                    ids.begin())] > 0.0F,
                label + ": a zero-probability candidate was drawn");
     }
+    g_head_rows += 4;
     std::cout << head.name << ",scored=" << head.scored.size()
               << ",drawn_minus_reported=" << worst_drawn << '\n';
   }
@@ -427,6 +443,14 @@ int main() {
     std::cerr << "sampled_speculation_oracle_test: " << failure.what() << '\n';
     return 1;
   }
+  // The cases of sampled_cases::All() and their draft rows; five head rows
+  // at four temperatures.
+  std::cout << "checks=" << g_checks << ",cases=" << g_cases
+            << ",draft_rows=" << g_draft_rows << ",head_rows=" << g_head_rows
+            << '\n';
+  Expect(g_cases >= 18 && g_draft_rows >= 51 && g_head_rows >= 20 &&
+             g_checks >= 2000,
+         "the run executed fewer checks than its cases require");
   std::cout << (g_passed ? "PASS" : "FAIL") << '\n';
   return g_passed ? 0 : 1;
 }
