@@ -494,6 +494,33 @@ class GateTests(unittest.TestCase):
                 self.assertEqual((code, state["status"]), (1, "FAIL"))
                 self.assertTrue(any(text in failure["error"] for failure in state["failures"]), state["failures"])
 
+    def test_composition_refill_keeps_the_json_exchange_in_the_next_continuation(self):
+        bench = self.bench(pace=.01)
+        evidence = remediation.Evidence(bench.url, bench.root / "out-refill")
+        composition = remediation.Composition(evidence, "refill")
+        composition.fill(2136)
+        composition.continue_all()
+        for session in composition.sessions:
+            composition.reset(session, 2136)
+        composition.continue_all()
+        self.assertEqual(composition.state["failures"], [])
+        for session in composition.sessions:
+            marker = session["marker"]
+            rows = evidence.report["requests"]
+            refill = next(row for row in rows if row["id"].endswith("refill-" + marker))
+            continuation = [row for row in rows if row["id"].endswith("continue-" + marker)][-1]
+            refill_messages = json.loads((evidence.output / refill["request_file"]).read_text())["body"]["messages"]
+            continued = json.loads((evidence.output / continuation["request_file"]).read_text())["body"]["messages"]
+            # The next "same JSON format" request must include the successful
+            # refill question and its real answer, just as after the first fill.
+            expected_tail = [refill_messages[-1],
+                             {"role": "assistant", "content": refill["result"]["text"]},
+                             {"role": "user", "content": "Повтори те же три ключа в том же JSON-формате."}]
+            with self.subTest(marker=marker):
+                self.assertEqual(continued[-3:], expected_tail)
+                self.assertEqual(continued[:-2], refill_messages)
+                self.assertEqual(json.loads(continued[-2]["content"]), session["keys"])
+
     def test_long_c4_continuations_without_drafts_fail(self):
         # Короткие C1 показывают черновики, длинные продолжения — нет.
         code, state = self.compose(["no_long_drafts"])

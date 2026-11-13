@@ -1421,6 +1421,8 @@ class Composition:
         result = self.answered(row, session, session["keys"])
         if result:
             session["depth"] = result["metrics"].get("prompt_tokens")
+            session["history"] += [{"role": "user", "content": KEY_QUESTION},
+                                   {"role": "assistant", "content": result["text"]}]
 
     def cycle(self, step, records):
         self.continue_all()
