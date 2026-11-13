@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
@@ -1289,7 +1290,245 @@ void TestMinimumCheckpointStep() {
       "zero disables the step");
 }
 
+void TestAsyncMinimumStepDoesNotRetainSnapshots() {
+  for (const bool reserved : {false, true}) {
+    TemporaryDirectory directory;
+    auto runner = std::make_shared<FakeRunner>("early-step");
+    auto blocker = std::make_shared<FakeRunner>("blocked-io");
+    std::binary_semaphore entered(0), release(0);
+    const auto charge = ExpectedFileBytes(10, 3);
+    auto options = StoreOptions(directory.path(), 4096, charge * 2);
+    options.min_checkpoint_step_tokens = 3;
+    std::atomic<std::size_t> skipped{0};
+    ContinuationDiskStore store(options, [&](const auto& event) {
+      if (event.reason == ContinuationDiskEventReason::kMinStep) {
+        ++skipped;
+        throw std::runtime_error("diagnostic sink failure");
+      }
+    });
+    Expect(SaveTokens(store, *runner, {1, 2}, *MakeSnapshot(*runner, 10, 2))
+               .stored,
+           "a durable prefix exists before async admission");
+    blocker->before_stream = [&] {
+      entered.release();
+      release.acquire();
+    };
+    Expect(
+        store.SaveAsync(blocker, {9, 8, 7}, MakeSnapshot(*blocker, 90, 3)) != 0,
+        "an unrelated write occupies the worker");
+    Expect(entered.try_acquire_for(std::chrono::seconds(2)),
+           "writer pauses outside the metadata gate");
+    auto reservation = reserved
+                           ? store.ReserveCapture(*runner, 3, kFakePayloadBytes)
+                           : nullptr;
+    Expect(!reserved || reservation != nullptr,
+           "the second slot can reserve a disk-only capture");
+    std::shared_ptr<const TextRunnerSnapshot> snapshot =
+        MakeSnapshot(*runner, 11, 3);
+    const std::weak_ptr<const TextRunnerSnapshot> weak = snapshot;
+    const auto queued = store.SaveAsync(runner, {1, 2, 3}, snapshot, {},
+                                        std::move(reservation));
+    snapshot.reset();
+    const bool freed_before_writer = weak.expired();
+    const bool staging_available = store.CanSave(*runner, 3, kFakePayloadBytes);
+    release.release();
+    store.Flush();
+    Expect(queued == 0 && freed_before_writer,
+           "covered async offers release their snapshot before a blocked "
+           "writer resumes");
+    Expect(staging_available && skipped == 1,
+           "early rejection releases any capture reservation and reports "
+           "one minimum-step skip even when its diagnostic sink throws");
+    auto state = runner->CreateState();
+    const auto restored = RestoreTokens(store, *runner, *state, {1, 2, 3, 4});
+    Expect(restored.restored && restored.token_count == 2 &&
+               RequireFakeState(*state).value == 10,
+           "early rejection preserves the exact durable prefix");
+  }
+}
+
+void TestAsyncMinimumStepReleasesForeignReservation() {
+  TemporaryDirectory directory, foreign_directory;
+  auto runner = std::make_shared<FakeRunner>("foreign-capture");
+  const auto charge = ExpectedFileBytes(15, 3);
+  auto options = StoreOptions(directory.path(), 4096, charge);
+  options.min_checkpoint_step_tokens = 3;
+  ContinuationDiskStore store(options);
+  ContinuationDiskStore foreign(
+      StoreOptions(foreign_directory.path(), 4096, charge));
+  Expect(
+      SaveTokens(store, *runner, {1, 2}, *MakeSnapshot(*runner, 10, 2)).stored,
+      "foreign reservation fixture has a durable covering prefix");
+  auto reservation = foreign.ReserveCapture(*runner, 3, kFakePayloadBytes);
+  Expect(
+      reservation != nullptr && !foreign.CanSave(*runner, 3, kFakePayloadBytes),
+      "the reservation consumes only its originating store's budget");
+  std::shared_ptr<const TextRunnerSnapshot> snapshot =
+      MakeSnapshot(*runner, 20, 3);
+  const std::weak_ptr<const TextRunnerSnapshot> weak = snapshot;
+  const auto queued = store.SaveAsync(runner, {1, 2, 3}, std::move(snapshot),
+                                      {}, std::move(reservation));
+  Expect(queued == 0 && weak.expired() &&
+             store.CanSave(*runner, 3, kFakePayloadBytes) &&
+             foreign.CanSave(*runner, 3, kFakePayloadBytes),
+         "a rejected foreign reservation releases its own charge without "
+         "charging the receiving store or retaining the snapshot");
+}
+
+void TestAsyncMinimumStepExemptions() {
+  struct Case {
+    std::size_t step;
+    bool shared;
+    const char* identity;
+    std::vector<std::uint8_t> input_identity;
+    std::vector<TextRunnerToken> tokens;
+  };
+  const std::vector<Case> cases{
+      {3, true, "same-model", {}, {1, 2, 3}},
+      {0, false, "same-model", {}, {1, 2, 3}},
+      {3, false, "same-model", {}, {1, 2, 3, 4, 5}},
+      {3, false, "other-model", {}, {1, 2, 3}},
+      {3, false, "same-model", {7}, {1, 2, 3}},
+  };
+  for (const auto& item : cases) {
+    TemporaryDirectory directory;
+    const FakeRunner original("same-model");
+    auto runner = std::make_shared<FakeRunner>(item.identity);
+    auto options = StoreOptions(directory.path());
+    options.min_checkpoint_step_tokens = item.step;
+    ContinuationDiskStore store(options);
+    Expect(SaveTokens(store, original, {1, 2}, *MakeSnapshot(original, 10, 2))
+               .stored,
+           "exemption fixture has a potentially covering prefix");
+    Expect(store.SaveAsync(runner, item.tokens,
+                           MakeSnapshot(*runner, 20, item.tokens.size()),
+                           item.input_identity, {}, item.shared) != 0,
+           "shared prefixes, disabled steps, full steps and other identities "
+           "remain eligible");
+    store.Flush();
+    auto state = runner->CreateState();
+    const auto restored = store.RestoreLongestPrefix(
+        *runner, *state, item.tokens, item.input_identity);
+    Expect(restored.restored && restored.token_count == item.tokens.size() &&
+               RequireFakeState(*state).value == 20,
+           "eligible async snapshots persist their exact state");
+  }
+}
+
+void TestAsyncMinimumStepBusyFallsBackToWriter() {
+  TemporaryDirectory directory;
+  auto runner = std::make_shared<FakeRunner>("busy-step");
+  std::binary_semaphore entered(0), release(0);
+  std::atomic<bool> block_next{true};
+  auto options = StoreOptions(directory.path());
+  options.min_checkpoint_step_tokens = 3;
+  ContinuationDiskStore store(options, {}, [&](auto bytes) {
+    if (block_next.exchange(false)) {
+      entered.release();
+      release.acquire();
+    }
+    return gufo::crypto::Sha256Hex(bytes);
+  });
+  Expect(store.SaveAsync(runner, {1, 2}, MakeSnapshot(*runner, 10, 2)) != 0,
+         "the future covering prefix is queued first");
+  Expect(entered.try_acquire_for(std::chrono::seconds(2)),
+         "the writer holds the metadata gate before publishing its prefix");
+  std::shared_ptr<const TextRunnerSnapshot> snapshot =
+      MakeSnapshot(*runner, 20, 3);
+  const std::weak_ptr<const TextRunnerSnapshot> weak = snapshot;
+  auto admission = std::async(std::launch::async, [&] {
+    return store.SaveAsync(runner, {1, 2, 3}, snapshot);
+  });
+  const bool ready =
+      admission.wait_for(std::chrono::seconds(1)) == std::future_status::ready;
+  release.release();
+  const auto queued = admission.get();
+  snapshot.reset();
+  store.Flush();
+  Expect(ready && queued != 0,
+         "a busy metadata gate admits work without waiting for the writer");
+  auto state = runner->CreateState();
+  const auto restored = RestoreTokens(store, *runner, *state, {1, 2, 3, 4});
+  Expect(restored.restored && restored.token_count == 2 &&
+             RequireFakeState(*state).value == 10 && weak.expired() &&
+             store.entry_count() == 1,
+         "the writer rechecks coverage published after admission and releases "
+         "the skipped snapshot");
+}
+
+void TestAsyncMinimumStepAdmissionCanPrecedeEviction() {
+  TemporaryDirectory directory;
+  auto runner = std::make_shared<FakeRunner>("early-evict");
+  std::binary_semaphore entered(0), release(0);
+  const auto bytes = ExpectedFileBytes(11, 2);
+  // Leave room to stage both three-token offers, while any third durable
+  // entry still evicts the oldest of the two initial two-token entries.
+  auto options = StoreOptions(directory.path(), (bytes + 4) * 2, 4096);
+  options.min_checkpoint_step_tokens = 3;
+  ContinuationDiskStore store(options);
+  Expect(SaveTokens(store, *runner, {1, 2}, *MakeSnapshot(*runner, 10, 2))
+                 .stored &&
+             SaveTokens(store, *runner, {7, 8}, *MakeSnapshot(*runner, 70, 2))
+                 .stored,
+         "two durable prefixes fill the disk budget");
+  std::atomic<bool> block_next{true};
+  runner->before_stream = [&] {
+    if (block_next.exchange(false)) {
+      entered.release();
+      release.acquire();
+    }
+  };
+  Expect(store.SaveAsync(runner, {9, 9, 9}, MakeSnapshot(*runner, 90, 3)) != 0,
+         "a new prefix will evict the oldest one when published");
+  Expect(entered.try_acquire_for(std::chrono::seconds(2)),
+         "the oldest prefix still exists while the writer serializes");
+  const auto queued =
+      store.SaveAsync(runner, {1, 2, 3}, MakeSnapshot(*runner, 20, 3));
+  release.release();
+  store.Flush();
+  runner->before_stream = {};
+  auto state = runner->CreateState();
+  Expect(!RestoreTokens(store, *runner, *state, {1, 2, 3, 4}).restored,
+         "an advisory skip does not pin its covering prefix across later "
+         "eviction or promise a future cache hit");
+  Expect(queued == 0, "an initially covered offer was not queued");
+  Expect(RestoreTokens(store, *runner, *state, {7, 8, 9}).restored &&
+             RestoreTokens(store, *runner, *state, {9, 9, 9}).restored,
+         "early eligibility checks do not refresh prefix LRU order");
+}
+
+void TestAsyncExactDuplicateRefreshesLru() {
+  TemporaryDirectory directory;
+  auto runner = std::make_shared<FakeRunner>("async-dedup");
+  const auto bytes = ExpectedFileBytes(11, 2);
+  auto options = StoreOptions(directory.path(), bytes * 2, 4096);
+  options.min_checkpoint_step_tokens = 3;
+  ContinuationDiskStore store(options);
+  Expect(SaveTokens(store, *runner, {1, 2}, *MakeSnapshot(*runner, 10, 2))
+                 .stored &&
+             SaveTokens(store, *runner, {7, 8}, *MakeSnapshot(*runner, 70, 2))
+                 .stored,
+         "duplicate fixture fills the disk budget");
+  Expect(store.SaveAsync(runner, {1, 2}, MakeSnapshot(*runner, 99, 2)) != 0,
+         "an exact duplicate still reaches the writer's recency update");
+  store.Flush();
+  Expect(
+      SaveTokens(store, *runner, {9, 9}, *MakeSnapshot(*runner, 90, 2)).stored,
+      "a subsequent write applies LRU pressure");
+  auto state = runner->CreateState();
+  Expect(RestoreTokens(store, *runner, *state, {1, 2, 3}).restored &&
+             RequireFakeState(*state).value == 10 &&
+             !RestoreTokens(store, *runner, *state, {7, 8, 9}).restored,
+         "exact duplicate admission refreshes LRU without replacing state");
+}
+
 int main() {
+  TestAsyncMinimumStepDoesNotRetainSnapshots();
+  TestAsyncMinimumStepReleasesForeignReservation();
+  TestAsyncMinimumStepExemptions();
+  TestAsyncMinimumStepBusyFallsBackToWriter();
+  TestAsyncMinimumStepAdmissionCanPrecedeEviction();
+  TestAsyncExactDuplicateRefreshesLru();
   TestAppendedImagePrefixesSurviveRestart();
   TestBoundedAsyncPersistenceDoesNotBlockLookup();
   TestIndexedPrefixLookup();

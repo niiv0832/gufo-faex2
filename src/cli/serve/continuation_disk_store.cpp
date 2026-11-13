@@ -1644,6 +1644,17 @@ std::size_t ContinuationDiskStore::SaveAsync(
   const auto descriptor = DescriptorForInput(*runner, input_identity);
   if (!descriptor.persistence)
     return 0;
+  // Avoid retaining a RAM/live snapshot in the queue when an existing durable
+  // prefix already makes this write unnecessary. The nonblocking check is only
+  // advisory: the prefix may be evicted after this check, and a busy metadata
+  // gate leaves the decision to the writer. Save still rechecks before writing.
+  if (!shared_prefix && impl_->options.min_checkpoint_step_tokens != 0 &&
+      WithinCheckpointStep(*runner, checkpoint_tokens, input_identity)) {
+    impl_->Emit(ContinuationDiskEventAction::kSkipped,
+                ContinuationDiskEventReason::kMinStep, 0, 0,
+                checkpoint_tokens.size());
+    return 0;
+  }
   const auto file_bytes =
       CheckedFileBytes(descriptor.persistence->compatibility_identity.size(),
                        checkpoint_tokens.size(),

@@ -142,6 +142,11 @@ public:
 
   /// Enqueues immutable storage, retaining both model and snapshot until done.
   /// The returned byte count is queued work, not completed disk I/O.
+  /// Non-shared offers may be skipped at admission when a durable prefix is
+  /// within the minimum step. This advisory check neither pins nor touches that
+  /// prefix: later eviction can change future cache hits. A busy metadata gate
+  /// leaves normal queue admission in place; the writer rechecks eligibility
+  /// before persistence.
   [[nodiscard]] std::size_t SaveAsync(
       std::shared_ptr<const TextModelRunner> runner,
       std::vector<TextRunnerToken> checkpoint_tokens,

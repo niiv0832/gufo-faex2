@@ -4,6 +4,13 @@
 
 ## 2026-11-14
 
+### 02:23 MSK — близкие дисковые checkpoint проверяются до удержания в очереди
+
+- В `SaveAsync` добавлена неблокирующая advisory-проверка `min_step` для обычных snapshots. Shared prefix и занятый metadata gate оставляют прежнюю обычную admission-проверку; writer повторно проверяет условия. RAM capture/publication и численная identity не менялись.
+- Две регрессии дали настоящий RED: queued snapshot не освобождался до возобновления занятого writer; отдельный LRU-сценарий показывал сохранение позднего snapshot после вытеснения его базы. Новый early skip намеренно меняет этот последний cache hint: равенство всех будущих попаданий не обещается.
+- Mac CPU с адаптером только Linux OS-advisory/page-probe функций: полные disk-store/cache suites GREEN, настоящие файлы/locks/queues. Проверены reservations, исключения callback, busy fallback, writer recheck, shared prefix, identity, duplicate Touch/LRU. Runner здесь NOT_EXECUTED: семь прежних ignored-nodiscard предупреждений стали ошибками локального `-Werror`; чужой тест не изменён. Linux-проверки и фактический эффект ещё ожидаются.
+- Три изменённых файла проходят clang-format; общий check содержит те же девять прежних failures. Независимые ревью не нашли новых lock/RAII/identity дефектов. [Доказательства и границы](../../.local/remed-20261113/codex-closeout/early-min-step/validation.json). Прежние GPU-результаты и FAIL сохраняются, main работает.
+
 ### 02:01 MSK — исправленный эпизод памяти исполнен, main возвращён
 
 - `codex-cache4`: 14/14 запросов, 13 точных ответов и одна подтверждённая отмена; нужные три refill, C4 MTP и disk boundary 128309 исполнены. Клиент 723,225 с, прежний лимит 900 с.
