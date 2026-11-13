@@ -38,6 +38,7 @@ enum class TensorRole : std::uint8_t {
   kEmbedding,
   kNorm,
   kProjection,
+  kMoeRouter,
   kSsmParameter,
 };
 
@@ -50,6 +51,8 @@ enum class TensorRole : std::uint8_t {
       return "normalization";
     case TensorRole::kProjection:
       return "projection";
+    case TensorRole::kMoeRouter:
+      return "MoE router";
     case TensorRole::kSsmParameter:
       return "SSM parameter";
   }
@@ -75,6 +78,8 @@ enum class TensorRole : std::uint8_t {
       // HIP norm, convolution, and recurrence kernels consume these tensors as
       // float pointers. Accepting BF16 or packed data would reinterpret bytes.
       return type == core::GgmlType::kF32;
+    case TensorRole::kMoeRouter:
+      return SupportsMoeRouterType(type);
     case TensorRole::kProjection:
       // opt-q4kxl: the Unsloth UD-Q4_K_XL shard mixes Q5_K, IQ4_XS, Q4_K, Q6_K,
       // IQ4_NL, Q3_K and IQ3_S across projections, and every one of them has an
@@ -286,7 +291,7 @@ std::optional<QwenModelWeights> QwenModelWeights::LoadFromGguf(
       const std::size_t expert_ff = weights.config.expert_ff;
       const std::size_t shared_ff = weights.config.shared_expert_ff;
       if (!ValidateTensor(l.ffn_gate_inp, experts * hidden_size,
-                          TensorRole::kProjection,
+                          TensorRole::kMoeRouter,
                           prefix + "ffn_gate_inp.weight", error_msg) ||
           !ValidateTensor(l.ffn_gate_exps, experts * expert_ff * hidden_size,
                           TensorRole::kProjection,
@@ -312,7 +317,7 @@ std::optional<QwenModelWeights> QwenModelWeights::LoadFromGguf(
                           prefix + "ffn_down_shexp.weight", error_msg,
                           shared_ff) ||
           !ValidateTensor(l.ffn_gate_inp_shexp, hidden_size,
-                          TensorRole::kProjection,
+                          TensorRole::kMoeRouter,
                           prefix + "ffn_gate_inp_shexp.weight", error_msg)) {
         return std::nullopt;
       }

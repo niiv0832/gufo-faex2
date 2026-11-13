@@ -29,10 +29,8 @@ void MoePrefillRouterLogitsFallback(hipblasHandle_t handle,
   const auto is_f32 = [](const models::QwenTensorRef& tensor) {
     return tensor.type == core::GgmlType::kF32;
   };
-  const auto is_supported = [&is_f32](const models::QwenTensorRef& tensor) {
-    return is_f32(tensor) || tensor.type == core::GgmlType::kBF16;
-  };
-  if (!is_supported(router) || !is_supported(shared_gate)) {
+  if (!models::SupportsMoeRouterType(router.type) ||
+      !models::SupportsMoeRouterType(shared_gate.type)) {
     throw std::invalid_argument(
         "Qwen MoE router and shared-expert gate must be F32 or BF16, found " +
         std::string(core::ToString(router.type)) + " and " +

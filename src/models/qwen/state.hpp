@@ -21,6 +21,14 @@ namespace gufo::models {
 
 /// Non-owning reference to a mapped tensor. Consumers validate the exact
 /// formats supported for each tensor role.
+/// Storage the MoE router and shared-expert gate may use. Their kernels read
+/// F32 and BF16 rows; any other type would be read as raw floats, so the
+/// loader refuses it instead of routing through the wrong decoder.
+[[nodiscard]] constexpr bool SupportsMoeRouterType(
+    core::GgmlType type) noexcept {
+  return type == core::GgmlType::kF32 || type == core::GgmlType::kBF16;
+}
+
 struct QwenTensorRef {
   const void* data = nullptr;
   core::GgmlType type = core::GgmlType::kF32;

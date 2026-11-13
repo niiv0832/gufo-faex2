@@ -55,6 +55,9 @@ add_qwen_cpu_test(qwen_fusion_route_test
 add_qwen_cpu_test(qwen_numerical_overrides_test
   tests/models/qwen/hip/numerical_overrides_test.cpp
   "cpu;models;qwen;hip;policy;cache")
+add_qwen_cpu_test(qwen_moe_router_type_test
+  tests/models/qwen/moe_router_type_test.cpp
+  "cpu;models;qwen;moe;loader")
 add_qwen_cpu_test(qwen_attention_policy_test
   tests/models/qwen/hip/attention_policy_test.cpp
   "cpu;models;qwen;hip;attention;dispatch")
