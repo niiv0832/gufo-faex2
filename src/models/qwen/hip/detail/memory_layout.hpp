@@ -62,7 +62,8 @@ struct QwenArenaMemoryLayout {
   /// the rollback pair.
   std::size_t recurrent_bytes{0};
   /// Per-batch prompt scratch (QwenPrefillBank). The constructor allocates
-  /// one; layered prefill adds a second on first use.
+  /// one; paired prompt chunks, which only an NPU offload runs, add a second
+  /// on first use.
   std::size_t bank_bytes{0};
   /// Scratch outside the bank: logits, target layer taps, split-K attention
   /// and the BF16 weight staging buffer.
@@ -85,14 +86,16 @@ struct QwenArenaMemoryLayout {
         CheckedBytesSum(bank_bytes, fixed_scratch_bytes),
         CheckedBytesSum(moe_decode_bytes, moe_prefill_bytes));
   }
-  /// Everything the arena can hold: both recurrent buffers, both banks and
-  /// the replay log.
+  /// Everything the arena can hold: both recurrent buffers, the replay log
+  /// and, where paired prompt chunks can run, both banks.
   [[nodiscard]] constexpr std::size_t ReservedStateBytes() const {
     return CheckedBytesSum(LiveStateBytes(), recurrent_bytes);
   }
-  [[nodiscard]] constexpr std::size_t ReservedScratchBytes() const {
+  [[nodiscard]] constexpr std::size_t ReservedScratchBytes(
+      bool paired_prompt_chunks) const {
     return CheckedBytesSum(
-        CheckedBytesSum(ConstructedScratchBytes(), bank_bytes),
+        CheckedBytesSum(ConstructedScratchBytes(),
+                        paired_prompt_chunks ? bank_bytes : 0),
         replay_log_bytes);
   }
 };
@@ -203,6 +206,30 @@ struct QwenArenaMemoryLayout {
   layout.replay_log_bytes =
       CheckedBytesSum(layout.replay_log_bytes, sizeof(std::uint32_t));
   return layout;
+}
+
+/// Rows and widest row of the BF16 activations a prompt batch stages in the
+/// arena; scratch derived from them elsewhere is bounded by this shape.
+struct QwenPromptScratchShape {
+  std::size_t batch{0};
+  std::size_t width{0};
+};
+
+[[nodiscard]] constexpr QwenPromptScratchShape ComputeQwenPromptScratchShape(
+    const core::ModelConfig& config, std::uint32_t max_context) {
+  const std::size_t projection = std::max<std::size_t>(
+      CheckedBytesProduct(2, config.AttentionSize()), config.SsmQkvSize());
+  return {
+      .batch = std::min<std::size_t>(std::max<std::uint32_t>(max_context, 1U),
+                                     kArenaMaxPromptBatch),
+      .width = std::max<std::size_t>(
+          {config.intermediate_size, config.hidden_size, projection,
+           CheckedBytesSum(
+               config.SsmQkvSize(),
+               CheckedBytesSum(
+                   config.ssm_inner_size,
+                   CheckedBytesProduct(2, config.ssm_time_step_rank)))}),
+  };
 }
 
 /// Device bytes of one QwenMtpGpuExecutor, by lifetime.

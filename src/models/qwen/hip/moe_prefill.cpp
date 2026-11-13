@@ -9,10 +9,31 @@ QwenMoePrefillFactory& Factory() {
   static QwenMoePrefillFactory factory;
   return factory;
 }
+
+QwenMoePrefillSizing& Sizing() {
+  static QwenMoePrefillSizing sizing;
+  return sizing;
+}
 }  // namespace
 
-void SetQwenMoePrefillFactory(QwenMoePrefillFactory factory) {
+void SetQwenMoePrefillFactory(QwenMoePrefillFactory factory,
+                              QwenMoePrefillSizing sizing) {
   Factory() = std::move(factory);
+  Sizing() = std::move(sizing);
+}
+
+std::size_t EstimateQwenMoePrefillResidentBytes(
+    const models::QwenModelWeights& weights) {
+  const auto& sizing = Sizing();
+  return sizing.resident_bytes ? sizing.resident_bytes(weights) : 0;
+}
+
+std::size_t EstimateQwenMoePrefillStreamScratchBytes(
+    const core::ModelConfig& config, std::uint32_t max_tokens) {
+  const auto& sizing = Sizing();
+  return sizing.stream_scratch_bytes
+             ? sizing.stream_scratch_bytes(config, max_tokens)
+             : 0;
 }
 
 std::unique_ptr<QwenMoePrefill> CreateQwenMoePrefill(

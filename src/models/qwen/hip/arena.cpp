@@ -2,9 +2,11 @@
 #include <algorithm>
 #include <array>
 #include <cassert>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <type_traits>
 #include <utility>
@@ -12,6 +14,7 @@
 #include "src/core/hip/hip_utils.hpp"
 #include "src/core/hip/snapshot_transfer.hpp"
 #include "src/models/qwen/hip/detail/attention_policy.hpp"
+#include "src/models/qwen/hip/detail/memory_layout.hpp"
 #include "src/models/qwen/hip/executor.hpp"
 #include "src/models/qwen/hip/moe_ffn.hpp"
 #include "src/models/qwen/hip/ops/gemm.hpp"
@@ -20,8 +23,12 @@
 namespace gufo::hip {
 namespace {
 
-constexpr std::uint32_t kMaxPromptBatch = 4096;
-constexpr std::size_t kMaxTargetLayerTaps = 9;
+constexpr std::uint32_t kMaxPromptBatch = detail::kArenaMaxPromptBatch;
+constexpr std::size_t kMaxTargetLayerTaps = detail::kArenaMaxTargetLayerTaps;
+// The memory layout names these sizes without the device headers.
+static_assert(detail::kArenaMoeDecodeRows == kMoeFfnScratchRows);
+static_assert(detail::kArenaRouterSplitRows == kRouterSplitRows);
+static_assert(detail::kArenaSsmReplayCapacity == kSsmReplayCapacity);
 constexpr std::array<std::uint8_t, 8> kCompactSnapshotMagic = {
     'G', 'Q', 'K', 'V', 'S', 'N', 'P', '1'};
 constexpr std::uint32_t kCompactSnapshotVersion = 1;
@@ -45,9 +52,45 @@ void CheckedAdd(std::size_t value, std::size_t* total) {
   *total = CheckedSum(*total, value);
 }
 
-void AddAllocation(std::size_t elements, std::size_t element_bytes,
-                   std::size_t* total) {
-  CheckedAdd(CheckedMultiply(elements, element_bytes), total);
+// Opt-in block-sparse attention (GUFO_QWEN_SPARSE_ATTN) for the head
+// geometries its kernel is built for; empty when it stays off.
+std::optional<SparseAttentionConfig> ReadSparseAttentionConfig(
+    const core::ModelConfig& config, std::uint32_t max_context,
+    QwenExecutionPolicy policy) {
+  // One resolution of the environment for the arena, its reserve and the
+  // cache identity.
+  const auto overrides =
+      ResolveQwenNumericalOverrides(config, policy, max_context);
+  if (!overrides.sparse_attention) {
+    return std::nullopt;
+  }
+  return SparseAttentionConfig{
+      .sink_blocks = overrides.sparse_sink_blocks,
+      .local_blocks = overrides.sparse_local_blocks,
+      .top_blocks = overrides.sparse_top_blocks,
+      .min_context = overrides.sparse_min_context,
+  };
+}
+
+std::size_t SparseAttentionListBytes(const SparseAttentionConfig& sparse,
+                                     const core::ModelConfig& config,
+                                     std::uint32_t max_context) {
+  return SparseAttentionListInts(std::min(max_context, kMaxPromptBatch),
+                                 config.num_key_value_heads, sparse) *
+         sizeof(std::int32_t);
+}
+
+// Device bytes of the pooled key bounds and block lists.
+std::size_t SparseAttentionBytes(
+    const std::optional<SparseAttentionConfig>& sparse,
+    const core::ModelConfig& config, std::uint32_t max_context) {
+  if (!sparse.has_value()) {
+    return 0;
+  }
+  return CheckedSum(
+      SparseAttentionPooledBytes(config.FullAttentionLayerCount(),
+                                 config.num_key_value_heads, max_context),
+      SparseAttentionListBytes(*sparse, config, max_context));
 }
 
 void ThrowOnHipError(hipError_t error, std::string_view operation) {
@@ -339,101 +382,48 @@ std::size_t QwenGpuSnapshot::SerializeCompact(
 QwenGpuMemoryUsage QwenGpuArena::EstimateMemoryUsage(
     const core::ModelConfig& config, std::uint32_t max_context,
     QwenExecutionPolicy policy) {
-  const std::size_t context = std::max(max_context, 1U);
-  const std::size_t batch = std::min<std::size_t>(context, kMaxPromptBatch);
-  const std::size_t hidden = config.hidden_size;
-  const std::size_t intermediate = config.intermediate_size;
-  const std::size_t attention = config.AttentionSize();
-  const std::size_t kv =
-      CheckedMultiply(config.num_key_value_heads, config.head_dim);
-  const std::size_t q_projection = CheckedMultiply(2, attention);
-  const std::size_t ssm_qkv = config.SsmQkvSize();
-  const std::size_t recurrent =
-      std::max<std::size_t>(attention, config.ssm_inner_size);
-  const std::size_t projection = std::max(q_projection, ssm_qkv);
-  const std::size_t time_step = config.ssm_time_step_rank;
-
-  QwenGpuMemoryUsage usage;
-  auto& scratch = usage.temporary_scratch_bytes;
-  AddAllocation(CheckedMultiply(batch, hidden), sizeof(float), &scratch);
-  AddAllocation(CheckedMultiply(batch, hidden), sizeof(float), &scratch);
-  AddAllocation(CheckedMultiply(batch, attention), sizeof(float), &scratch);
-  AddAllocation(CheckedMultiply(batch, kv), sizeof(float), &scratch);
-  AddAllocation(CheckedMultiply(batch, kv), sizeof(float), &scratch);
-  AddAllocation(CheckedMultiply(batch, hidden), sizeof(float), &scratch);
-  AddAllocation(CheckedMultiply(batch, intermediate), sizeof(float), &scratch);
-  AddAllocation(CheckedMultiply(batch, intermediate), sizeof(float), &scratch);
-  AddAllocation(CheckedMultiply(batch, intermediate), sizeof(float), &scratch);
-  AddAllocation(CheckedMultiply(batch, hidden), sizeof(float), &scratch);
-  AddAllocation(CheckedMultiply(batch, projection), sizeof(float), &scratch);
-  AddAllocation(CheckedMultiply(batch, ssm_qkv), sizeof(float), &scratch);
-  AddAllocation(CheckedMultiply(batch, recurrent), sizeof(float), &scratch);
-  AddAllocation(CheckedMultiply(batch, recurrent), sizeof(float), &scratch);
-  AddAllocation(CheckedMultiply(batch, time_step), sizeof(float), &scratch);
-  AddAllocation(CheckedMultiply(batch, time_step), sizeof(float), &scratch);
-  AddAllocation(
-      CheckedMultiply(CheckedMultiply(batch, config.ssm_group_count), 3),
-      sizeof(float), &scratch);
-  AddAllocation(CheckedMultiply(CheckedMultiply(batch, time_step), 2),
-                sizeof(float), &scratch);
-  AddAllocation(config.vocab_size, sizeof(float), &scratch);
-  AddAllocation(std::max<std::size_t>(batch, 2), sizeof(std::uint32_t),
-                &scratch);
-  AddAllocation(CheckedMultiply(kMaxTargetLayerTaps, hidden), sizeof(float),
-                &scratch);
-
-  const std::size_t maximum_scratch_width = std::max<std::size_t>(
-      {intermediate, hidden, projection,
-       CheckedSum(ssm_qkv, CheckedSum(config.ssm_inner_size,
-                                      CheckedMultiply(2, time_step)))});
-  const std::size_t scratch_elements =
-      CheckedMultiply(batch, maximum_scratch_width);
-  AddAllocation(scratch_elements, sizeof(hip_bfloat16), &scratch);
-
-  const std::size_t q8_rows = CheckedMultiply((batch + 15) / 16, 16);
-  const std::size_t q8_row_elements = scratch_elements / batch;
-  const std::size_t q8_elements = CheckedMultiply(q8_rows, q8_row_elements);
-  const std::size_t q8_blocks = (q8_elements + 31) / 32;
-  CheckedAdd(CheckedMultiply(CheckedMultiply(q8_blocks, sizeof(float)), 10),
-             &scratch);
-  CheckedAdd(4096, &scratch);
-
-  AddAllocation(detail::DecodeAttentionScratchElements(
-                    config.num_attention_heads, config.head_dim),
-                sizeof(float), &scratch);
-
-  const std::size_t maximum_weight_width =
-      std::max<std::size_t>({q_projection, kv, attention, intermediate, ssm_qkv,
-                             config.ssm_inner_size, time_step});
-  const std::size_t maximum_weight =
-      CheckedMultiply(hidden, maximum_weight_width);
-  AddAllocation(maximum_weight, sizeof(hip_bfloat16), &scratch);
-
-  auto& state = usage.request_state_bytes;
-  const std::size_t total_kv = CheckedMultiply(
-      CheckedMultiply(CheckedMultiply(config.FullAttentionLayerCount(), kv),
-                      context),
-      1);
-  AddAllocation(
-      CheckedMultiply(total_kv, 2),
-      policy.UsesFp16AttentionKv() ? sizeof(std::uint16_t) : sizeof(float),
-      &state);
-
-  const std::size_t total_conv = CheckedMultiply(
-      CheckedMultiply(config.SsmLayerCount(), ssm_qkv), config.ssm_conv_kernel);
-  AddAllocation(total_conv, sizeof(float), &state);
-  const std::size_t total_deltanet = CheckedMultiply(
-      CheckedMultiply(CheckedMultiply(config.SsmLayerCount(), time_step),
-                      config.ssm_state_size),
-      config.SsmValueSize());
-  AddAllocation(total_deltanet,
-                QwenRecurrentStateElementBytes(policy.recurrent_state_storage),
-                &state);
+  // The reserved maximum: both recurrent buffers and the replay log count
+  // although the constructor allocates one buffer and no log. The second
+  // prompt bank counts where an NPU runtime can ask for paired chunks.
+  const auto layout =
+      detail::ComputeQwenArenaMemoryLayout(config, max_context, policy);
+  QwenGpuMemoryUsage usage{
+      .request_state_bytes = layout.ReservedStateBytes(),
+      .temporary_scratch_bytes =
+          layout.ReservedScratchBytes(HasQwenNpuFfnFactory()),
+  };
+  const std::uint32_t context = std::max(max_context, 1U);
+  CheckedAdd(
+      SparseAttentionBytes(ReadSparseAttentionConfig(config, context, policy),
+                           config, context),
+      &usage.temporary_scratch_bytes);
+  CheckedAdd(HipblasLtGemm::MaxWorkspaceBytes(),
+             &usage.temporary_scratch_bytes);
   return usage;
 }
 
 QwenGpuMemoryUsage QwenGpuArena::GetMemoryUsage() const {
-  return EstimateMemoryUsage(config_, max_context_, policy_);
+  // What is allocated now.
+  const auto layout =
+      detail::ComputeQwenArenaMemoryLayout(config_, max_context_, policy_);
+  const bool rollback_pair = d_ssm_conv_buffers_[1] != nullptr &&
+                             d_ssm_deltanet_buffers_[1] != nullptr;
+  QwenGpuMemoryUsage usage{
+      .request_state_bytes = layout.LiveStateBytes() +
+                             (rollback_pair ? layout.recurrent_bytes : 0),
+      .temporary_scratch_bytes =
+          layout.ConstructedScratchBytes() +
+          (second_bank_ != nullptr ? layout.bank_bytes : 0) +
+          (d_ssm_replay_qkv_ != nullptr ? layout.replay_log_bytes : 0),
+  };
+  if (sparse_enabled) {
+    usage.temporary_scratch_bytes +=
+        SparseAttentionBytes(sparse_config, config_, max_context_);
+  }
+  if (hipblaslt_gemm != nullptr) {
+    usage.temporary_scratch_bytes += hipblaslt_gemm->WorkspaceBytes();
+  }
+  return usage;
 }
 
 std::size_t QwenGpuArena::SnapshotPayloadBytes(
@@ -447,7 +437,9 @@ std::size_t QwenGpuArena::SnapshotPayloadBytes(
           CheckedMultiply(config_.num_key_value_heads, config_.head_dim)),
       policy_.UsesFp16AttentionKv() ? 2 * sizeof(std::uint16_t)
                                     : 2 * sizeof(float));
-  return GetMemoryUsage().request_state_bytes - unused;
+  return detail::ComputeQwenArenaMemoryLayout(config_, max_context_, policy_)
+             .LiveStateBytes() -
+         unused;
 }
 
 std::unique_ptr<QwenGpuSnapshot> QwenGpuArena::SaveSnapshot(
@@ -860,9 +852,7 @@ QwenGpuArena::QwenGpuArena(const core::ModelConfig& config,
                               config_.num_key_value_heads, max_context_)));
       HIP_CHECK(hipMalloc(
           &d_sparse_lists,
-          SparseAttentionListInts(max_batch_, config_.num_key_value_heads,
-                                  sparse_config) *
-              sizeof(std::int32_t)));
+          SparseAttentionListBytes(sparse_config, config_, max_context_)));
       sparse_pooled_end.assign(config_.FullAttentionLayerCount(), 0u);
       sparse_enabled = true;
     }

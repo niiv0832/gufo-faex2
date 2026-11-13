@@ -19,6 +19,7 @@
 #include "src/core/hip/heap_placement.hpp"
 #include "src/core/hip/hip_utils.hpp"
 #include "src/models/qwen/chat_template.hpp"
+#include "src/models/qwen/hip/detail/memory_layout.hpp"
 #include "src/models/qwen/hip/executor.hpp"
 #include "src/models/qwen/hip/ops/gemm.hpp"
 #include "src/models/qwen/hip/ops/moe.hpp"
@@ -283,6 +284,26 @@ QwenGpuModel::~QwenGpuModel() {
   ReleaseWeightRegions(weight_regions_);
 }
 
+namespace {
+
+// Whether RouterSplitWeights builds a copy for this layer.
+bool HasRouterSplit(const core::ModelConfig& config,
+                    const models::QwenLayerWeights& layer) {
+  const auto& gate = layer.ffn_gate_inp;
+  const auto& shared = layer.ffn_gate_inp_shexp;
+  const auto is_supported = [](const models::QwenTensorRef& tensor) {
+    return tensor.type == core::GgmlType::kF32 ||
+           tensor.type == core::GgmlType::kBF16;
+  };
+  const std::size_t hidden = config.hidden_size;
+  return config.num_experts + 1 <= kRouterSplitRows && is_supported(gate) &&
+         is_supported(shared) &&
+         gate.num_elements == config.num_experts * hidden &&
+         shared.num_elements == hidden;
+}
+
+}  // namespace
+
 const std::uint16_t* QwenGpuModel::RouterSplitWeights(
     std::uint32_t layer) const {
   std::lock_guard lock(router_split_mutex_);
@@ -295,18 +316,11 @@ const std::uint16_t* QwenGpuModel::RouterSplitWeights(
   const auto& config = weights_.config;
   const auto& gate = weights_.layers[layer].ffn_gate_inp;
   const auto& shared = weights_.layers[layer].ffn_gate_inp_shexp;
-  const auto is_supported = [](const models::QwenTensorRef& tensor) {
-    return tensor.type == core::GgmlType::kF32 ||
-           tensor.type == core::GgmlType::kBF16;
-  };
   const std::size_t hidden = config.hidden_size;
-  if (config.num_experts + 1 > kRouterSplitRows || !is_supported(gate) ||
-      !is_supported(shared) ||
-      gate.num_elements != config.num_experts * hidden ||
-      shared.num_elements != hidden)
+  if (!HasRouterSplit(config, weights_.layers[layer]))
     return nullptr;
   std::uint16_t* buffer = nullptr;
-  const std::size_t bytes = kRouterSplitRows * 3 * hidden * sizeof(*buffer);
+  const std::size_t bytes = detail::QwenRouterSplitLayerBytes(config);
   if (hipMalloc(&buffer, bytes) != hipSuccess)
     return nullptr;
   HIP_CHECK(hipMemset(buffer, 0, bytes));
@@ -317,6 +331,38 @@ const std::uint16_t* QwenGpuModel::RouterSplitWeights(
   HIP_CHECK(hipDeviceSynchronize());
   router_split_[layer] = buffer;
   return buffer;
+}
+
+std::size_t QwenGpuModel::GetDerivedWeightBytes() const {
+  std::size_t total = 0;
+  {
+    std::lock_guard lock(router_split_mutex_);
+    for (const auto* buffer : router_split_) {
+      if (buffer != nullptr)
+        total += detail::QwenRouterSplitLayerBytes(weights_.config);
+    }
+  }
+  if (const auto* prefill = moe_prefill_ready_.load())
+    total += prefill->ResidentBytes();
+  return total;
+}
+
+std::size_t QwenGpuModel::EstimateDerivedWeightBytes() const {
+  const auto& config = weights_.config;
+  if (!config.IsMoe())
+    return 0;
+  std::size_t total = EstimateQwenMoePrefillResidentBytes(weights_);
+  for (const auto& layer : weights_.layers) {
+    if (HasRouterSplit(config, layer))
+      total += detail::QwenRouterSplitLayerBytes(config);
+  }
+  return total;
+}
+
+std::size_t QwenGpuModel::MoePrefillStreamScratchBytes(
+    hipStream_t stream) const {
+  auto* const prefill = moe_prefill_ready_.load();
+  return prefill != nullptr ? prefill->StreamScratchBytes(stream) : 0;
 }
 
 std::size_t QwenGpuModel::GetResidentBytes() const noexcept {
@@ -433,6 +479,7 @@ QwenMoePrefill* QwenGpuModel::MoePrefill(std::uint32_t max_tokens) const {
     moe_prefill_ = CreateQwenMoePrefill(weights_, max_tokens, &error);
     if (moe_prefill_ == nullptr && !error.empty())
       std::fprintf(stderr, "MoE prefill off: %s\n", error.c_str());
+    moe_prefill_ready_.store(moe_prefill_.get());
   });
   return moe_prefill_.get();
 }

@@ -1640,15 +1640,25 @@ namespace {
 // A larger request first drains the stream: queued kernels still read the old
 // buffer. Buffers are kept for the life of the process, as the per-thread
 // scratch they replace was.
+struct StreamQ8Scratch {
+  void* data = nullptr;
+  std::size_t bytes = 0;
+};
+
+struct StreamQ8ScratchTable {
+  std::mutex mutex;
+  std::unordered_map<hipStream_t, StreamQ8Scratch> by_stream;
+};
+
+StreamQ8ScratchTable& StreamQ8Scratches() {
+  static StreamQ8ScratchTable table;
+  return table;
+}
+
 void* StreamQ8ActivationScratch(hipStream_t stream, std::size_t bytes) {
-  struct Scratch {
-    void* data = nullptr;
-    std::size_t bytes = 0;
-  };
-  static std::mutex mutex;
-  static std::unordered_map<hipStream_t, Scratch> scratch_by_stream;
-  const std::lock_guard lock(mutex);
-  auto& scratch = scratch_by_stream[stream];
+  auto& table = StreamQ8Scratches();
+  const std::lock_guard lock(table.mutex);
+  auto& scratch = table.by_stream[stream];
   if (scratch.bytes < bytes) {
     if (scratch.data != nullptr) {
       HIP_CHECK(stream != nullptr ? hipStreamSynchronize(stream)
@@ -1663,6 +1673,13 @@ void* StreamQ8ActivationScratch(hipStream_t stream, std::size_t bytes) {
 }
 
 }  // namespace
+
+std::size_t StreamQ8ActivationScratchBytes(hipStream_t stream) {
+  auto& table = StreamQ8Scratches();
+  const std::lock_guard lock(table.mutex);
+  const auto found = table.by_stream.find(stream);
+  return found == table.by_stream.end() ? 0 : found->second.bytes;
+}
 
 void LaunchBatchedQuantGEMM(core::GgmlType type, const void* w,
                             const void* bf16_x, float* y, std::size_t batch,

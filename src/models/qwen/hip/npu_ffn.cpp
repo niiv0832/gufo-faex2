@@ -15,6 +15,10 @@ void SetQwenNpuFfnFactory(QwenNpuFfnFactory factory) {
   Factory() = std::move(factory);
 }
 
+bool HasQwenNpuFfnFactory() {
+  return static_cast<bool>(Factory());
+}
+
 std::unique_ptr<QwenNpuFfn> CreateQwenNpuFfn(
     const models::QwenModelWeights& weights, std::string* error) {
   const auto& factory = Factory();

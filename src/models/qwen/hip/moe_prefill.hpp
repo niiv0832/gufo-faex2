@@ -5,10 +5,15 @@
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <string>
+
+namespace gufo::core {
+struct ModelConfig;
+}
 
 namespace gufo::models {
 struct QwenModelWeights;
@@ -39,12 +44,33 @@ public:
                                  const __half* x_half, const float* shared_out,
                                  const float* shared_logit, float* out,
                                  hipStream_t stream) = 0;
+  /// Device bytes of the expert weights this object re-encoded for the
+  /// grouped kernels and holds beside the model's own.
+  [[nodiscard]] virtual std::size_t ResidentBytes() const noexcept = 0;
+  /// Device and pinned host bytes of the scratch kept for `stream`: zero
+  /// until its first Run, then held until this object is destroyed.
+  [[nodiscard]] virtual std::size_t StreamScratchBytes(hipStream_t stream) = 0;
+};
+
+/// What an implementation's objects hold, before one exists: the expert
+/// copies of a model (QwenMoePrefill::ResidentBytes) and the scratch of one
+/// stream at `max_tokens` (QwenMoePrefill::StreamScratchBytes).
+struct QwenMoePrefillSizing {
+  std::function<std::size_t(const models::QwenModelWeights&)> resident_bytes;
+  std::function<std::size_t(const core::ModelConfig&, std::uint32_t)>
+      stream_scratch_bytes;
 };
 
 using QwenMoePrefillFactory = std::function<std::unique_ptr<QwenMoePrefill>(
     const models::QwenModelWeights&, std::uint32_t, std::string*)>;
 
-void SetQwenMoePrefillFactory(QwenMoePrefillFactory factory);
+void SetQwenMoePrefillFactory(QwenMoePrefillFactory factory,
+                              QwenMoePrefillSizing sizing);
+/// The reserved maximum of the registered implementation; zero without one.
+[[nodiscard]] std::size_t EstimateQwenMoePrefillResidentBytes(
+    const models::QwenModelWeights& weights);
+[[nodiscard]] std::size_t EstimateQwenMoePrefillStreamScratchBytes(
+    const core::ModelConfig& config, std::uint32_t max_tokens);
 std::unique_ptr<QwenMoePrefill> CreateQwenMoePrefill(
     const models::QwenModelWeights& weights, std::uint32_t max_tokens,
     std::string* error);

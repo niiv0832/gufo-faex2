@@ -8,6 +8,7 @@
 
 #include "src/core/hip/detail/dispatch_telemetry.hpp"
 #include "src/core/hip/hip_utils.hpp"
+#include "src/models/qwen/hip/detail/memory_layout.hpp"
 
 namespace gufo::hip {
 namespace {
@@ -100,6 +101,15 @@ QwenGpuMemoryUsage QwenGpuExecutor::EstimateMemoryUsage(
     const core::ModelConfig& config, std::uint32_t max_context,
     QwenExecutionPolicy policy) {
   auto usage = QwenGpuArena::EstimateMemoryUsage(config, max_context, policy);
+  // Scratch kept per stream outside the arena, for the widest prompt batch:
+  // the quantized activations of Q8_0 projections, whose rows come from the
+  // arena's BF16 scratch, and the grouped MoE prefill.
+  const auto prompt =
+      detail::ComputeQwenPromptScratchShape(config, max_context);
+  usage.temporary_scratch_bytes +=
+      QuantizedActivationBytes(prompt.batch, prompt.width);
+  usage.temporary_scratch_bytes += EstimateQwenMoePrefillStreamScratchBytes(
+      config, static_cast<std::uint32_t>(prompt.batch));
   usage.temporary_scratch_bytes +=
       EstimateGpuSamplingWorkspaceBytes(config.vocab_size, max_context);
   // Reserve the bounded fallback for eight requests with eight rows each.
@@ -110,6 +120,18 @@ QwenGpuMemoryUsage QwenGpuExecutor::EstimateMemoryUsage(
       (features + config.vocab_size - 1) / config.vocab_size;
   usage.temporary_scratch_bytes +=
       std::max(rows, feature_rows) * config.vocab_size * sizeof(float);
+  return usage;
+}
+
+QwenGpuMemoryUsage QwenGpuExecutor::EstimateMemoryUsage(
+    const QwenGpuModel& model, std::uint32_t max_context,
+    QwenExecutionPolicy policy) {
+  auto usage = EstimateMemoryUsage(model.GetConfig(), max_context, policy);
+  if (model.VisionEncoder() != nullptr) {
+    usage.temporary_scratch_bytes += detail::MaxQwenVisionInputBytes(
+        model.GetConfig(), max_context,
+        sizeof(models::qwen::vision::DeviceRope));
+  }
   return usage;
 }
 
@@ -124,6 +146,10 @@ QwenGpuMemoryUsage QwenGpuExecutor::GetMemoryUsage() const {
                                    weights_.config.vocab_size * sizeof(float);
   usage.temporary_scratch_bytes += sampling_workspace_.SizeBytes();
   usage.temporary_scratch_bytes += vision_input_.Bytes();
+  usage.temporary_scratch_bytes +=
+      StreamQ8ActivationScratchBytes(arena_.stream);
+  usage.temporary_scratch_bytes +=
+      model_->MoePrefillStreamScratchBytes(arena_.stream);
   return usage;
 }
 

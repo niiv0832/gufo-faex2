@@ -49,6 +49,70 @@ bool HipOk(hipError_t status, const char* what, std::string* error) {
   return false;
 }
 
+// Whether the grouped kernels serve a model of this shape at all.
+bool GroupedShape(const core::ModelConfig& c) {
+  return c.IsMoe() && c.hidden_size % 256 == 0 && c.expert_ff % 256 == 0;
+}
+
+bool GroupedGate(const QwenLayerWeights& layer) {
+  const bool gate_ok = layer.ffn_gate_exps.type == core::GgmlType::kQ4_K ||
+                       layer.ffn_gate_exps.type == core::GgmlType::kQ5_K;
+  return gate_ok && layer.ffn_up_exps.type == layer.ffn_gate_exps.type;
+}
+
+// Bytes of one layer's down experts re-encoded as Q8_0.
+std::size_t Q8CopyBytes(const core::ModelConfig& c) {
+  const std::size_t rows = std::size_t{c.num_experts} * c.hidden_size;
+  return rows * (c.expert_ff / 32) * 34;
+}
+
+std::uint32_t TileCapacity(const core::ModelConfig& c,
+                           std::uint32_t max_tokens) {
+  const std::size_t slots = std::size_t{max_tokens} * c.num_experts_used;
+  return static_cast<std::uint32_t>(
+      (slots + std::size_t{c.num_experts} * (kPadRows - 1)) / kPadRows +
+      c.num_experts + 1);
+}
+
+// Byte sizes of one stream's scratch, in allocation order.
+struct ScratchBytes {
+  std::size_t ids;
+  std::size_t weights;
+  std::size_t counts;
+  std::size_t bounds;
+  std::size_t cursors;
+  std::size_t rows;   // rows_token and rows_slot each
+  std::size_t tiles;  // tiles_pair and tiles_down each
+  std::size_t act;
+  std::size_t down;
+  std::size_t host_counts;
+  std::size_t host_tiles;
+
+  [[nodiscard]] std::size_t Total() const noexcept {
+    return ids + weights + counts + bounds + cursors + 2 * rows + 2 * tiles +
+           act + down + host_counts + host_tiles;
+  }
+};
+
+ScratchBytes SizeScratch(const core::ModelConfig& c, std::uint32_t max_tokens) {
+  const std::size_t slots = std::size_t{max_tokens} * c.num_experts_used;
+  const std::size_t rows = RoutedCompactRows(slots, c.num_experts);
+  const std::size_t tiles = TileCapacity(c, max_tokens);
+  return {
+      .ids = slots * sizeof(std::int32_t),
+      .weights = slots * sizeof(float),
+      .counts = c.num_experts * sizeof(std::uint32_t),
+      .bounds = (c.num_experts + 1) * sizeof(std::int32_t),
+      .cursors = c.num_experts * sizeof(std::int32_t),
+      .rows = rows * sizeof(std::int32_t),
+      .tiles = tiles * sizeof(std::int32_t),
+      .act = slots * c.expert_ff * sizeof(__half),
+      .down = slots * c.hidden_size * sizeof(__half),
+      .host_counts = c.num_experts * sizeof(std::uint32_t),
+      .host_tiles = 2 * tiles * sizeof(std::int32_t),
+  };
+}
+
 class Qwen35MoePrefill final : public hip::QwenMoePrefill {
   struct Scratch {
     std::int32_t* ids_{nullptr};
@@ -90,16 +154,13 @@ public:
       const QwenModelWeights& weights, std::uint32_t max_tokens,
       std::string* error) {
     const auto& c = weights.config;
-    if (!c.IsMoe() || c.hidden_size % 256 != 0 || c.expert_ff % 256 != 0) {
+    if (!GroupedShape(c)) {
       return nullptr;
     }
     std::unique_ptr<Qwen35MoePrefill> self(new Qwen35MoePrefill());
     self->config_ = c;
     self->max_tokens_ = max_tokens;
-    const std::size_t slots = std::size_t{max_tokens} * c.num_experts_used;
-    self->tile_capacity_ = static_cast<std::uint32_t>(
-        (slots + std::size_t{c.num_experts} * (kPadRows - 1)) / kPadRows +
-        c.num_experts + 1);
+    self->tile_capacity_ = TileCapacity(c, max_tokens);
     hipStream_t stream = nullptr;
     if (!HipOk(hipStreamCreate(&stream), "stream", error)) {
       return nullptr;
@@ -109,9 +170,7 @@ public:
     for (std::size_t l = 0; l < weights.layers.size(); ++l) {
       const auto& layer = weights.layers[l];
       LayerExperts& out = self->layers_[l];
-      const bool gate_ok = layer.ffn_gate_exps.type == core::GgmlType::kQ4_K ||
-                           layer.ffn_gate_exps.type == core::GgmlType::kQ5_K;
-      if (!gate_ok || layer.ffn_up_exps.type != layer.ffn_gate_exps.type) {
+      if (!GroupedGate(layer)) {
         continue;
       }
       out.gate = layer.ffn_gate_exps.data;
@@ -133,7 +192,7 @@ public:
         case core::GgmlType::kQ6_K: {
           // The grouped down kernel has no Q6_K decoder: keep an int8 copy.
           const std::size_t rows = std::size_t{c.num_experts} * c.hidden_size;
-          const std::size_t bytes = rows * (c.expert_ff / 32) * 34;
+          const std::size_t bytes = Q8CopyBytes(c);
           if (!HipOk(hipMalloc(&out.converted_down, bytes), "q8 copy", error)) {
             hipStreamDestroy(stream);
             return nullptr;
@@ -157,6 +216,7 @@ public:
     if (!synced) {
       return nullptr;
     }
+    self->converted_bytes_ = converted_bytes;
     if (converted_bytes != 0) {
       std::fprintf(
           stderr, "MoE prefill: %.2f GiB of Q6_K experts re-encoded as Q8_0\n",
@@ -171,6 +231,39 @@ public:
         (void)hipFree(layer.converted_down);
       }
     }
+  }
+
+  // The copies Create makes: one per layer whose gate the grouped kernels
+  // read and whose down experts are Q6_K.
+  static std::size_t EstimateResidentBytes(const QwenModelWeights& weights) {
+    if (!GroupedShape(weights.config)) {
+      return 0;
+    }
+    std::size_t bytes = 0;
+    for (const auto& layer : weights.layers) {
+      if (GroupedGate(layer) &&
+          layer.ffn_down_exps.type == core::GgmlType::kQ6_K) {
+        bytes += Q8CopyBytes(weights.config);
+      }
+    }
+    return bytes;
+  }
+
+  static std::size_t EstimateStreamScratchBytes(const core::ModelConfig& config,
+                                                std::uint32_t max_tokens) {
+    return GroupedShape(config) ? SizeScratch(config, max_tokens).Total() : 0;
+  }
+
+  std::size_t ResidentBytes() const noexcept override {
+    return converted_bytes_;
+  }
+
+  std::size_t StreamScratchBytes(hipStream_t stream) override {
+    const std::lock_guard lock(scratch_mutex_);
+    const auto found = scratch_by_stream_.find(stream);
+    return found != scratch_by_stream_.end() && found->second != nullptr
+               ? SizeScratch(config_, max_tokens_).Total()
+               : 0;
   }
 
   std::uint32_t MaxTokens() const noexcept override { return max_tokens_; }
@@ -291,49 +384,34 @@ private:
   }
 
   bool Allocate(Scratch& scratch, std::string* error) {
-    const std::size_t slots =
-        std::size_t{max_tokens_} * config_.num_experts_used;
-    const std::size_t rows = RoutedCompactRows(slots, config_.num_experts);
-    return HipOk(hipMalloc(&scratch.ids_, slots * sizeof(std::int32_t)), "ids",
+    const ScratchBytes bytes = SizeScratch(config_, max_tokens_);
+    return HipOk(hipMalloc(&scratch.ids_, bytes.ids), "ids", error) &&
+           HipOk(hipMalloc(&scratch.weights_, bytes.weights), "weights",
                  error) &&
-           HipOk(hipMalloc(&scratch.weights_, slots * sizeof(float)), "weights",
+           HipOk(hipMalloc(&scratch.counts_, bytes.counts), "counts", error) &&
+           HipOk(hipMalloc(&scratch.bounds_, bytes.bounds), "bounds", error) &&
+           HipOk(hipMalloc(&scratch.cursors_, bytes.cursors), "cursors",
                  error) &&
-           HipOk(hipMalloc(&scratch.counts_,
-                           config_.num_experts * sizeof(std::uint32_t)),
-                 "counts", error) &&
-           HipOk(hipMalloc(&scratch.bounds_,
-                           (config_.num_experts + 1) * sizeof(std::int32_t)),
-                 "bounds", error) &&
-           HipOk(hipMalloc(&scratch.cursors_,
-                           config_.num_experts * sizeof(std::int32_t)),
-                 "cursors", error) &&
-           HipOk(hipMalloc(&scratch.rows_token_, rows * sizeof(std::int32_t)),
-                 "rows", error) &&
-           HipOk(hipMalloc(&scratch.rows_slot_, rows * sizeof(std::int32_t)),
-                 "rows", error) &&
-           HipOk(hipMalloc(&scratch.tiles_pair_,
-                           tile_capacity_ * sizeof(std::int32_t)),
-                 "tiles", error) &&
-           HipOk(hipMalloc(&scratch.tiles_down_,
-                           tile_capacity_ * sizeof(std::int32_t)),
-                 "tiles", error) &&
-           HipOk(hipMalloc(&scratch.act_,
-                           slots * config_.expert_ff * sizeof(__half)),
-                 "act", error) &&
-           HipOk(hipMalloc(&scratch.down_,
-                           slots * config_.hidden_size * sizeof(__half)),
-                 "down", error) &&
+           HipOk(hipMalloc(&scratch.rows_token_, bytes.rows), "rows", error) &&
+           HipOk(hipMalloc(&scratch.rows_slot_, bytes.rows), "rows", error) &&
+           HipOk(hipMalloc(&scratch.tiles_pair_, bytes.tiles), "tiles",
+                 error) &&
+           HipOk(hipMalloc(&scratch.tiles_down_, bytes.tiles), "tiles",
+                 error) &&
+           HipOk(hipMalloc(&scratch.act_, bytes.act), "act", error) &&
+           HipOk(hipMalloc(&scratch.down_, bytes.down), "down", error) &&
            HipOk(hipHostMalloc(reinterpret_cast<void**>(&scratch.host_counts_),
-                               config_.num_experts * sizeof(std::uint32_t)),
+                               bytes.host_counts),
                  "host counts", error) &&
            HipOk(hipHostMalloc(reinterpret_cast<void**>(&scratch.host_tiles_),
-                               2 * tile_capacity_ * sizeof(std::int32_t)),
+                               bytes.host_tiles),
                  "host tiles", error);
   }
 
   core::ModelConfig config_;
   std::uint32_t max_tokens_{0};
   std::uint32_t tile_capacity_{0};
+  std::size_t converted_bytes_{0};
   std::vector<LayerExperts> layers_;
   std::mutex scratch_mutex_;
   std::unordered_map<hipStream_t, std::unique_ptr<Scratch>> scratch_by_stream_;
@@ -342,7 +420,10 @@ private:
 }  // namespace
 
 void RegisterQwenMoePrefill() {
-  hip::SetQwenMoePrefillFactory(&Qwen35MoePrefill::Create);
+  hip::SetQwenMoePrefillFactory(
+      &Qwen35MoePrefill::Create,
+      {.resident_bytes = &Qwen35MoePrefill::EstimateResidentBytes,
+       .stream_scratch_bytes = &Qwen35MoePrefill::EstimateStreamScratchBytes});
 }
 
 }  // namespace gufo::models::qwen38_flash_next::rocm

@@ -64,6 +64,13 @@ public:
   HipblasLtGemm(HipblasLtGemm&&) noexcept;
   HipblasLtGemm& operator=(HipblasLtGemm&&) noexcept;
 
+  /// Device bytes of the plan workspace this object holds.
+  [[nodiscard]] std::size_t WorkspaceBytes() const noexcept;
+  /// The most a default-constructed object allocates for its workspace: zero
+  /// without a plan cache (GUFO_HIPBLASLT_PLAN_CACHE), otherwise the cap on a
+  /// persisted plan's workspace.
+  [[nodiscard]] static std::size_t MaxWorkspaceBytes() noexcept;
+
   /// Computes Y[B, M] = X_bf16[B, K] * A_bf16[M, K]^T.
   /// Returns false when hipBLASLt cannot provide a supported plan.
   [[nodiscard]] bool RunBf16(const void* a_bf16, const void* x_bf16, float* y,
@@ -246,6 +253,11 @@ void LaunchQuantizeActivationQ8_1FromFp32(const float* fp32_x, void* q8_1_out,
 /// before LaunchBatchedQuantGEMMPreQuantized can consume it.
 [[nodiscard]] std::size_t QuantizedActivationBytes(std::size_t batch,
                                                    std::size_t k);
+
+/// Device bytes of the Q8_1 activation scratch LaunchBatchedQuantGEMM keeps
+/// for `stream`: zero until a Q8_0 projection runs on it, then the largest
+/// QuantizedActivationBytes it was asked for.
+[[nodiscard]] std::size_t StreamQ8ActivationScratchBytes(hipStream_t stream);
 
 /// Fuses SwiGLU activation (SiLU(gate) * up) with Q8_1 quantization into one
 /// kernel

@@ -417,6 +417,18 @@ HipblasLtGemm::HipblasLtGemm(HipblasLtGemm&&) noexcept = default;
 
 HipblasLtGemm& HipblasLtGemm::operator=(HipblasLtGemm&&) noexcept = default;
 
+std::size_t HipblasLtGemm::WorkspaceBytes() const noexcept {
+  return impl_ != nullptr ? impl_->workspace_capacity : 0;
+}
+
+std::size_t HipblasLtGemm::MaxWorkspaceBytes() noexcept {
+  // Default options take a workspace only for the plans of a cache file; how
+  // much they ask for is known once a handle has matched the file's key.
+  return std::getenv("GUFO_HIPBLASLT_PLAN_CACHE") != nullptr
+             ? kMaxPersistedWorkspaceBytes
+             : 0;
+}
+
 bool HipblasLtGemm::RunBf16(const void* a_bf16, const void* x_bf16, float* y,
                             std::size_t batch_size, std::size_t m,
                             std::size_t k, hipStream_t stream,

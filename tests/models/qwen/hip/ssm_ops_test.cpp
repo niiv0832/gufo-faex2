@@ -559,8 +559,9 @@ void TestBf16RecurrentMemoryAndSnapshot() {
       static_cast<std::size_t>(production.SsmLayerCount()) *
       production.ssm_time_step_rank * production.ssm_state_size *
       production.SsmValueSize();
+  // The reserve holds both buffers of the rollback pair.
   const std::size_t expected_savings =
-      recurrent_elements * (sizeof(float) - sizeof(std::uint16_t));
+      2 * recurrent_elements * (sizeof(float) - sizeof(std::uint16_t));
   if (fp32_usage.request_state_bytes - bf16_usage.request_state_bytes !=
       expected_savings) {
     throw std::runtime_error(

@@ -90,6 +90,8 @@ using QwenNpuFfnFactory = std::function<std::unique_ptr<QwenNpuFfn>(
 /// The NPU runtime registers itself here at startup; without a registered
 /// factory (or without GUFO_NPU_DIR) the 27B runs on the GPU alone.
 void SetQwenNpuFfnFactory(QwenNpuFfnFactory factory);
+/// Whether an NPU runtime registered itself, so a model may get an offload.
+[[nodiscard]] bool HasQwenNpuFfnFactory();
 std::unique_ptr<QwenNpuFfn> CreateQwenNpuFfn(
     const models::QwenModelWeights& weights, std::string* error);
 

@@ -2,6 +2,7 @@
 #define GUFO_MODELS_QWEN_HIP_EXECUTOR_HPP_
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
@@ -72,8 +73,16 @@ struct QwenGpuWeightRegion {
   bool owns_device_allocation{false};
 };
 
+/// Device memory of one session: its executor or draft head and what their
+/// streams keep. The Estimate* functions return the reserved maximum, every
+/// lazily allocated buffer included; the Get* functions return what is
+/// allocated now and never exceed the estimate of the same object. Memory of
+/// the model itself is accounted by QwenGpuModel.
 struct QwenGpuMemoryUsage {
+  /// Session state: attention K/V and both buffers of the recurrent rollback
+  /// pair once the second exists.
   std::size_t request_state_bytes{0};
+  /// Everything else the session holds between requests.
   std::size_t temporary_scratch_bytes{0};
 
   [[nodiscard]] std::size_t TotalBytes() const noexcept {
@@ -118,7 +127,18 @@ public:
   [[nodiscard]] std::size_t GetWeightRegionCount() const noexcept {
     return weight_regions_.size();
   }
+  /// Device bytes of the loaded weights and the vision encoder.
   [[nodiscard]] std::size_t GetResidentBytes() const noexcept;
+  /// Device bytes of the copies derived from the weights on first use and
+  /// shared by every session: the router split weights and the experts the
+  /// grouped prefill re-encodes. GetDerivedWeightBytes is what exists now,
+  /// EstimateDerivedWeightBytes the most there can be.
+  [[nodiscard]] std::size_t GetDerivedWeightBytes() const;
+  [[nodiscard]] std::size_t EstimateDerivedWeightBytes() const;
+  /// Bytes of the scratch the grouped prefill keeps for `stream`; zero until
+  /// that stream's first grouped pass.
+  [[nodiscard]] std::size_t MoePrefillStreamScratchBytes(
+      hipStream_t stream) const;
   /// NPU offload of the FFN gate/up projections, or null when it is off.
   [[nodiscard]] QwenNpuFfn* NpuFfn() const;
   /// Grouped-expert prefill for qwen35moe, or null when unavailable.
@@ -141,6 +161,9 @@ private:
   mutable std::unique_ptr<QwenNpuFfn> npu_ffn_;
   mutable std::once_flag moe_prefill_once_;
   mutable std::unique_ptr<QwenMoePrefill> moe_prefill_;
+  // moe_prefill_ once its creation finished, for readers that must not
+  // trigger it.
+  mutable std::atomic<QwenMoePrefill*> moe_prefill_ready_{nullptr};
   mutable std::vector<std::uint16_t*> router_split_;
   mutable std::mutex router_split_mutex_;
 };
@@ -439,6 +462,9 @@ public:
       const noexcept {
     return policy_.recurrent_state_storage;
   }
+  /// The reserved maximum of one arena, and what this arena holds now: the
+  /// second prompt bank, the second recurrent buffer and the replay log count
+  /// in the latter once allocated.
   [[nodiscard]] static QwenGpuMemoryUsage EstimateMemoryUsage(
       const core::ModelConfig& config, std::uint32_t max_context,
       QwenExecutionPolicy policy = QwenExecutionPolicy::Production());
@@ -649,9 +675,19 @@ public:
   [[nodiscard]] std::uint32_t GetMaxContext() const noexcept {
     return arena_.GetMaxContext();
   }
+  /// The reserved maximum of one executor: its arena, sampling and
+  /// verification buffers and the scratch its stream comes to keep in the
+  /// quantized-activation and grouped-prefill tables.
   [[nodiscard]] static QwenGpuMemoryUsage EstimateMemoryUsage(
       const core::ModelConfig& config, std::uint32_t max_context,
       QwenExecutionPolicy policy = QwenExecutionPolicy::Production());
+  /// The same for a session of `model`, which with a vision encoder also
+  /// reserves the vision input of a context of image tokens.
+  [[nodiscard]] static QwenGpuMemoryUsage EstimateMemoryUsage(
+      const QwenGpuModel& model, std::uint32_t max_context,
+      QwenExecutionPolicy policy = QwenExecutionPolicy::Production());
+  /// What this executor holds now; never more than the estimate for its
+  /// model.
   [[nodiscard]] QwenGpuMemoryUsage GetMemoryUsage() const;
   void SetCancellationCheck(std::function<bool()> check) {
     cancellation_check_ = std::move(check);

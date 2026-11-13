@@ -58,6 +58,9 @@ add_qwen_cpu_test(qwen_numerical_overrides_test
 add_qwen_cpu_test(qwen_attention_policy_test
   tests/models/qwen/hip/attention_policy_test.cpp
   "cpu;models;qwen;hip;attention;dispatch")
+add_qwen_cpu_test(qwen_memory_layout_test
+  tests/models/qwen/hip/memory_layout_test.cpp
+  "cpu;models;qwen;hip;memory")
 add_qwen_cpu_test(qwen_gemm_route_test
   tests/models/qwen/gemm_route_test.cpp
   "cpu;models;qwen;gemm;dispatch")
@@ -183,6 +186,17 @@ if (ENGINE_ENABLE_HIP)
   target_link_libraries(qwen_mtp_shared_score_memory_test PRIVATE
     gufo_qwen38_flash_next)
   set_tests_properties(qwen_mtp_shared_score_memory_test PROPERTIES
+    RUN_SERIAL TRUE TIMEOUT 900)
+
+  # One target session's memory accounting through the steps that allocate
+  # lazily: what it holds stays within its reserve, as do the copies the model
+  # derives from its weights. Skipped without the model.
+  add_qwen_hip_test(qwen_session_memory_test
+    tests/models/qwen/hip/session_memory_test.cpp
+    "gpu;hip;qwen;memory;external-model")
+  target_link_libraries(qwen_session_memory_test PRIVATE
+    gufo_qwen38_flash_next)
+  set_tests_properties(qwen_session_memory_test PROPERTIES
     RUN_SERIAL TRUE TIMEOUT 900)
 
   # The fused end of a MoE layer equals the launches it replaces bit for bit.

@@ -1092,9 +1092,18 @@ public:
   }
 
   [[nodiscard]] TextRunnerResourceClaim ResourceClaim() const override {
+    // Per session: the reserved maximum of its executor and draft head, so
+    // buffers a session allocates on first use are admitted before any state
+    // exists. MeasuredResources() reports what a state holds and stays below.
     auto usage = hip::QwenGpuExecutor::EstimateMemoryUsage(
-        model_->GetConfig(), max_context_, execution_policy_);
-    std::size_t resident_weights = model_->GetResidentBytes();
+        *model_, max_context_, execution_policy_);
+    // Shared by every session: the weights, and the copies the model derives
+    // from them on first use at their reserved maximum.
+    const std::size_t derived_weights = model_->EstimateDerivedWeightBytes();
+    const std::size_t derived_pending =
+        derived_weights -
+        std::min(derived_weights, model_->GetDerivedWeightBytes());
+    std::size_t resident_weights = model_->GetResidentBytes() + derived_weights;
     if (drafts_.dflash != nullptr) {
       const auto draft = hip::QwenDFlashGpuExecutor::EstimateMemoryUsage(
           *drafts_.dflash, max_context_, MaximumDecodeBatchWidth());
@@ -1112,17 +1121,17 @@ public:
     std::size_t free_bytes = 0;
     std::size_t total_bytes = 0;
     std::optional<std::size_t> capacity;
-    if (hipMemGetInfo(&free_bytes, &total_bytes) == hipSuccess) {
-      capacity = free_bytes;
-    }
     // Snapshot buffers are device allocations, but on a unified-memory APU
     // they are carved from the same RAM as every host allocation, and HIP's
     // free figure does not see host pressure. Cap them by the host budget too.
     std::size_t snapshot_capacity = HostSnapshotBudgetBytes();
     std::size_t snapshot_ceiling = HostSnapshotCeilingBytes();
-    if (capacity.has_value()) {
-      snapshot_capacity = std::min(snapshot_capacity, *capacity);
-      snapshot_ceiling = std::min(snapshot_ceiling, *capacity);
+    if (hipMemGetInfo(&free_bytes, &total_bytes) == hipSuccess) {
+      snapshot_capacity = std::min(snapshot_capacity, free_bytes);
+      snapshot_ceiling = std::min(snapshot_ceiling, free_bytes);
+      // The derived copies that do not exist yet come out of the same free
+      // memory as the session states.
+      capacity = free_bytes - std::min(free_bytes, derived_pending);
     }
     return {
         .resident_weights_bytes = resident_weights,
