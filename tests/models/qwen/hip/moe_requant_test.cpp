@@ -1,15 +1,19 @@
 // The Q8_0 copy of Q6_K expert down weights that the grouped-expert prefill
 // reads (RequantToQ8_0), on the real weights of every Q6_K layer.
 //
-// Exact contracts, checked for every block:
+// The original values come from an independent host decoder of the GGUF
+// bytes. Exact contracts, checked for every block against those values:
 //   - the device conversion is repeatable bit for bit;
-//   - every converted weight is within half a Q8_0 step of the original
-//     value, the bound of the format (see BlockBound).
-// Measured and printed, with no threshold: how the device conversion compares
-// with the same algorithm in IEEE single precision on the host (the kernel is
-// built with -ffast-math, so its division need not be correctly rounded),
-// and how much the conversion loses against the original Q6_K values and
-// against the Q6_K quantization step.
+//   - the stored scale is max|w| / 127 of the block to half precision;
+//   - every converted weight is within half a step of that scale of the
+//     original value (see BlockViolations for both bounds).
+// The kernel is built with -ffast-math, so its divisions need not be
+// correctly rounded and the result is not required to equal the IEEE
+// single-precision conversion bit for bit; the number of blocks and codes
+// that differ from it is printed. A block with a doubled scale and a block
+// with a displaced code must be rejected, or the check itself fails.
+// Measured and printed, with no threshold: how much the conversion loses
+// against the original Q6_K values and against the Q6_K quantization step.
 //
 // qwen_moe_requant_test [MODEL.gguf]
 // Without an argument GUFO_QWEN_LAYERED_PREFILL_MODEL names the weights; the
@@ -46,6 +50,8 @@ struct LayerStats {
   std::size_t host_scale_mismatch_blocks = 0;
   std::size_t host_code_mismatch_weights = 0;
   std::size_t bound_violations = 0;
+  bool controls_done = false;
+  int controls_rejected = 0;
   std::size_t changed_weights = 0;
   std::size_t beyond_half_q6_step = 0;
   double sum_error2 = 0.0;
@@ -58,15 +64,39 @@ struct LayerStats {
   std::size_t q6_step_weights = 0;
 };
 
-// Half a step of the stored scale s bounds the rounding of v / s to an
-// integer, provided no code is clamped. The stored scale is max|v| / 127
-// rounded to half precision, within 2^-11 of it, so the largest quotient is at
-// most 127 * (1 + 2^-10) < 127.5 and rounds to 127 without clamping. Division
-// and product are single-precision operations of relative error at most
-// 2^-22 each under fast-math reciprocal approximations, which moves a
-// quotient of at most 127.2 by less than 2^-13; the bound keeps that margin.
-double BlockBound(double scale) {
-  return scale * (0.5 + std::ldexp(1.0, -12));
+// Violations of the conversion contract in one block of 32 weights, judged
+// from the independently decoded originals alone.
+//
+// Scale. With a = max|w| / 127 exactly, the kernel stores half(a') where a'
+// is a single-precision quotient, or product with a reciprocal under
+// fast-math, within 2^-22 of a. Rounding to half precision moves it by at
+// most 2^-11 of its value, or 2^-25 absolute for a subnormal half. So
+// |s - a| <= a * (2^-11 + 2^-20) + 2^-25.
+//
+// Weights. A code is round(w / s) computed as a single-precision product with
+// a reciprocal of s, each within 2^-22: the quotient, at most
+// 127 * (1 + 2^-10) < 127.5, is off by less than 2^-13 before rounding, so no
+// code is clamped and |s * code - w| <= s * (0.5 + 2^-12), with s bounded as
+// above.
+std::size_t BlockViolations(const QuantCode* original, const std::uint8_t* q8) {
+  double block_max = 0.0;
+  for (int i = 0; i < 32; ++i)
+    block_max = std::max(block_max, std::fabs(original[i].Value()));
+  const double ideal = block_max / 127.0;
+  const double scale = gufo::test_reference::ReadHalf(q8);
+  const double scale_bound =
+      (ideal * (std::ldexp(1.0, -11) + std::ldexp(1.0, -20))) +
+      std::ldexp(1.0, -25);
+  std::size_t violations = !(std::fabs(scale - ideal) <= scale_bound);
+  const double weight_bound =
+      (ideal + scale_bound) * (0.5 + std::ldexp(1.0, -12));
+  for (int i = 0; i < 32; ++i) {
+    const auto code = static_cast<std::int8_t>(q8[2 + i]);
+    const double stored = scale * code;
+    violations += code == -128 ||
+                  !(std::fabs(stored - original[i].Value()) <= weight_bound);
+  }
+  return violations;
 }
 
 }  // namespace
@@ -162,7 +192,6 @@ int main(int argc, char** argv) {
             const double stored = scale * static_cast<std::int8_t>(q8[2 + i]);
             const double err = std::fabs(stored - value);
             s.host_code_mismatch_weights += host[2 + i] != q8[2 + i];
-            s.bound_violations += !(err <= BlockBound(scale));
             s.changed_weights += err != 0.0;
             block_max = std::max(block_max, std::fabs(value));
             block_error_max = std::max(block_error_max, err);
@@ -180,6 +209,31 @@ int main(int argc, char** argv) {
               s.beyond_half_q6_step += ratio > 0.5;
             }
           }
+          s.bound_violations += BlockViolations(original, q8);
+          if (!s.controls_done && block_max > 0.0) {
+            // The check must reject a wrong conversion of real data: a
+            // self-consistent conversion of the block with twice the scale
+            // (every code rounded for that scale, so each weight is within
+            // half of the coarser step), and the block with one code two
+            // steps away.
+            s.controls_done = true;
+            std::uint8_t doubled[34];
+            std::memcpy(doubled, q8, sizeof(doubled));
+            doubled[1] = static_cast<std::uint8_t>(doubled[1] + 0x04);
+            const double coarse = gufo::test_reference::ReadHalf(doubled);
+            for (int i = 0; i < 32; ++i)
+              doubled[2 + i] =
+                  static_cast<std::uint8_t>(static_cast<std::int8_t>(
+                      std::nearbyint(original[i].Value() / coarse)));
+            std::uint8_t displaced[34];
+            std::memcpy(displaced, q8, sizeof(displaced));
+            const auto code = static_cast<std::int8_t>(displaced[2]);
+            displaced[2] = static_cast<std::uint8_t>(
+                static_cast<std::int8_t>(code > 0 ? code - 2 : code + 2));
+            s.controls_rejected =
+                (BlockViolations(original, doubled) != 0 ? 1 : 0) +
+                (BlockViolations(original, displaced) != 0 ? 1 : 0);
+          }
           ++s.blocks;
           s.weights += 32;
           s.sum_error2 += block_error2;
@@ -193,12 +247,14 @@ int main(int argc, char** argv) {
           }
         }
       }
-      const bool ok = s.repeat_mismatch_bytes == 0 && s.bound_violations == 0;
+      const bool ok = s.repeat_mismatch_bytes == 0 && s.bound_violations == 0 &&
+                      s.controls_rejected == 2;
       passed = passed && ok;
       const auto weights_count = static_cast<double>(s.weights);
       std::cout << "layer=" << l << ",blocks=" << s.blocks
                 << ",repeat_mismatch_bytes=" << s.repeat_mismatch_bytes
-                << ",beyond_half_q8_step=" << s.bound_violations << ','
+                << ",contract_violations=" << s.bound_violations
+                << ",wrong_blocks_rejected=" << s.controls_rejected << "/2,"
                 << (ok ? "PASS" : "FAIL") << '\n'
                 << "  device against IEEE host conversion: scale differs in "
                 << s.host_scale_mismatch_blocks << " blocks, code differs in "
