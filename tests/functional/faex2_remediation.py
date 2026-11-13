@@ -466,8 +466,18 @@ class Checks:
         write_json(state_path, state)
 
     # --- диск: фаза после перезапуска ------------------------------------
-    def disk_after(self, state):
-        cases = state.get("cases", {})
+    def disk_after(self, state_path):
+        cases = {}
+
+        def load():
+            state = json.loads(Path(state_path).read_text())
+            need(isinstance(state, dict) and isinstance(state.get("cases"), dict),
+                 "restart state has no cases object")
+            cases.update(state["cases"])
+            return {"prepared": sorted(cases), "state_sha256": hashlib.sha256(
+                Path(state_path).read_bytes()).hexdigest()}
+        self.gate("disk_restore_state", "Состояние фазы before (restart-state.json) существует и читается; "
+                  "отсутствующий или повреждённый файл — FAIL, а не пропуск.", load)
 
         def restore(tag, exact):
             def run():
@@ -744,19 +754,27 @@ class Checks:
         def after_cancel():
             victim, factor = SESSIONS[1]
             long_request, _ = self.product_case("ses-c", victim, factor, 1, 2, long=True)
-            cases = [(f"ses-c-{marker}", self.product_case("ses-c", marker, value, 1, turn)[0])
-                     for (marker, value), turn in zip(SESSIONS, turns) if marker != victim]
+            cases, expected = [], {}
+            for (marker, value), turn in zip(SESSIONS, turns):
+                if marker != victim:
+                    request, answer = self.product_case("ses-c", marker, value, 1, turn)
+                    cases.append((f"ses-c-{marker}", request))
+                    expected[f"ses-c-{marker}"] = (marker, answer)
             with ThreadPoolExecutor(max_workers=4) as pool:
                 cancel = pool.submit(self.e.send, "ses-c-cancelled", long_request, 120, 3)
                 peers = [pool.submit(self.e.send, identifier, request) for identifier, request in cases]
                 cancelled, rows = cancel.result(), [peer.result() for peer in peers]
             need(cancelled["status"] == "CANCELLED", "the session was not cancelled mid-answer",
                  {"status": cancelled["status"]})
+            # Полный ожидаемый ответ каждого соседа проверяется здесь, во время отмены:
+            # верный последующий повтор не исправляет неверный ответ до него.
             for row in rows:
-                marker = row["id"].rsplit("-", 1)[1]
+                marker, answer = expected[row["id"]]
                 result = done(row)
-                need(not self.foreign(result, marker) and (json_answer(result) or {}).get("session") == marker,
-                     row["id"] + ": peer answer is wrong during the cancellation", {"text": result["text"]})
+                work(result)
+                need(not self.foreign(result, marker) and json_answer(result) == answer,
+                     row["id"] + ": peer answer is wrong during the cancellation",
+                     {"text": result["text"], "expected": answer})
             _, replay = self.cohort("ses-d", 4, 1, turns)
             line = self.log.completed(cancelled["result"].get("request_id"))
             evidence = {"replay": replay, "server_log": line and {"finish": line.get("finish")}}
@@ -764,8 +782,9 @@ class Checks:
                 raise NotExercised("server-side cancellation is not confirmed by the server log", evidence)
             return evidence
         self.gate("sessions_after_cancel", "Один из четырёх диалогов отменён посреди ответа (журнал: "
-                  "finish=cancelled), остальные три отвечают верно; затем все четыре повторены без чужих "
-                  "маркеров. Без журнала — NOT_EXERCISED.", after_cancel)
+                  "finish=cancelled); остальные три во время отмены дают полный верный ответ (session и "
+                  "все восемь произведений) без чужих маркеров; затем все четыре повторены так же. "
+                  "Без подтверждения журналом — NOT_EXERCISED.", after_cancel)
 
     # --- инструменты -------------------------------------------------------
     def tools(self):
@@ -995,6 +1014,8 @@ class Checks:
 
 
 def overall(gates):
+    if not gates:  # Ни одной выполненной проверки — не успех.
+        return "FAIL"
     statuses = {row["status"] for row in gates.values()}
     if "FAIL" in statuses or "RUNNING" in statuses:
         return "FAIL"
@@ -1025,22 +1046,40 @@ def run_check(args):
                     control=control_answers(args.control_report))
     evidence.report.update(phase=args.phase, groups=list(groups),
                            harness_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest())
+    plan = ("disk_after",) if args.phase == "after" else groups
+    stages = {name: "NOT_RUN" for name in plan}
+    evidence.report.update(status="RUNNING", stages=stages)
+    evidence.save()
+    interrupted = None
     try:
-        if args.phase == "after":
-            checks.disk_after(json.loads((Path(args.restore) / "restart-state.json").read_text()))
-        else:
-            for group in groups:
-                if group == "disk":
-                    checks.disk_before(evidence.output / "restart-state.json")
-                else:
-                    getattr(checks, group)()
+        for name in plan:
+            stages[name] = "FAILED"  # Остаётся при исключении внутри этапа.
+            before = len(checks.gates)
+            if name == "disk_after":
+                checks.disk_after(Path(args.restore) / "restart-state.json")
+            elif name == "disk":
+                checks.disk_before(evidence.output / "restart-state.json")
+            else:
+                getattr(checks, name)()
+            require(len(checks.gates) > before, "stage ran no gate: " + name)
+            stages[name] = "DONE"
+    except BaseException as error:  # Причина сохраняется; отчёт и код выхода согласованы.
+        evidence.report["error"] = type(error).__name__ + ": " + str(error)
+        if not isinstance(error, Exception):
+            interrupted = error
     finally:
-        evidence.report["status"] = overall(checks.gates)
+        status = overall(checks.gates)
+        if "error" in evidence.report or any(value != "DONE" for value in stages.values()):
+            status = "FAIL"
+        evidence.report["status"] = status
         evidence.report["finished_at"] = time.time()
         evidence.save()
     summary = {name: row["status"] for name, row in checks.gates.items()}
-    print(json.dumps({"status": evidence.report["status"], "gates": summary}, ensure_ascii=False, indent=1))
-    return {"PASS": 0, "FAIL": 1}.get(evidence.report["status"], 2)
+    print(json.dumps({"status": status, "error": evidence.report.get("error"), "gates": summary},
+                     ensure_ascii=False, indent=1))
+    if interrupted is not None:
+        raise interrupted
+    return {"PASS": 0, "FAIL": 1}.get(status, 2)
 
 
 # --- времена каждой фазы и память по этапам -------------------------------
@@ -1121,8 +1160,9 @@ KEY_QUESTION = ("Верни только JSON с полями start, middle, end
 
 class Composition:
     """Критерии отказа клиента: ошибка или пустой ответ, чужие данные, недоступный сервер."""
-    def __init__(self, evidence, nonce, clock=time):
-        self.e, self.nonce, self.clock = evidence, nonce, clock
+    def __init__(self, evidence, nonce, clock=time, log=None):
+        self.e, self.nonce, self.clock, self.log = evidence, nonce, clock, log or ServerLog(None)
+        self.rounds, self.cancels = [], []
         self.sessions = [{"marker": marker, "factor": factor, "keys": {
             "start": f"{marker}_S{index}{nonce}", "middle": f"{marker}_M{index}{nonce}",
             "end": f"{marker}_E{index}{nonce}"}} for index, (marker, factor) in enumerate(SESSIONS)]
@@ -1206,13 +1246,52 @@ class Composition:
                  for session in self.sessions]
         with ThreadPoolExecutor(max_workers=4) as pool:
             rows = list(pool.map(lambda case: self.e.send(case[0], case[2], 600), cases))
+        observed = {}
         for (_, session, _), row in zip(cases, rows):
             result = self.answered(row, session, session["keys"])
             if result:
+                metrics = result["metrics"]
+                observed[row["id"]] = {name: metrics.get(name) for name in (
+                    "prompt_tokens", "cached_tokens", "prefill_tokens", "draft_tokens",
+                    "draft_tokens_accepted", "physical_execution_width")}
                 session["history"] += [
                     {"role": "user", "content": "Повтори те же три ключа в том же JSON-формате."},
                     {"role": "assistant", "content": result["text"]}]
                 session["depth"] = result["metrics"].get("prompt_tokens", session.get("depth"))
+        self.rounds.append(observed)
+
+    def long_c4(self):
+        """Фактическая работа MTP на длинных продолжениях четырёх сеансов одной когортой."""
+        qualified, widths = [], []
+        for requests in self.rounds:
+            depths = [row["prompt_tokens"] for row in requests.values()]
+            if len(requests) != 4 or not all(type(depth) is int and depth >= MIN_DEPTH for depth in depths):
+                continue
+            width = max((row["physical_execution_width"] for row in requests.values()
+                         if type(row["physical_execution_width"]) in (int, float)), default=0)
+            widths.append(width)
+            if width >= 4:
+                qualified.append({"width": width, "requests": requests})
+        evidence = {"rounds": len(self.rounds), "widths": widths, "qualified_rounds": qualified[:3]}
+        for item in qualified:
+            for identifier, row in item["requests"].items():
+                proposed, accepted = row["draft_tokens"], row["draft_tokens_accepted"]
+                if not (type(proposed) is int and type(accepted) is int and proposed > 0 and 0 < accepted <= proposed):
+                    return {"status": "FAIL", "error": identifier + ": no proposed and accepted MTP drafts "
+                            "in a long C4 continuation", "evidence": {**evidence, "failed": {identifier: row}}}
+        if not qualified:
+            return {"status": "NOT_EXERCISED", "reason": "no round ran four long continuations as one "
+                    "physical cohort of width 4", "evidence": evidence}
+        return {"status": "PASS", "evidence": evidence}
+
+    def cancel_gate(self):
+        confirmed = [row for row in self.cancels if row["finish"] == "cancelled"]
+        evidence = {"client_cancellations": len(self.cancels), "server_confirmed": len(confirmed),
+                    "server_log": str(self.log.path) if self.log.path else "NOT_PROVIDED"}
+        if not confirmed or len(confirmed) != len(self.cancels):
+            return {"status": "NOT_EXERCISED", "reason": "not every client cancellation is confirmed by "
+                    "finish=cancelled in the server log", "evidence": evidence}
+        return {"status": "PASS", "evidence": evidence}
 
     def fresh(self, width):
         tag = f"n{self.counter}"
@@ -1233,7 +1312,9 @@ class Composition:
                                     max_tokens=400, structured=False)
         row = self.e.send(self.identifier("cancel-" + session["marker"]), request, 600, cancel=2)
         if row["status"] != "CANCELLED":
-            self.fail(row["id"], "mid-answer cancellation did not happen: " + row["status"])
+            return self.fail(row["id"], "mid-answer cancellation did not happen: " + row["status"])
+        line = self.log.completed(row["result"].get("request_id"), timeout=5)
+        self.cancels.append({"id": row["id"], "finish": line.get("finish") if line else None})
 
     def image(self):
         colour = ("red", "blue", "green")[self.counter % 3]
@@ -1286,7 +1367,22 @@ class Composition:
             self.fail("composition", type(error).__name__ + ": " + str(error))
             raise
         finally:
-            self.state["status"] = "FAIL" if self.state["failures"] else "WORKLOAD_PASS_REQUIRES_MONITOR_VERDICT"
+            gates = {"mtp_long_c4_continuations": {
+                "criterion": "Раунд продолжений четырёх сеансов с историями >= 110000 токенов исполнен "
+                "одной когортой (physical_execution_width == 4), и в каждом из четырёх запросов "
+                "draft_tokens > 0 и draft_tokens_accepted > 0. Нет такой когорты — NOT_EXERCISED; "
+                "когорта без черновиков — FAIL. Короткие C1 этот gate не закрывают.", **self.long_c4()},
+                "cancellation_confirmed": {
+                "criterion": "Каждая отмена посреди ответа подтверждена строкой finish=cancelled журнала "
+                "сервера; без журнала — NOT_EXERCISED.", **self.cancel_gate()}}
+            self.state["gates"] = gates
+            statuses = {gate["status"] for gate in gates.values()}
+            if "FAIL" in statuses:
+                self.fail("composition", "gate failed: " + ", ".join(
+                    name for name, gate in gates.items() if gate["status"] == "FAIL"))
+            self.state["status"] = ("FAIL" if self.state["failures"] else
+                                    "INCOMPLETE" if "NOT_EXERCISED" in statuses else
+                                    "WORKLOAD_PASS_REQUIRES_MONITOR_VERDICT")
             self.e.report["status"] = self.state["status"]
             self.e.save()
             write_json(self.e.output / "composition.json", self.state)
@@ -1296,10 +1392,16 @@ class Composition:
 def run_compose(args):
     require(args.duration >= 3600 or args.allow_short, "the pre-registered load is at least 3600 s")
     evidence = Evidence(args.base_url, args.output)
-    state = Composition(evidence, args.nonce or format(int(time.time()), "x")).run(args.records, args.duration)
+    composition = Composition(evidence, args.nonce or format(int(time.time()), "x"),
+                              log=ServerLog(args.server_log))
+    try:
+        state = composition.run(args.records, args.duration)
+    except Exception:  # Причина уже в failures; отчёт сохранён как FAIL.
+        state = composition.state
     print(json.dumps({"status": state["status"], "failures": len(state["failures"]),
+                      "gates": {name: gate["status"] for name, gate in state.get("gates", {}).items()},
                       "operations": state["operations"]}, ensure_ascii=False))
-    return 0 if state["status"] != "FAIL" else 1
+    return {"WORKLOAD_PASS_REQUIRES_MONITOR_VERDICT": 0, "FAIL": 1}.get(state["status"], 2)
 
 
 def main(argv=None):
@@ -1310,8 +1412,10 @@ def main(argv=None):
         command.add_argument("--base-url", required=True)
         command.add_argument("--output", type=Path, required=True)
         command.add_argument("--nonce", help="метка прогона; по умолчанию время запуска")
+    for name in ("check", "compose"):
+        sub.choices[name].add_argument("--server-log", type=Path,
+                                       help="локальная копия журнала сервера текущего запуска")
     check = sub.choices["check"]
-    check.add_argument("--server-log", type=Path, help="локальная копия журнала сервера текущего запуска")
     check.add_argument("--phase", choices=("before", "after"), default="before")
     check.add_argument("--restore", type=Path, help="каталог --output фазы before")
     check.add_argument("--only", help="группы через запятую: " + ", ".join(GROUPS))

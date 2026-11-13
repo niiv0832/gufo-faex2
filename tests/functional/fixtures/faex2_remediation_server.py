@@ -55,6 +55,7 @@ class Fake:
         self.lock = threading.Lock()
         self.ram, self.inflight, self.readers, self.counter = [], {}, [], 0
         self.budget_leak = None
+        self.peak = {}
         self.server = None
         self.answers = {}
         if fixture_images:
@@ -166,8 +167,10 @@ class Fake:
             marker = re.search(r"беседа (\w+)", system).group(1)
             if "cross_talk" in self.defects:
                 marker = "MOON_853" if marker != "MOON_853" else "OWL_142"
-            return json.dumps({"session": marker, "products": [int(factor.group(1)) * value
-                                                                for value in range(20, 28)]})
+            products = [int(factor.group(1)) * value for value in range(20, 28)]
+            if "zero_products_during_cancel" in self.defects and "ses-c" in system:
+                products = [0] * 8
+            return json.dumps({"session": marker, "products": products})
         if "ключ" in last.lower() and "JSON" in last:
             history = " ".join(text for _, text in texts)
             return json.dumps({name: re.search(rf"Ключ {name} = (\S+)", history).group(1)
@@ -236,8 +239,10 @@ def handler(fake):
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             with fake.lock:
                 fake.counter += 1
-                identifier = f"r{fake.counter}"
+                identifier = self.identifier = f"r{fake.counter}"
                 fake.inflight[identifier] = 1
+                for other in fake.inflight:  # Наибольшая ширина за время жизни запроса.
+                    fake.peak[other] = max(fake.peak.get(other, 1), len(fake.inflight))
             try:
                 if self.path == "/v1/completions":
                     self.serve_completion(body, identifier)
@@ -289,10 +294,10 @@ def handler(fake):
                 prefill += 1
             proposed = max(2, completion // 2) if fake.speculative == "mtp" else 0
             accepted = max(1, proposed - 1) if proposed else 0
-            if "no_drafts" in fake.defects:
+            if "no_drafts" in fake.defects or "no_long_drafts" in fake.defects and len(prompt) > 100000:
                 proposed = accepted = 0
             with fake.lock:
-                width = max(1, len(fake.inflight))
+                width = max(1, len(fake.inflight), fake.peak.pop(self.identifier, 1))
             if "width1" in fake.defects:
                 width = 1
             disk = source == "disk" and "no_disk_flag" not in fake.defects

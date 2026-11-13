@@ -13,6 +13,7 @@ import struct
 import sys
 import tempfile
 import unittest
+import unittest.mock
 import zlib
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -154,7 +155,9 @@ class GateTests(unittest.TestCase):
         state.mkdir()
         (state / "restart-state.json").write_text(json.dumps({"cases": {}}))
         code, report, _ = bench.check(phase="after", restore=state)
-        self.assertEqual(set(self.statuses(report).values()), {"NOT_EXERCISED"})
+        statuses = self.statuses(report)
+        self.assertEqual(statuses.pop("disk_restore_state"), "PASS")
+        self.assertEqual(set(statuses.values()), {"NOT_EXERCISED"})
         self.assertEqual((code, report["status"]), (2, "INCOMPLETE"))
 
     # --- дефекты: каждый gate обязан отказать -------------------------------
@@ -187,7 +190,9 @@ class GateTests(unittest.TestCase):
         bench.restart(["no_disk_flag"])
         code, after, _ = bench.check(phase="after", restore=output)
         self.assertEqual(code, 1)
-        self.assertEqual(set(self.statuses(after).values()), {"FAIL"})
+        statuses = self.statuses(after)
+        self.assertEqual(statuses.pop("disk_restore_state"), "PASS")
+        self.assertEqual(set(statuses.values()), {"FAIL"})
         self.assertIn("disk-hit evidence", after["gates"]["zero_prefill_disk_raw_completion"]["error"])
 
     def test_disk_restore_after_cache_loss_fails(self):
@@ -197,7 +202,9 @@ class GateTests(unittest.TestCase):
             path.unlink()
         bench.restart()
         _, after, _ = bench.check(phase="after", restore=output)
-        self.assertEqual(set(self.statuses(after).values()), {"FAIL"})
+        statuses = self.statuses(after)
+        self.assertEqual(statuses.pop("disk_restore_state"), "PASS")
+        self.assertEqual(set(statuses.values()), {"FAIL"})
 
     def test_reasoning_boundary_defects(self):
         for defect, status, text in (("reasoning_over", "FAIL", "exceeded"),
@@ -272,6 +279,53 @@ class GateTests(unittest.TestCase):
         self.assertEqual(set(self.statuses(report).values()), {"FAIL"})
         self.assertEqual(code, 1)
 
+    # --- отчёт никогда не PASS без выполненных проверок ----------------------
+    def test_missing_or_corrupt_restart_state_is_a_recorded_failure(self):
+        for label, content in (("missing", None), ("corrupt", "{not json"), ("wrong-shape", "[]")):
+            with self.subTest(label):
+                bench = self.bench()
+                state = bench.root / "state"
+                state.mkdir()
+                if content is not None:
+                    (state / "restart-state.json").write_text(content)
+                code, report, _ = bench.check(phase="after", restore=state)
+                self.assertEqual((code, report["status"]), (1, "FAIL"), report.get("error"))
+                self.assertEqual(report["gates"]["disk_restore_state"]["status"], "FAIL")
+                self.assertNotIn("PASS", self.statuses(report).values())
+
+    def test_exception_before_the_first_gate_is_a_recorded_failure(self):
+        bench = self.bench()
+        with unittest.mock.patch.object(remediation.Checks, "zero_prefill",
+                                        side_effect=RuntimeError("boom before gates")):
+            code, report, _ = bench.check("zero_prefill,tools")
+        self.assertEqual((code, report["status"], report["gates"]), (1, "FAIL", {}))
+        self.assertIn("boom before gates", report["error"])
+        self.assertEqual(report["stages"], {"zero_prefill": "FAILED", "tools": "NOT_RUN"})
+
+    def test_exception_after_partial_gates_is_a_recorded_failure(self):
+        bench = self.bench()
+        with unittest.mock.patch.object(remediation.Checks, "tools", side_effect=RuntimeError("boom later")):
+            code, report, _ = bench.check("zero_prefill,tools")
+        self.assertEqual(set(self.statuses(report).values()), {"PASS"})  # Выполненные gates прошли…
+        self.assertEqual((code, report["status"]), (1, "FAIL"))           # …но отчёт не PASS.
+        self.assertIn("boom later", report["error"])
+        self.assertEqual(report["stages"], {"zero_prefill": "DONE", "tools": "FAILED"})
+
+    def test_a_stage_that_ran_no_gate_is_not_a_pass(self):
+        bench = self.bench()
+        with unittest.mock.patch.object(remediation.Checks, "tools", return_value=None):
+            code, report, _ = bench.check("tools")
+        self.assertEqual((code, report["status"], report["gates"]), (1, "FAIL", {}))
+        self.assertEqual(remediation.overall({}), "FAIL")
+
+    def test_wrong_peer_products_during_cancellation_fail(self):
+        # Сосед отвечает своим session без чужих маркеров, но с нулями вместо произведений.
+        _, report, _ = self.bench(["zero_products_during_cancel"], pace=.5).check("sessions")
+        self.assertEqual(report["gates"]["sessions_independent_c4"]["status"], "PASS")
+        gate = report["gates"]["sessions_after_cancel"]
+        self.assertEqual(gate["status"], "FAIL", gate)
+        self.assertIn("peer answer is wrong during the cancellation", gate["error"])
+
     # --- профиль и композиция ------------------------------------------------
     def run_command(self, bench, name, *extra):
         output = bench.root / ("out-" + name)
@@ -291,8 +345,18 @@ class GateTests(unittest.TestCase):
         repeat = next(row for row in profile["rows"] if row["case"] == "profile-repeat-4k")
         self.assertEqual(repeat["work"]["prefill_tokens"], 0)
 
+    def compose(self, defects=(), log=True, extra=()):
+        bench = self.bench(defects, pace=.05)
+        argv = ["--duration", "1", "--allow-short", "--records", "6400", *extra]
+        if log:
+            argv += ["--server-log", str(bench.log)]
+        code, output = self.run_command(bench, "compose", *argv)
+        return code, json.loads((output / "composition.json").read_text())
+
     def test_composition_fills_four_long_sessions_and_mixes_operations(self):
-        code, output = self.run_command(self.bench(pace=.05), "compose", "--duration", "1", "--allow-short")
+        bench = self.bench(pace=.05)
+        code, output = self.run_command(bench, "compose", "--duration", "1", "--allow-short",
+                                        "--server-log", str(bench.log))
         state = json.loads((output / "composition.json").read_text())
         self.assertEqual((code, state["status"], state["failures"]),
                          (0, "WORKLOAD_PASS_REQUIRES_MONITOR_VERDICT", []))
@@ -303,15 +367,40 @@ class GateTests(unittest.TestCase):
         self.assertLessEqual({"fill", "continue", "new", "cancel", "image"}, kinds)
         self.assertLess(state["timeline"]["fill_finished"], state["timeline"]["warmup_finished"])
         self.assertLessEqual(state["timeline"]["warmup_finished"], state["timeline"]["load_finished"])
+        gate = state["gates"]["mtp_long_c4_continuations"]
+        self.assertEqual(gate["status"], "PASS", gate)
+        qualified = gate["evidence"]["qualified_rounds"][0]
+        self.assertEqual(len(qualified["requests"]), 4)
+        self.assertTrue(all(row["prompt_tokens"] >= remediation.MIN_DEPTH and row["draft_tokens"] > 0
+                            and row["draft_tokens_accepted"] > 0 for row in qualified["requests"].values()))
+        self.assertEqual(qualified["width"], 4)
+        self.assertEqual(state["gates"]["cancellation_confirmed"]["status"], "PASS")
 
     def test_composition_reports_foreign_data_and_missing_drafts(self):
         for defect, text in (("cross_talk", "foreign session data"), ("no_drafts", "MTP drafts")):
             with self.subTest(defect):
-                code, output = self.run_command(self.bench([defect], pace=.05), "compose",
-                                                "--duration", "1", "--allow-short", "--records", "5800")
-                state = json.loads((output / "composition.json").read_text())
+                code, state = self.compose([defect])
                 self.assertEqual((code, state["status"]), (1, "FAIL"))
                 self.assertTrue(any(text in failure["error"] for failure in state["failures"]), state["failures"])
+
+    def test_long_c4_continuations_without_drafts_fail(self):
+        # Короткие C1 показывают черновики, длинные продолжения — нет.
+        code, state = self.compose(["no_long_drafts"])
+        gate = state["gates"]["mtp_long_c4_continuations"]
+        self.assertEqual((gate["status"], state["status"], code), ("FAIL", "FAIL", 1), gate)
+        self.assertGreater(state["mtp_sampled"], 0)
+
+    def test_long_c4_continuations_without_a_physical_cohort_are_not_exercised(self):
+        code, state = self.compose(["width1"])
+        self.assertEqual(state["gates"]["mtp_long_c4_continuations"]["status"], "NOT_EXERCISED")
+        self.assertEqual((state["status"], code), ("INCOMPLETE", 2))
+
+    def test_composition_cancellation_needs_the_server_log(self):
+        for defects, log in (((), False), (["no_cancel_log"], True)):
+            with self.subTest(defects=defects, log=log):
+                code, state = self.compose(defects, log)
+                self.assertEqual(state["gates"]["cancellation_confirmed"]["status"], "NOT_EXERCISED")
+                self.assertEqual((state["status"], code), ("INCOMPLETE", 2))
 
     def test_registered_load_duration_cannot_be_shortened_silently(self):
         with self.assertRaisesRegex(ValueError, "3600"):
