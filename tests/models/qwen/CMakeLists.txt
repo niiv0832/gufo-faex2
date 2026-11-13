@@ -109,6 +109,9 @@ if (ENGINE_ENABLE_HIP)
   add_qwen_hip_test(qwen_ssm_ops_test
     tests/models/qwen/hip/ssm_ops_test.cpp
     "hip;gpu;kernels;qwen;qwen-kernel-oracle;slow;ssm;opt-c0138-bf16-recurrent")
+  add_qwen_hip_test(qwen_vision_device_input_test
+    tests/models/qwen/hip/vision_device_input_test.cpp
+    "hip;gpu;qwen;vision;recovery")
 
   add_qwen_hip_test(qwen_graph_ops_test
     tests/models/qwen/hip/graph_ops_test.cpp

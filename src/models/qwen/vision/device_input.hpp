@@ -3,21 +3,35 @@
 
 #include <hip/hip_runtime.h>
 
+#include <cstddef>
 #include <memory>
+#include <new>
 #include <utility>
 #include <vector>
 
+#include "src/core/hip/device_allocator.hpp"
 #include "src/models/qwen/vision/encoder.hpp"
 #include "src/models/qwen/vision/prompt.hpp"
 #include "src/models/qwen/vision/rope.hpp"
 
 namespace gufo::models::qwen::vision {
 
+/// Memory sources of a DeviceInput. Production keeps the defaults;
+/// allocation-failure tests substitute functions that fail on demand.
+struct DeviceInputMemory {
+  hip::DeviceAllocator device;
+  void* (*host_allocate)(std::size_t bytes){
+      [](std::size_t bytes) { return ::operator new(bytes); }};
+  void (*host_release)(void* pointer){
+      [](void* pointer) { ::operator delete(pointer); }};
+};
+
 /// Per-session image inputs. The stable device descriptor lets captured
 /// decode graphs follow a new request without capturing its image pointers.
 class DeviceInput {
 public:
   DeviceInput() = default;
+  explicit DeviceInput(const DeviceInputMemory& memory) : memory_(memory) {}
   ~DeviceInput();
   DeviceInput(const DeviceInput&) = delete;
   DeviceInput& operator=(const DeviceInput&) = delete;
@@ -43,6 +57,7 @@ public:
   }
 
 private:
+  DeviceInputMemory memory_;
   RopeLayout layout_;
   std::shared_ptr<const Prompt> prompt_;
   std::shared_ptr<Encoder> encoder_;
@@ -50,6 +65,9 @@ private:
   DeviceRope* descriptor_{nullptr};
   std::int32_t* positions_{nullptr};
   std::size_t capacity_{0};
+  // False only when a failed device update could not leave the descriptor in
+  // a known state; RestoreLayout then rebuilds it whatever the layout.
+  bool published_{true};
   Encoder::CancellationCheck is_cancelled_;
 };
 
