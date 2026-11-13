@@ -23,16 +23,19 @@
 // files of whitespace-separated token ids replace the built-in histories.
 
 #include <algorithm>
+#include <charconv>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #if defined(ENGINE_ENABLE_HIP)
@@ -340,6 +343,29 @@ void RunScenario(std::vector<Session>& all, const Scenario& scenario,
             used[index].reference, Decode(used[index], prefix, rows + 1, true));
   }
 
+  // A stored state restores exactly: the snapshot of a state reached through
+  // verification, serialized and restored into a reset session, decodes the
+  // same next token as the state it was taken from.
+  {
+    for (std::size_t index = 0; index < order.size(); ++index)
+      order[index] = index;
+    (void)Verify(sessions, order, scenario, all_accepted, vocab);
+    for (std::size_t index = 0; index < used.size(); ++index) {
+      auto& session = used[index];
+      session.executor->FinishVerification();
+      const auto snapshot = session.executor->SaveSnapshot(prefix + rows);
+      std::vector<std::uint8_t> payload(snapshot->CompactPayloadBytes());
+      if (snapshot->SerializeCompact(payload) != payload.size())
+        throw std::runtime_error("snapshot serialization has a wrong size");
+      Check(context, label("before_snapshot_restore", index, rows),
+            Row(session, context, rows), DecodeNext(session, prefix + rows));
+      session.executor->Reset();
+      session.executor->RestoreCompactSnapshot(payload, prefix + rows);
+      Check(context, label("after_snapshot_restore", index, rows),
+            Row(session, context, rows), DecodeNext(session, prefix + rows));
+    }
+  }
+
   // A decode step batched across sessions.
   if (used.size() > 1) {
     for (auto& session : used)
@@ -370,12 +396,35 @@ std::vector<Token> ReadIds(const std::string& path) {
   if (!input)
     throw std::runtime_error("cannot read " + path);
   std::vector<Token> ids;
-  std::uint64_t value = 0;
-  while (input >> value)
+  std::string word;
+  while (input >> word) {
+    // Checked before narrowing: a value that does not fit a token id must
+    // not wrap into a valid one.
+    std::uint64_t value = 0;
+    const auto [end, parsed] =
+        std::from_chars(word.data(), word.data() + word.size(), value);
+    if (parsed != std::errc{} || end != word.data() + word.size() ||
+        value > std::numeric_limits<Token>::max())
+      throw std::runtime_error("malformed token id '" + word + "' in " + path);
     ids.push_back(static_cast<Token>(value));
-  if (!input.eof())
-    throw std::runtime_error("malformed token ids in " + path);
+  }
+  if (ids.empty())
+    throw std::runtime_error("no token ids in " + path);
   return ids;
+}
+
+std::uint32_t ParseCount(const char* text, const char* name,
+                         std::uint32_t maximum) {
+  const std::string_view view(text);
+  std::uint32_t value = 0;
+  const auto [end, parsed] =
+      std::from_chars(view.data(), view.data() + view.size(), value);
+  if (parsed != std::errc{} || end != view.data() + view.size() || value == 0 ||
+      value > maximum)
+    throw std::invalid_argument(std::string(name) + " must be 1.." +
+                                std::to_string(maximum) + ", got '" +
+                                std::string(view) + "'");
+  return value;
 }
 
 }  // namespace
@@ -383,9 +432,29 @@ std::vector<Token> ReadIds(const std::string& path) {
 
 int main(int argc, char** argv) {
 #if defined(ENGINE_ENABLE_HIP)
-  if (argc == 3 || argc > 8) {
+  // The arguments are checked before the model is loaded. A run that names a
+  // prefix must name its histories: one, two or four files, so that every
+  // file takes part in a scenario.
+  const int files = argc - 4;
+  if (argc > 2 && files != 1 && files != 2 && files != 4) {
     std::cerr << "Usage: qwen_ar_verify_parity_test [MODEL.gguf [PREFIX ROWS "
-                 "IDS.txt...]]\n";
+                 "IDS.txt (1, 2 or 4 files)]]\n";
+    return 2;
+  }
+  std::vector<Session> sessions;
+  std::vector<Scenario> scenarios;
+  try {
+    if (argc > 2) {
+      const auto prefix = ParseCount(argv[2], "PREFIX", kContext - 2);
+      const auto rows = ParseCount(argv[3], "ROWS", 8);
+      for (int index = 4; index < argc; ++index)
+        sessions.push_back({ReadIds(argv[index]), nullptr, {}});
+      for (std::size_t count = 1; count <= sessions.size(); count *= 2)
+        scenarios.push_back(
+            {"file-c" + std::to_string(count), prefix, rows, count});
+    }
+  } catch (const std::exception& failure) {
+    std::cerr << "qwen_ar_verify_parity_test: " << failure.what() << '\n';
     return 2;
   }
   const char* env = std::getenv("GUFO_QWEN_LAYERED_PREFILL_MODEL");
@@ -412,17 +481,7 @@ int main(int argc, char** argv) {
     }
     Context context{config.num_layers, config.hidden_size, config.vocab_size};
 
-    std::vector<Session> sessions;
-    std::vector<Scenario> scenarios;
-    if (argc > 3) {
-      const auto prefix = static_cast<std::uint32_t>(std::stoul(argv[2]));
-      const auto rows = static_cast<std::uint32_t>(std::stoul(argv[3]));
-      for (int index = 4; index < argc; ++index)
-        sessions.push_back({ReadIds(argv[index]), nullptr, {}});
-      for (std::size_t count = 1; count <= sessions.size(); count *= 2)
-        scenarios.push_back(
-            {"file-c" + std::to_string(count), prefix, rows, count});
-    } else {
+    if (scenarios.empty()) {
       for (std::uint64_t seed = 0; seed < 4; ++seed)
         sessions.push_back({History(2200, seed), nullptr, {}});
       scenarios = {
@@ -453,6 +512,9 @@ int main(int argc, char** argv) {
       if (!session.executor)
         throw std::runtime_error("executor: " + error);
     }
+    if (scenarios.empty())
+      throw std::runtime_error("no scenario to run");
+    std::size_t completed = 0;
     for (const auto& scenario : scenarios) {
       if (scenario.rows == 0 || scenario.rows > 8 || scenario.prefix == 0 ||
           scenario.sessions > sessions.size())
@@ -465,8 +527,10 @@ int main(int argc, char** argv) {
       local.passed = true;
       RunScenario(sessions, scenario, local);
       context.passed = context.passed && local.passed;
+      ++completed;
     }
-    return context.passed ? 0 : 1;
+    std::cout << "scenarios=" << completed << '\n';
+    return context.passed && completed == scenarios.size() ? 0 : 1;
   } catch (const std::exception& failure) {
     std::cerr << "qwen_ar_verify_parity_test: " << failure.what() << '\n';
     return 1;
