@@ -209,6 +209,12 @@ if (ENGINE_ENABLE_HIP)
   add_qwen_hip_test(qwen_moe_router_fallback_ops_test
     tests/models/qwen/hip/moe_router_fallback_ops_test.cpp
     "hip;gpu;kernels;qwen;moe;l2")
+  # Sampled speculative verification against an independent double-precision
+  # reference: the device samplers on synthetic logits, the verifier on a
+  # host target.
+  add_qwen_hip_test(qwen_sampled_verify_ops_test
+    tests/models/qwen/hip/sampled_verify_ops_test.cpp
+    "hip;gpu;kernels;qwen;sampling;speculative")
 
   # MoE feed-forward for several rows equals the single-token decode path bit
   # for bit. Skipped without the model.
