@@ -1,7 +1,7 @@
 {
   "schema": "gufo-faex2.candidate.v1",
   "date": "2026-11-13",
-  "evidence_as_of": "2026-11-14T00:32:46+03:00",
+  "evidence_as_of": "2026-11-14T01:36:55.192549+03:00",
   "status": "PREPARED_NOT_ACCEPTED",
   "ready_for_deployment": false,
   "deployment_performed": false,
@@ -188,7 +188,7 @@
         "gtt_growth_median_bytes": -81788928,
         "gpu_total_growth_median_bytes": -81092608,
         "rule": "Рост максимума ИЛИ медианы выше 1 GiB означает FAIL. Снижение медиан не отменяет превышение максимумов; критерий не изменён.",
-        "cause_status": "UNDER_INVESTIGATION"
+        "cause_status": "UNRESOLVED_AFTER_BOUNDED_DIAGNOSTIC"
       },
       "continuation_cache_observation": {
         "status": "OPEN",
@@ -225,6 +225,55 @@
         "tests/functional/pi_agent.py": "0febc5ce4fafdf482494e025d1272b51504cf4094639b72d66e69ad6b3e34a92",
         "tests/functional/test_faex2_agents.py": "ec5fa248272f7278cb077c0417d750bb92e7379c2503f8c06af6a2112815a9fe"
       }
+    },
+    "cache_memory_diagnostic": {
+      "window": "codex-cache3",
+      "status": "INCOMPLETE",
+      "acceptance": "NOT_QUALIFIED",
+      "instrumented_binary_sha256": "e08026a982583b57d537e8eff19a95232a916212aed351410a8bdd5c598a8bd3",
+      "patch_sha256": "26bc2a653823e01704bc8c79dfc2154eb31b032bfddea9aa0f4579219a1e9828",
+      "plan_sha256": "2dec8658fbf437a9de6893b7335c7e3ade2cd7135d6d175f9468816df93cb5b2",
+      "runner_sha256": "0dc8aa9c376c33c044a7e209cc65e2d98a54f8252cafb6e08b8e4c9f4b1e4d29",
+      "requests_planned": 36,
+      "requests_recorded": 30,
+      "exact_complete_responses": 26,
+      "confirmed_cancellations": 4,
+      "budget_seconds": 900,
+      "runtime_seconds": 892.1323435306549,
+      "interrupted_request": {
+        "number": 963,
+        "recorded_status": "FAILED",
+        "error_type": "DeadlineExceeded",
+        "timeout_seconds": 45.99737607798306
+      },
+      "not_started_requests": [
+        964,
+        965,
+        966,
+        967,
+        968
+      ],
+      "original_full_misses": "NOT_REPRODUCED",
+      "memory_peak_scenario": "NOT_EXECUTED",
+      "reproducer_setup_status": "DEFECT_OPEN",
+      "reproducer_setup_issue": "Plain seed 910 не гарантирует совместимый JSON prefix target 965; готовится проверенный план с JSON seed 912. Простое увеличение бюджета не устраняет дефект.",
+      "memory_gate": "NOT_REEVALUATED",
+      "original_final2_fail_preserved": true,
+      "paired_snapshot_lifetimes": 88,
+      "paired_disk_jobs": 56,
+      "paired_host_buffers": 19,
+      "paired_capture_reservations": 12,
+      "observed_budget_checks": 213,
+      "observed_budget_violations": 0,
+      "final_observed_logical_counters": 0,
+      "scope": "Наблюдаемые логические пары и отдельные бюджеты; не все физические allocations, не proof of no leak и не performance qualification. Новый cold cache не воспроизводит исходный час целиком.",
+      "main_restore_verified": true,
+      "kernel_status": "CLEAN",
+      "production_downtime_seconds": 921.4520266056061,
+      "state_ref": ".local/remed-20261113/codex-closeout/remote-evidence/accept-out/codex-cache3/state.json",
+      "review_ref": ".local/remed-20261113/codex-closeout/cache3-final-memory-analysis.json",
+      "live_restore_ref": ".local/remed-20261113/codex-closeout/cache3-live-restore.json",
+      "archive_sha256": "fd5c92521ab8b2cff2e4d97ccc7ccb71cc687a3fdce889af59fd82cf1fd41c05"
     }
   },
   "previous_candidate_evidence": {
