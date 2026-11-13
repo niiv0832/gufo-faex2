@@ -67,6 +67,10 @@ class NotExercised(GateFail):
     """Условие сценария не возникло: это не успех и не отказ кандидата."""
 
 
+class Recorded(GateFail):
+    """Режим записи: ответ сохранён без оценки содержания (контрольный бинарник)."""
+
+
 class Inherited(GateFail):
     """Содержательный отказ совпал с контрольным бинарником на тех же байтах."""
 
@@ -254,8 +258,9 @@ def done(row, finish=("stop",)):
 
 
 class Checks:
-    def __init__(self, evidence, log, nonce, *, late_attempts=4, settle=15.0, control=None):
-        self.e, self.log, self.nonce = evidence, log, nonce
+    def __init__(self, evidence, log, nonce, *, late_attempts=4, settle=15.0, control=None,
+                 record_only=False):
+        self.e, self.log, self.nonce, self.record_only = evidence, log, nonce, record_only
         self.late_attempts, self.settle = late_attempts, settle
         self.control = control or {}
         self.gates = {}
@@ -272,6 +277,8 @@ class Checks:
             row.update(status="PASS", evidence=function() or {})
         except NotExercised as error:
             row.update(status="NOT_EXERCISED", reason=str(error), evidence=error.evidence)
+        except Recorded as error:
+            row.update(status="RECORDED", reason=str(error), evidence=error.evidence)
         except Inherited as error:
             row.update(status="INHERITED_FAIL", reason=str(error), evidence=error.evidence)
         except GateFail as error:
@@ -300,6 +307,12 @@ class Checks:
         return {"server_log": {field: line.get(field) for field in
                                ("prompt_tokens", "prefill_tokens", "cached_tokens", "cache", "finish",
                                 "draft_proposed", "draft_accepted", "batch_width")}}
+
+    def need_log(self, evidence):
+        """Gate опирается на журнал сервера: без него условие не подтверждено, это не PASS."""
+        if self.log.path is None:
+            raise NotExercised("the server log is required to confirm this gate (--server-log)", evidence)
+        return evidence
 
     # --- точное восстановление без чтения остатка ------------------------
     def code_request(self, tag, content=None, code=None):
@@ -354,10 +367,11 @@ class Checks:
         def ram(tag, content=None):
             def run():
                 request, code = self.code_request(tag, content)
-                return self.exact_repeat(tag, request, code)[1]
+                return self.need_log(self.exact_repeat(tag, request, code)[1])
             return run
         exact = ("побайтно тот же greedy-запрос: cached_tokens == prompt_tokens, prefill_tokens == 0, "
-                 "cache_hit без диска, ответ и finish совпадают; при журнале — строка cache=memory. "
+                 "cache_hit без диска, ответ и finish совпадают; строка журнала сервера cache=memory "
+                 "(без --server-log — NOT_EXERCISED). "
                  "Ненулевой остаток — FAIL с observed=RESTORE_WITH_REMAINDER. Не доказывает равенство "
                  "logits: его закрывают native-тесты точных контрактов.")
         self.gate("zero_prefill_ram_text", "Текст, " + exact, ram("zpt"))
@@ -367,7 +381,7 @@ class Checks:
         def run():
             continued, code, evidence = self.continuation("zpc")
             evidence["exact_repeat"] = self.exact_repeat_existing("zpc-turn2", continued, code)
-            return evidence
+            return self.need_log(evidence)
         self.gate("zero_prefill_ram_continuation",
                   "История + сгенерированный ответ + новое сообщение: cached >= prompt первого хода − "
                   f"{FRAMING} (читается только новое), учёт cached + prefill == prompt; побайтный повтор "
@@ -425,11 +439,12 @@ class Checks:
                 publication = self.published(offset, [boundary])
                 state["cases"][tag] = {"request": request, "text": first["text"], "prompt_tokens": total,
                                        "boundaries": [boundary], **publication}
-                return {**evidence, "boundary": boundary, **publication}
+                return self.need_log({**evidence, "boundary": boundary, **publication})
             return run
         note = ("подготовка дискового восстановления: холодный запрос, точный RAM-повтор, измерение "
                 "стабильной границы расходящимся запросом и ожидание записи checkpoint (журнал "
-                "event=disk_cache action=stored). Сам по себе перезапуск не доказывает.")
+                "event=disk_cache action=stored; без --server-log — NOT_EXERCISED). Сам по себе "
+                "перезапуск не доказывает.")
         self.gate("disk_prepare_text", "Текст: " + note, single("dkt"))
         self.gate("disk_prepare_image", "Изображение: " + note, single("dki", [images.colour_image("blue")]))
 
@@ -443,7 +458,7 @@ class Checks:
             publication = self.published(offset, [first_boundary, second_boundary])
             state["cases"]["dkc"] = {"request": continued, "text": code, "prompt_tokens": total,
                                      "boundaries": [first_boundary, second_boundary], **publication}
-            return {**evidence, "boundaries": [first_boundary, second_boundary], **publication}
+            return self.need_log({**evidence, "boundaries": [first_boundary, second_boundary], **publication})
         self.gate("disk_prepare_continuation", "Продолжение диалога: " + note, conversation)
 
         def raw():
@@ -459,7 +474,7 @@ class Checks:
             publication = self.published(offset, [total])
             state["cases"]["dkr"] = {"request": request, "text": result["text"], "prompt_tokens": total,
                                      "boundaries": [total], **publication}
-            return {"prompt": total, **publication}
+            return self.need_log({"prompt": total, **publication})
         self.gate("disk_prepare_raw_completion",
                   "/v1/completions без шаблона чата: checkpoint снимается на полном prompt (нет изменяемой "
                   "разметки ассистента), prompt <= 2048, чтобы сетка не вытеснила полный снимок. " + note, raw)
@@ -503,14 +518,14 @@ class Checks:
                     if prefill != 0 or cached != total:
                         raise GateFail(tag + ": disk restore left a nonzero remainder",
                                        {**evidence, "observed": "RESTORE_WITH_REMAINDER"})
-                    return evidence
+                    return self.need_log(evidence)
                 need(cached in saved["boundaries"], tag + ": restored at an unexpected boundary", evidence)
                 stored = [value for value in saved.get("stored_tokens") or [] if value <= total]
                 if stored:
                     need(cached == max(stored), tag + ": not the longest stored checkpoint", evidence)
                 need(0 < prefill < GRID, tag + ": remainder outside the framing/step bound", evidence)
                 evidence["observed"] = "RESTORE_WITH_REMAINDER_BY_DESIGN"
-                return evidence
+                return self.need_log(evidence)
             return run
         self.gate("zero_prefill_disk_raw_completion",
                   "После перезапуска тот же /v1/completions: disk hit, cached == prompt, prefill == 0, тот же "
@@ -675,6 +690,9 @@ class Checks:
                             "image_sha256": images.image_sha(probe["content"]),
                             "request_sha256": fingerprint(request), "prompt": total}
                 need(cached == 0, "fresh image prefill absent", evidence)
+                if self.record_only:
+                    raise Recorded("answer recorded without grading",
+                                   {**evidence, "graded_correct": bool(probe["grade"](result["text"]))})
                 if probe["grade"](result["text"]):
                     return evidence
                 control = self.control.get(identifier)
@@ -1019,6 +1037,8 @@ def overall(gates):
     statuses = {row["status"] for row in gates.values()}
     if "FAIL" in statuses or "RUNNING" in statuses:
         return "FAIL"
+    if "RECORDED" in statuses:  # Запись без оценки не смешивается с оценёнными gates.
+        return "RECORDED" if statuses == {"RECORDED"} else "FAIL"
     if "NOT_EXERCISED" in statuses:
         return "INCOMPLETE"
     return "KNOWN_FAILURES" if "INHERITED_FAIL" in statuses else "PASS"
@@ -1040,10 +1060,12 @@ def run_check(args):
     groups = GROUPS if not args.only else tuple(args.only.split(","))
     require(set(groups) <= set(GROUPS), "unknown group; choose from " + ", ".join(GROUPS))
     require(args.phase != "after" or args.restore, "--phase after requires --restore")
+    require(not args.record_only or groups == ("images_complex",) and args.phase == "before",
+            "--record-only is only for --only images_complex")
     evidence = Evidence(args.base_url, args.output)
     checks = Checks(evidence, ServerLog(args.server_log), args.nonce or format(int(time.time()), "x"),
                     late_attempts=args.late_attempts, settle=args.disk_settle,
-                    control=control_answers(args.control_report))
+                    control=control_answers(args.control_report), record_only=args.record_only)
     evidence.report.update(phase=args.phase, groups=list(groups),
                            harness_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest())
     plan = ("disk_after",) if args.phase == "after" else groups
@@ -1079,7 +1101,7 @@ def run_check(args):
                      ensure_ascii=False, indent=1))
     if interrupted is not None:
         raise interrupted
-    return {"PASS": 0, "FAIL": 1}.get(status, 2)
+    return {"PASS": 0, "RECORDED": 0, "FAIL": 1}.get(status, 2)
 
 
 # --- времена каждой фазы и память по этапам -------------------------------
@@ -1094,6 +1116,12 @@ def run_profile(args):
     def mark(stage):
         if args.pid:
             memory.append({"stage": stage, **memory_snapshot(args.pid)})
+
+    def memory_status():
+        if not args.pid:
+            return "MISSING_NO_PID"
+        measured = all(type(row.get(name)) is int for row in memory for name in ("rss_bytes", "gtt_used_bytes"))
+        return "MEASURED" if memory and measured else "MISSING_METRICS"
 
     def record(row, group):
         result = done(row)
@@ -1129,11 +1157,16 @@ def run_profile(args):
     except Exception as error:
         status = "FAIL"
         evidence.report["error"] = type(error).__name__ + ": " + str(error)
-    evidence.report.update(status=status, profile={"rows": rows, "memory": memory})
+    # Память — обязательная часть профиля: без неё запись не считается полной.
+    recorded_memory = memory_status()
+    if status == "RECORDED" and recorded_memory != "MEASURED":
+        status = "RECORDED_MEMORY_MISSING"
+    profile = {"status": status, "memory_status": recorded_memory, "rows": rows, "memory": memory}
+    evidence.report.update(status=status, profile=profile)
     evidence.save()
-    write_json(evidence.output / "profile.json", {"status": status, "rows": rows, "memory": memory})
-    print(json.dumps({"status": status, "rows": len(rows)}))
-    return 0 if status == "RECORDED" else 1
+    write_json(evidence.output / "profile.json", profile)
+    print(json.dumps({"status": status, "memory_status": recorded_memory, "rows": len(rows)}))
+    return {"RECORDED": 0, "FAIL": 1}.get(status, 2)
 
 
 # --- конечная композиция: четыре длинных сеанса и смешанная нагрузка -------
@@ -1421,6 +1454,9 @@ def main(argv=None):
     check.add_argument("--only", help="группы через запятую: " + ", ".join(GROUPS))
     check.add_argument("--late-attempts", type=int, default=4)
     check.add_argument("--disk-settle", type=float, default=15)
+    check.add_argument("--record-only", action="store_true",
+                       help="только с --only images_complex: записать ответы (контрольный бинарник) без "
+                            "оценки; статус RECORDED, код 0")
     check.add_argument("--control-report", type=Path,
                        help="каталог отчёта группы images_complex на контрольном бинарнике")
     sub.choices["profile"].add_argument("--pid", type=int, help="PID сервера для отметок памяти (Linux)")

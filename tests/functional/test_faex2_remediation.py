@@ -25,6 +25,10 @@ import faex2_remediation_server as double
 import faex2_transport as transport
 
 
+def measured_never(*_):
+    raise AssertionError("memory must not be sampled without --pid")
+
+
 class Bench:
     """Двойник сервера с журналом и каталогом кэша; restart() сохраняет только диск."""
     def __init__(self, root, defects=(), pace=1.0):
@@ -326,6 +330,58 @@ class GateTests(unittest.TestCase):
         self.assertEqual(gate["status"], "FAIL", gate)
         self.assertIn("peer answer is wrong during the cancellation", gate["error"])
 
+    # --- журнал сервера обязателен там, где gate на него опирается ------------
+    def test_gates_that_need_the_server_log_are_not_exercised_without_it(self):
+        bench = self.bench(pace=.2)
+        code, report, output = bench.check("zero_prefill,disk", log=False)
+        statuses = self.statuses(report)
+        self.assertEqual(set(statuses.values()), {"NOT_EXERCISED"}, statuses)
+        self.assertEqual((code, report["status"]), (2, "INCOMPLETE"))
+        evidence = report["gates"]["zero_prefill_ram_text"]["evidence"]
+        self.assertEqual((evidence["repeat"]["prefill"], evidence["server_log"]), (0, "NOT_PROVIDED"))
+        # Состояние для фазы after всё равно записано; сама она без журнала тоже не PASS.
+        self.assertEqual(set(json.loads((output / "restart-state.json").read_text())["cases"]),
+                         {"dkt", "dki", "dkc", "dkr"})
+        bench.restart()
+        code, after, _ = bench.check(phase="after", restore=output, log=False)
+        statuses = self.statuses(after)
+        self.assertEqual(statuses.pop("disk_restore_state"), "PASS")
+        self.assertEqual(set(statuses.values()), {"NOT_EXERCISED"})
+        self.assertEqual(code, 2)
+
+    def test_a_real_failure_wins_over_the_missing_server_log(self):
+        _, report, _ = self.bench(["ram_remainder"]).check("zero_prefill", log=False)
+        self.assertEqual(report["gates"]["zero_prefill_ram_text"]["status"], "FAIL")
+
+    # --- запись ответов контроля -----------------------------------------------
+    def test_record_only_keeps_control_answers_without_failing(self):
+        for defects, graded in (((), True), (["image_wrong"], False)):
+            with self.subTest(defects=defects):
+                code, report, output = self.bench(defects).check("images_complex", extra=["--record-only"])
+                self.assertEqual(set(self.statuses(report).values()), {"RECORDED"})
+                self.assertEqual((code, report["status"]), (0, "RECORDED"))
+                gate = report["gates"]["image_complex_table_cell"]
+                self.assertIs(gate["evidence"]["graded_correct"], graded)
+                self.assertEqual(len(remediation.control_answers(output)), 5)
+        # Кандидат: INHERITED_FAIL только при том же неверном ответе записанного контроля.
+        _, _, wrong_control = self.bench(["image_wrong"]).check("images_complex", extra=["--record-only"])
+        code, report, _ = self.bench(["image_wrong"]).check(
+            "images_complex", extra=["--control-report", str(wrong_control)])
+        self.assertEqual((set(self.statuses(report).values()), code), ({"INHERITED_FAIL"}, 2))
+        _, _, right_control = self.bench().check("images_complex", extra=["--record-only"])
+        code, report, _ = self.bench(["image_wrong"]).check(
+            "images_complex", extra=["--control-report", str(right_control)])
+        self.assertEqual((set(self.statuses(report).values()), code), ({"FAIL"}, 1))
+
+    def test_record_only_is_limited_and_transport_failures_still_fail(self):
+        bench = self.bench()
+        with self.assertRaisesRegex(ValueError, "images_complex"):
+            bench.check("tools", extra=["--record-only"])
+        bench.fake.stop()
+        code, report, _ = bench.check("images_complex", extra=["--record-only"])
+        self.assertEqual((set(self.statuses(report).values()), code), ({"FAIL"}, 1))
+        self.assertEqual(remediation.overall({"a": {"status": "RECORDED"}, "b": {"status": "PASS"}}), "FAIL")
+
     # --- профиль и композиция ------------------------------------------------
     def run_command(self, bench, name, *extra):
         output = bench.root / ("out-" + name)
@@ -335,15 +391,34 @@ class GateTests(unittest.TestCase):
         return code, output
 
     def test_profile_records_every_phase_of_every_request(self):
-        code, output = self.run_command(self.bench(pace=.3), "profile")
+        measured = {"status": "MEASURED", "rss_bytes": 40 << 30, "gtt_used_bytes": 45 << 30}
+        with unittest.mock.patch.object(remediation, "memory_snapshot", return_value=measured):
+            code, output = self.run_command(self.bench(pace=.3), "profile", "--pid", "4242")
         profile = json.loads((output / "profile.json").read_text())
-        self.assertEqual((code, profile["status"]), (0, "RECORDED"))
+        self.assertEqual((code, profile["status"], profile["memory_status"]), (0, "RECORDED", "MEASURED"))
+        self.assertEqual([mark["stage"] for mark in profile["memory"]],
+                         ["ready", "after_single_session", "after_c1", "after_c2", "after_c4"])
         self.assertEqual(len(profile["rows"]), 12)
         for row in profile["rows"]:
             self.assertEqual(set(row["phases"]), set(remediation.PHASES))
             self.assertIsNotNone(row["phases"]["wall_ms"])
         repeat = next(row for row in profile["rows"] if row["case"] == "profile-repeat-4k")
         self.assertEqual(repeat["work"]["prefill_tokens"], 0)
+
+    def test_profile_without_memory_is_marked_and_not_a_clean_record(self):
+        unsupported = {"status": "UNSUPPORTED_PLATFORM", "rss_bytes": None, "gtt_used_bytes": None}
+        for label, extra, patch, expected in (
+                ("no pid", (), measured_never, "MISSING_NO_PID"),
+                ("no metrics", ("--pid", "4242"), lambda *_: unsupported, "MISSING_METRICS")):
+            with self.subTest(label), unittest.mock.patch.object(remediation, "memory_snapshot", patch):
+                bench = self.bench(pace=.3)
+                bench.root = bench.root / label.replace(" ", "-")
+                bench.root.mkdir()
+                code, output = self.run_command(bench, "profile", *extra)
+                profile = json.loads((output / "profile.json").read_text())
+                self.assertEqual((code, profile["status"], profile["memory_status"]),
+                                 (2, "RECORDED_MEMORY_MISSING", expected))
+                self.assertEqual(len(profile["rows"]), 12)   # Времена при этом записаны.
 
     def compose(self, defects=(), log=True, extra=()):
         bench = self.bench(defects, pace=.05)
