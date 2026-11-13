@@ -70,11 +70,23 @@ class OpenCodeResults(unittest.TestCase):
     def test_edit_task_needs_original_source_and_passing_run(self):
         good = self.history(("read", {"filePath": "calc.py"}, "00001| def add(a, b):\n00002|     return a - b"),
                             ("edit", {"filePath": "calc.py", "oldString": "-", "newString": "+"}, "done"),
-                            ("bash", {"command": "python3 -c 'import calc; print(\"ok\")'"}, "ok\n"))
+                            ("bash", {"command": "python3 -c 'import calc; assert calc.add(2, 3) == 5; print(\"ok\")'"},
+                             "ok\n"))
         opencode_agent.validate_tool_results("edit", good)
         failing = [*good[:2], {**good[2], "result": "Traceback (most recent call last):\nAssertionError\nok"}]
-        with self.assertRaisesRegex(AssertionError, "result lacks 'ok'"):
+        with self.assertRaisesRegex(AssertionError, "result lacks"):
             opencode_agent.validate_tool_results("edit", failing)
+        # «ok» должен быть отдельной строкой вывода настоящей проверки, а не частью другого текста.
+        for label, steps in (
+                ("word inside a sentence", [*good[:2], {**good[2], "result": "this does not look ok to me"}]),
+                ("token", [*good[:2], {**good[2], "result": "tokens: 12"}]),
+                ("not ok", [*good[:2], {**good[2], "result": "not ok"}]),
+                ("command without the assertion", [*good[:2], {
+                    **good[2], "arguments": '{"command": "echo ok # calc"}'}])):
+            with self.subTest(label), self.assertRaises(AssertionError):
+                opencode_agent.validate_tool_results("edit", steps)
+        wrapped = [*good[:2], {**good[2], "result": "<stdout>\nok\n</stdout>"}]
+        opencode_agent.validate_tool_results("edit", wrapped)
         with self.assertRaisesRegex(AssertionError, "no executed read"):
             opencode_agent.validate_tool_results("edit", good[1:])
 
@@ -138,6 +150,43 @@ class OpenCodeResults(unittest.TestCase):
             self.assertFalse(opencode_agent.inside_git_tree(Path(directory) / "new" / "output"))
             (Path(directory) / ".git").mkdir()
             self.assertTrue(opencode_agent.inside_git_tree(Path(directory) / "new" / "output"))
+
+
+class OptimizedPython(unittest.TestCase):
+    """python -O и PYTHONOPTIMIZE удаляют assert: проверки обязаны отказать, а не пройти."""
+    SNIPPETS = {
+        "opencode results": "import opencode_agent as m; m.validate_tool_results('tools', [])",
+        "opencode requests": "import opencode_agent as m, pathlib; m.validate_requests([], pathlib.Path('.'))",
+        "opencode task": "import opencode_agent as m, pathlib; m.validate_task('tools', pathlib.Path('/nonexistent'), "
+                         "pathlib.Path('/nonexistent/x'))",
+        "pi task": "import pi_agent as m, pathlib; m.validate_task('tools', pathlib.Path('.'), [])",
+        "pi requests": "import pi_agent as m; m.validate_requests([])",
+        "pi outputs": "import pi_agent as m; m.validate_real_outputs('tools', [])",
+    }
+
+    def run_python(self, arguments, environment=None):
+        return subprocess.run([sys.executable, *arguments], cwd=Path(__file__).parent, capture_output=True,
+                              text=True, timeout=60, env={**os.environ, **(environment or {})})
+
+    def test_library_checks_refuse_to_run_optimized(self):
+        for label, code in self.SNIPPETS.items():
+            for mode, arguments, environment in (("-O", ["-O", "-c", code], None),
+                                                 ("PYTHONOPTIMIZE", ["-c", code], {"PYTHONOPTIMIZE": "1"})):
+                with self.subTest(label=label, mode=mode):
+                    result = self.run_python(arguments, environment)
+                    self.assertNotEqual(result.returncode, 0, "optimized run silently passed")
+                    self.assertIn("without -O", result.stderr)
+
+    def test_command_line_refuses_to_run_optimized(self):
+        for script in ("opencode_agent.py", "pi_agent.py"):
+            with self.subTest(script), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / "out"
+                result = self.run_python(["-O", script, "--base-url", "http://127.0.0.1:1", "--model", "m",
+                                          "--output", str(output), "--pi", "/nonexistent",
+                                          "--server-log", "/nonexistent"][:8 if script.startswith("open") else 12])
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("without -O", result.stderr)
+                self.assertFalse(output.exists())            # Отказ до любых действий.
 
 
 def call(identifier, name, arguments):
@@ -212,6 +261,24 @@ class PiResults(unittest.TestCase):
         target.write_text("def add(a, b):\n    return a - b\n")
         with self.assertRaises(AssertionError):
             pi_agent.validate_task("edit", self.cwd, history("def add(a, b):\n    return a - b\n"))
+
+    def test_bugfix_and_creation_need_a_real_successful_test_run(self):
+        def history(command, shown, error=False):
+            return [assistant(call("a", "bash", {"command": command})), result("a", shown, error),
+                    assistant({"type": "text", "text": "C'est corrigé."}, stop="stop")]
+        pi_agent.validate_real_outputs("bugfix", history("node slugify.test.js", "ok\n"))
+        pi_agent.validate_real_outputs("creation", history("node test.js", "4 cas vérifiés\n"))
+        failures = {
+            "bugfix: run failed": ("bugfix", history("node slugify.test.js", "AssertionError", error=True)),
+            "bugfix: other output": ("bugfix", history("node slugify.test.js", "looks ok to me")),
+            "bugfix: other command": ("bugfix", history("echo ok", "ok\n")),
+            "bugfix: never run": ("bugfix", [assistant({"type": "text", "text": "ok"}, stop="stop")]),
+            "creation: run failed": ("creation", history("node test.js", "boom", error=True)),
+            "creation: never run": ("creation", history("ls", "stats.js test.js")),
+        }
+        for label, (name, messages) in failures.items():
+            with self.subTest(label), self.assertRaises(AssertionError):
+                pi_agent.validate_real_outputs(name, messages)
 
     def test_leaked_framing_and_unfinished_turn_fail(self):
         (self.cwd / "hello.txt").write_bytes(b"bonjour")

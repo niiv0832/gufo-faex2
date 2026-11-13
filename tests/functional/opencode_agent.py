@@ -19,6 +19,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import secrets
 import signal
 import subprocess
@@ -73,6 +74,12 @@ PROMPTS = {
     "verify": ("Read calc.py, fix the obvious bug with the edit tool, then run "
                "`python3 check.py` with the bash tool and reply with the exact line it prints."),
 }
+
+
+def require_assertions():
+    """Every check here is an assert statement: an optimized run would pass everything."""
+    if sys.flags.optimize:
+        raise SystemExit("run without -O and PYTHONOPTIMIZE: the checks are assert statements")
 
 
 def serve_mcp(log):
@@ -142,6 +149,7 @@ def sse_output(path, *, reasoning=None):
 
 def validate_requests(rows, output):
     """Every agent turn stays native and reuses the previous one."""
+    require_assertions()
     agent = []
     for row in rows:
         assert row.get("status") == 200 and not row.get("error"), row
@@ -172,6 +180,7 @@ def validate_requests(rows, output):
 
 
 def validate_task(name, cwd, calls_log):
+    require_assertions()
     mcp = [json.loads(line) for line in calls_log.read_text().splitlines()] \
         if calls_log.exists() else []
     if name == "tools":
@@ -225,6 +234,7 @@ def tool_history(bodies):
 
 def validate_tool_results(name, history, fixture=None):
     """The model was shown real tool output, not a claim that the task is done."""
+    require_assertions()
     executed = [call for call in history if call["result"] is not None]
     assert executed, "no tool result reached the model"
 
@@ -234,9 +244,10 @@ def validate_tool_results(name, history, fixture=None):
                  and all(part in call["arguments"] for part in argument)]
         assert found, (f"no executed {'/'.join(tools)} call mentioning {argument}",
                        [(call["name"], call["arguments"]) for call in executed])
-        good = [call for call in found if result in call["result"]
+        good = [call for call in found
+                if (result.search(call["result"]) if isinstance(result, re.Pattern) else result in call["result"])
                 and not any(mark in call["result"] for mark in forbidden)]
-        assert good, (f"{'/'.join(tools)} {argument}: result lacks {result!r}",
+        assert good, (f"{'/'.join(tools)} {argument}: result lacks {getattr(result, 'pattern', result)!r}",
                       [call["result"][-400:] for call in found])
         return good[-1]
 
@@ -246,7 +257,9 @@ def validate_tool_results(name, history, fixture=None):
         ran(("read",), ("hello.txt",), "bonjour")
     elif name == "edit":
         ran(("read",), ("calc.py",), "return a - b")
-        ran(("bash",), ("calc",), "ok", failed)
+        # The run that asserts the fix printed "ok" on a line of its own; the
+        # word inside other text, or a command without the assertion, is not it.
+        ran(("bash",), ("calc", "assert"), re.compile(r"(?m)^\s*ok\s*$"), failed)
     elif name == "verify":
         ran(("read",), ("calc.py",), fixture["sentinel"])
         ran(("edit", "patch", "multiedit", "write"), ("calc.py",), "")
@@ -385,6 +398,7 @@ def main():
                         help="Private opencode server, per-case HOME and a minimal environment; "
                              "requires --output outside any git work tree")
     args = parser.parse_args()
+    require_assertions()
     if args.isolated and inside_git_tree(args.output.resolve().parent):
         parser.error("--isolated needs --output outside a git work tree: opencode would load "
                      "that repository's instructions and configuration")

@@ -161,6 +161,12 @@ class Proxy(http.server.BaseHTTPRequestHandler):
             save(stem.with_suffix(".timing.json"), row)
 
 
+def require_assertions():
+    """Every check here is an assert statement: an optimized run would pass everything."""
+    if sys.flags.optimize:
+        raise SystemExit("run without -O and PYTHONOPTIMIZE: the checks are assert statements")
+
+
 def messages(path):
     result = []
     if path.exists():
@@ -200,6 +206,7 @@ def repeated_actions(history):
 
 
 def validate_requests(rows, server_log=None):
+    require_assertions()
     assert rows, "Pi did not send a request"
     completed = {}
     if server_log:
@@ -239,7 +246,44 @@ def tool_outputs(history):
             if message.get("role") == "toolResult" and not message.get("isError")]
 
 
+def executed_outputs(history, tool, fragment):
+    """Outputs of successful results for calls of `tool` whose arguments mention `fragment`."""
+    calls = {call["id"]: call for call in calls_from(history)}
+    outputs = []
+    for message in history:
+        if message.get("role") != "toolResult" or message.get("isError"):
+            continue
+        call = calls.get(message.get("toolCallId"))
+        if call and call["name"] == tool and fragment in json.dumps(call["arguments"]):
+            outputs.append("".join(part.get("text", "") for part in message.get("content", [])
+                                   if isinstance(part, dict) and part.get("type") == "text"))
+    return outputs
+
+
+def validate_real_outputs(name, history):
+    """The model was shown what a tool really returned, for the tasks where that is knowable.
+
+    tools/edit: the file content can only come from a tool that read the
+    fixture. bugfix: the fixed test prints "ok" on its own line. creation: the
+    generated test's output is the model's choice, so only a successful run of
+    `test.js` is required; its content is checked independently by the harness.
+    """
+    require_assertions()
+    if name == "tools":
+        assert any("bonjour" in output for output in tool_outputs(history)), "no tool returned the file"
+    elif name == "edit":
+        assert any("return a - b" in output for output in tool_outputs(history)), \
+            "no tool returned the original fixture"
+    elif name == "bugfix":
+        runs = executed_outputs(history, "bash", "slugify.test.js")
+        assert any(re.search(r"(?m)^\s*ok\s*$", output) for output in runs), \
+            ("no successful run of slugify.test.js printed ok", runs)
+    elif name == "creation":
+        assert executed_outputs(history, "bash", "test.js"), "no successful run of test.js reached the model"
+
+
 def validate_task(name, cwd, history):
+    require_assertions()
     calls = calls_from(history)
     for call in calls:
         allowed = {"todo"} if name == "wide-tool" else {"read", "write", "edit", "bash"}
@@ -278,16 +322,13 @@ def validate_task(name, cwd, history):
     elif name == "tools":
         assert (cwd / "hello.txt").read_bytes() == b"bonjour"
         assert {"bash", "read"} <= names, names
-        # The model must have been shown the file by a tool that really ran.
-        assert any("bonjour" in output for output in tool_outputs(history)), "no tool returned the file"
+        validate_real_outputs(name, history)
     elif name == "edit":
         namespace = {}
         exec(compile((cwd / "src/calc.py").read_text(), "calc.py", "exec"), namespace)
         assert namespace["add"](2, 3) == 5 and namespace["add"](-4, 1) == -3
         assert {"edit", "bash"} <= names, names
-        # The buggy line reaches the model only through a real read of the fixture.
-        assert any("return a - b" in output for output in tool_outputs(history)), \
-            "no tool returned the original fixture"
+        validate_real_outputs(name, history)
     elif name == "literal-protocol":
         source = (cwd / "chat_template_fixture.py").read_text()
         assert kImEnd in source and kImStart in source, source
@@ -312,6 +353,7 @@ def validate_task(name, cwd, history):
                 image.load()
                 assert image.convert("RGB").getpixel((image.width // 2, image.height // 2)) == (255, 0, 0)
     elif name == "creation":
+        validate_real_outputs(name, history)
         assert (cwd / "stats.js").is_file() and (cwd / "test.js").is_file()
         subprocess.run(["node", "test.js"], cwd=cwd, check=True, capture_output=True, timeout=10)
         # Independent checks cannot be weakened by the generated test.js.
@@ -323,6 +365,7 @@ for (const [xs, mean, median] of [
 }
 """], cwd=cwd, check=True, capture_output=True, timeout=10)
     elif name == "bugfix":
+        validate_real_outputs(name, history)
         assert (cwd / "slugify.test.js").read_text() == SLUG_TEST
         subprocess.run(["node", "slugify.test.js"], cwd=cwd, check=True, capture_output=True, timeout=10)
         subprocess.run(["node", "-e", """
@@ -419,6 +462,7 @@ def main():
     parser.add_argument("--api", default="openai-completions", choices=["openai-completions", "openai-responses"])
     parser.add_argument("--sampling", type=json.loads, default={}, help="Optional request overrides as JSON; otherwise server defaults")
     args = parser.parse_args()
+    require_assertions()
     upstream = urllib.parse.urlsplit(args.base_url)
     assert upstream.scheme == "http" and upstream.hostname in {"127.0.0.1", "localhost", "::1"}, "Loopback Gufo only"
     assert not args.output.exists(), "Use a fresh output directory; preserve previous evidence"
