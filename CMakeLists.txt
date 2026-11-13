@@ -434,6 +434,16 @@ if (BUILD_TESTING)
   add_test(NAME sampling_test COMMAND sampling_test)
   set_tests_properties(sampling_test PROPERTIES LABELS "cpu;sampling")
 
+  # The CPU sampler and the MTP draft policy against an independent
+  # double-precision reference of sampled speculative decoding.
+  add_executable(sampled_speculation_oracle_test
+    tests/core/sampled_speculation_oracle_test.cpp)
+  target_link_libraries(sampled_speculation_oracle_test PRIVATE gufo_core)
+  add_test(NAME sampled_speculation_oracle_test
+    COMMAND sampled_speculation_oracle_test)
+  set_tests_properties(sampled_speculation_oracle_test PROPERTIES
+    LABELS "cpu;sampling;speculative")
+
   add_executable(openai_chat_test
     tests/cli/openai_chat_test.cpp
     src/cli/serve/logging.cpp
