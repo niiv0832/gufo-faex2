@@ -219,6 +219,28 @@ if (ENGINE_ENABLE_HIP)
     tests/models/qwen/hip/sampled_verify_ops_test.cpp
     "hip;gpu;kernels;qwen;sampling;speculative")
 
+  # Sampled MTP speculation as one chain on real weights: the reported draft
+  # row, its token ids, the device verifier and the committed history against
+  # ordinary decoding and an independent reference. Skipped without the model.
+  add_qwen_hip_test(qwen_sampled_mtp_chain_test
+    tests/models/qwen/hip/sampled_mtp_chain_test.cpp
+    "gpu;hip;qwen;mtp;sampling;speculative;external-model")
+  target_link_libraries(qwen_sampled_mtp_chain_test PRIVATE
+    gufo_qwen38_flash_next)
+  set_tests_properties(qwen_sampled_mtp_chain_test PROPERTIES
+    RUN_SERIAL TRUE TIMEOUT 1800)
+
+  # The distribution of the first token sampled MTP speculation emits against
+  # the target distribution and ordinary sampling: a registered statistical
+  # check on real weights. Skipped without the model.
+  add_qwen_hip_test(qwen_sampled_mtp_distribution_test
+    tests/models/qwen/hip/sampled_mtp_distribution_test.cpp
+    "gpu;hip;qwen;mtp;sampling;speculative;statistical;slow;external-model")
+  target_link_libraries(qwen_sampled_mtp_distribution_test PRIVATE
+    gufo_qwen38_flash_next)
+  set_tests_properties(qwen_sampled_mtp_distribution_test PROPERTIES
+    RUN_SERIAL TRUE TIMEOUT 7200)
+
   # MoE feed-forward for several rows equals the single-token decode path bit
   # for bit. Skipped without the model.
   add_qwen_hip_test(qwen_moe_rows_test
