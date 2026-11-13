@@ -20,7 +20,7 @@ from metrics import digest, integer_number, summarize
 
 MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 GET_PATHS = {"/health", "/v1/health", "/ready", "/v1/ready", "/v1/models", "/props"}
-POST_PATHS = {"/v1/chat/completions", "/v1/responses", "/tokenize"}
+POST_PATHS = {"/v1/chat/completions", "/v1/completions", "/v1/responses", "/tokenize"}
 FRAME_END = re.compile(br"\r?\n\r?\n")
 RESPONSE_EVENTS = {"response." + suffix for suffix in (
     "created", "in_progress", "completed", "incomplete", "output_item.added", "output_item.done",
@@ -177,6 +177,23 @@ def parse_chat(events, body, streaming, ended):
     return text, reasoning, list(tools.values()), finish, usage
 
 
+def parse_completion(events, body):
+    """Legacy Completions без потока: сырой prompt, один choice с text."""
+    require(len(events) == 1 and not body.get("stream"), "legacy completion must be one buffered object")
+    value = events[0]
+    require(value.get("object") == "text_completion", "wrong response object")
+    require(isinstance(value.get("id"), str) and value["id"], "missing/invalid response id")
+    require(integer_number(value.get("created")) and value["created"] > 0, "missing/invalid created time")
+    require(value.get("model") == body.get("model") and isinstance(value.get("model"), str),
+            "wrong response model")
+    choices = value.get("choices")
+    require(isinstance(choices, list) and len(choices) == 1 and isinstance(choices[0], dict)
+            and choices[0].get("index") == 0 and isinstance(choices[0].get("text"), str),
+            "expected one text choice")
+    require(isinstance(value.get("usage"), dict), "usage must be an object")
+    return choices[0]["text"], "", [], choices[0].get("finish_reason"), value["usage"]
+
+
 def response_items(items):
     require(isinstance(items, list), "Responses output must be an array")
     text, reasoning, tools, ids = "", "", [], set()
@@ -309,6 +326,8 @@ def _parse_response(request, raw, parts, status, ended):
         text, reasoning, tools, finish, usage = parse_chat(events, body, streaming, ended)
     elif path == "/v1/responses":
         text, reasoning, tools, finish, usage = parse_responses(events, body, streaming, ended)
+    elif path == "/v1/completions":
+        text, reasoning, tools, finish, usage = parse_completion(events, body)
     else:
         require(status == 200 and not streaming, "unexpected discovery/tokenize status or stream")
     measured, fingerprint = summarize(parts, streaming, ended, (path, body, status))
@@ -336,7 +355,7 @@ def _parse_response(request, raw, parts, status, ended):
         result["response_status"] = finish
         result["finish"] = ("tool_calls" if tools else "stop") if finish == "completed" else finish
     if status >= 400: result["error"] = events[0]["error"]
-    if path not in ("/v1/chat/completions", "/v1/responses"):
+    if path not in ("/v1/chat/completions", "/v1/completions", "/v1/responses"):
         result["response"] = events[0]
         result["output_sha256"] = digest(events[0])
     return result

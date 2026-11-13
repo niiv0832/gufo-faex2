@@ -1,0 +1,413 @@
+"""CPU-проверки клиента приёмки доработок: настоящий loopback, подставной сервер, без модели.
+
+Каждый gate проверен в обе стороны: на исправном двойнике проходит, на двойнике с
+одним включённым дефектом отказывает либо остаётся NOT_EXERCISED.
+"""
+
+import base64
+import contextlib
+import io
+import json
+from pathlib import Path
+import struct
+import sys
+import tempfile
+import unittest
+import zlib
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent / "fixtures"))
+
+import faex2_remediation as remediation
+import faex2_remediation_images as images
+import faex2_remediation_server as double
+import faex2_transport as transport
+
+
+class Bench:
+    """Двойник сервера с журналом и каталогом кэша; restart() сохраняет только диск."""
+    def __init__(self, root, defects=(), pace=1.0):
+        self.root, self.defects, self.pace = Path(root), defects, pace
+        self.cache = self.root / "cache"
+        self.cache.mkdir(exist_ok=True)
+        self.runs = 0
+        self.fake = None
+        self.restart()
+
+    def restart(self, defects=None):
+        if self.fake:
+            self.fake.stop()
+        self.runs += 1
+        self.log = self.root / f"server-{self.runs}.log"
+        self.log.touch()
+        self.fake = double.Fake(self.cache, self.log, self.defects if defects is None else defects,
+                                pace=self.pace)
+        self.url = f"http://127.0.0.1:{self.fake.start()}"
+
+    def check(self, only=None, *, log=True, phase="before", restore=None, extra=()):
+        output = self.root / f"out-{self.runs}-{phase}-{len(list(self.root.glob('out-*')))}"
+        argv = ["check", "--base-url", self.url, "--output", str(output), "--phase", phase,
+                "--nonce", f"t{self.runs}", "--disk-settle", "0.2", *extra]
+        if only:
+            argv += ["--only", only]
+        if log:
+            argv += ["--server-log", str(self.log)]
+        if restore:
+            argv += ["--restore", str(restore)]
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            code = remediation.main(argv)
+        report = json.loads((output / "report.json").read_text())
+        return code, report, output
+
+
+class GateTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.benches = []
+
+    def bench(self, defects=(), pace=1.0):
+        bench = Bench(tempfile.mkdtemp(dir=self.directory.name), defects, pace)
+        self.benches.append(bench)
+        self.addCleanup(lambda: bench.fake.stop())
+        return bench
+
+    def statuses(self, report):
+        return {name: row["status"] for name, row in report["gates"].items()}
+
+    def assert_all(self, report, expected="PASS"):
+        wrong = {name: (row["status"], row.get("error") or row.get("reason"))
+                 for name, row in report["gates"].items() if row["status"] != expected}
+        self.assertEqual(wrong, {})
+
+    # --- исправный сервер ---------------------------------------------------
+    def test_zero_prefill_reasoning_images_tools_pass_on_a_healthy_server(self):
+        code, report, output = self.bench(pace=.3).check("zero_prefill,reasoning,images,images_complex,tools")
+        self.assert_all(report)
+        self.assertEqual((code, report["status"]), (0, "PASS"))
+        exact = report["gates"]["zero_prefill_ram_text"]["evidence"]
+        self.assertEqual(exact["repeat"]["prefill"], 0)
+        self.assertEqual(exact["repeat"]["cached"], exact["repeat"]["prompt"])
+        self.assertEqual(exact["server_log"]["cache"], "memory")
+        self.assertEqual(report["gates"]["reasoning_512_sampled_sse"]["evidence"]["reasoning_tokens"], 512)
+        wide = report["gates"]["reasoning_budget_isolation"]["evidence"]
+        self.assertEqual((wide["with_field_2048"]["reasoning_tokens"], wide["neighbour"]["reasoning_tokens"]),
+                         (900, 512))
+        # Запрос и сырой ответ каждого обмена сохранены до проверки.
+        for row in report["requests"]:
+            self.assertTrue((output / row["request_file"]).is_file())
+            self.assertTrue((output / row["result_file"]).with_name("response.raw").is_file())
+
+    def test_drafts_and_sessions_pass_with_real_counters_and_width(self):
+        code, report, _ = self.bench().check("drafts,sessions")
+        self.assert_all(report)
+        self.assertEqual(code, 0)
+        cohort = report["gates"]["drafts_c4_sampled"]["evidence"]["requests"]
+        self.assertEqual(len(cohort), 4)
+        self.assertTrue(all(row["draft_tokens_accepted"] > 0 for row in cohort.values()))
+        self.assertEqual(max(row["physical_execution_width"] for row in cohort.values()), 4)
+
+    def test_late_shared_prefix_passes_only_when_the_race_is_exercised(self):
+        code, report, _ = self.bench(pace=2).check("late_prefix")
+        gate = report["gates"]["late_shared_prefix"]
+        self.assertEqual((gate["status"], code), ("PASS", 0), gate)
+        evidence = gate["evidence"]
+        self.assertGreaterEqual(evidence["control_without_follower"]["edited"]["cached"], 2048)
+        attempt = evidence["attempts"][-1]
+        self.assertTrue(attempt["exercised"])
+        self.assertGreaterEqual(attempt["leader"]["prompt"], 3500)
+        self.assertEqual(attempt["leader"]["cached"], 0)
+        self.assertEqual(attempt["edited"]["cached"], 2048)
+        self.assertEqual(attempt["follower"]["cached"] + attempt["follower"]["prefill"],
+                         attempt["follower"]["prompt"])
+        self.assertGreater(attempt["timing"]["follower_admitted_before_grid_s"], 0)
+
+    def test_late_shared_prefix_without_the_race_is_not_exercised(self):
+        # Чтение лидера короче запуска последователя: условие гонки не возникает.
+        code, report, _ = self.bench(pace=.01).check("late_prefix", extra=["--late-attempts", "2"])
+        gate = report["gates"]["late_shared_prefix"]
+        self.assertEqual((gate["status"], report["status"], code), ("NOT_EXERCISED", "INCOMPLETE", 2), gate)
+        self.assertEqual(len(gate["evidence"]["attempts"]), 2)
+
+    def test_disk_restore_through_restart(self):
+        bench = self.bench(pace=.2)
+        code, before, output = bench.check("disk")
+        self.assert_all(before)
+        bench.restart()
+        code, after, _ = bench.check(phase="after", restore=output)
+        self.assert_all(after)
+        self.assertEqual(code, 0)
+        raw = after["gates"]["zero_prefill_disk_raw_completion"]["evidence"]
+        self.assertEqual((raw["prefill"], raw["cached"]), (0, raw["prompt"]))
+        self.assertIs(raw["cache_disk_hit"], True)
+        # Запрос чата после перезапуска — иное свидетельство: остаток по устройству сервера.
+        for name in ("text", "image", "continuation"):
+            evidence = after["gates"]["disk_restore_boundary_" + name]["evidence"]
+            self.assertEqual(evidence["observed"], "RESTORE_WITH_REMAINDER_BY_DESIGN")
+            self.assertGreater(evidence["prefill"], 0)
+            self.assertIn(evidence["cached"], evidence["boundaries"])
+            self.assertEqual(evidence["server_log"]["cache"], "disk")
+
+    def test_after_phase_without_prepared_state_is_not_exercised(self):
+        bench = self.bench()
+        state = bench.root / "empty"
+        state.mkdir()
+        (state / "restart-state.json").write_text(json.dumps({"cases": {}}))
+        code, report, _ = bench.check(phase="after", restore=state)
+        self.assertEqual(set(self.statuses(report).values()), {"NOT_EXERCISED"})
+        self.assertEqual((code, report["status"]), (2, "INCOMPLETE"))
+
+    # --- дефекты: каждый gate обязан отказать -------------------------------
+    def test_restore_with_a_remainder_is_not_a_zero_prefill_pass(self):
+        code, report, _ = self.bench(["ram_remainder"]).check("zero_prefill")
+        self.assertEqual(code, 1)
+        for name in ("zero_prefill_ram_text", "zero_prefill_ram_image", "zero_prefill_ram_continuation"):
+            gate = report["gates"][name]
+            self.assertEqual(gate["status"], "FAIL", gate)
+        evidence = report["gates"]["zero_prefill_ram_text"]["evidence"]
+        self.assertEqual(evidence["observed"], "RESTORE_WITH_REMAINDER")
+        self.assertEqual(evidence["repeat"]["prefill"], 2)
+
+    def test_incomplete_token_accounting_fails(self):
+        _, report, _ = self.bench(["accounting"]).check("zero_prefill")
+        self.assertEqual(report["gates"]["zero_prefill_ram_text"]["status"], "FAIL")
+        self.assertIn("cached + prefill", report["gates"]["zero_prefill_ram_text"]["error"])
+
+    def test_server_log_disagreeing_with_usage_fails(self):
+        bench = self.bench()
+        original = bench.fake.log
+        bench.fake.log = lambda line: original(line.replace("cache=memory", "cache=miss"))
+        _, report, _ = bench.check("zero_prefill")
+        self.assertEqual(report["gates"]["zero_prefill_ram_text"]["status"], "FAIL")
+        self.assertIn("server log cache=miss", report["gates"]["zero_prefill_ram_text"]["error"])
+
+    def test_disk_restore_without_disk_evidence_fails(self):
+        bench = self.bench(pace=.2)
+        _, _, output = bench.check("disk")
+        bench.restart(["no_disk_flag"])
+        code, after, _ = bench.check(phase="after", restore=output)
+        self.assertEqual(code, 1)
+        self.assertEqual(set(self.statuses(after).values()), {"FAIL"})
+        self.assertIn("disk-hit evidence", after["gates"]["zero_prefill_disk_raw_completion"]["error"])
+
+    def test_disk_restore_after_cache_loss_fails(self):
+        bench = self.bench(pace=.2)
+        _, _, output = bench.check("disk")
+        for path in bench.cache.glob("*.snapshot"):
+            path.unlink()
+        bench.restart()
+        _, after, _ = bench.check(phase="after", restore=output)
+        self.assertEqual(set(self.statuses(after).values()), {"FAIL"})
+
+    def test_reasoning_boundary_defects(self):
+        for defect, status, text in (("reasoning_over", "FAIL", "exceeded"),
+                                     ("reasoning_short", "NOT_EXERCISED", "before the 512-token budget"),
+                                     ("empty_after_reasoning", "FAIL", "empty visible answer")):
+            with self.subTest(defect):
+                code, report, _ = self.bench([defect], pace=.3).check("reasoning")
+                gate = report["gates"]["reasoning_512_greedy_sse"]
+                self.assertEqual(gate["status"], status, gate)
+                self.assertIn(text, gate.get("error") or gate.get("reason"))
+                self.assertNotEqual(code, 0)
+
+    def test_request_budget_leaking_into_a_neighbour_fails(self):
+        _, report, _ = self.bench(["budget_leak"], pace=.3).check("reasoning")
+        gate = report["gates"]["reasoning_budget_isolation"]
+        # Сосед без поля получил чужой лимит: рассуждение не уместилось в его max_completion_tokens.
+        self.assertEqual(gate["status"], "FAIL", gate)
+        self.assertIn("rb-narrow", gate["error"])
+
+    def test_draft_defects(self):
+        for defect, expected in (("no_drafts", {"drafts_c1_sampled": "FAIL", "drafts_c4_greedy": "FAIL"}),
+                                 ("missing_drafts", {"drafts_c1_greedy": "FAIL", "drafts_c2_sampled": "FAIL"}),
+                                 ("width1", {"drafts_c1_sampled": "PASS", "drafts_c2_sampled": "NOT_EXERCISED",
+                                             "drafts_c4_greedy": "NOT_EXERCISED"})):
+            with self.subTest(defect):
+                _, report, _ = self.bench([defect]).check("drafts")
+                statuses = self.statuses(report)
+                self.assertEqual({name: statuses[name] for name in expected}, expected)
+
+    def test_foreign_session_marker_fails(self):
+        _, report, _ = self.bench(["cross_talk"]).check("sessions")
+        gate = report["gates"]["sessions_independent_c4"]
+        self.assertEqual(gate["status"], "FAIL", gate)
+
+    def test_cancellation_without_server_confirmation_is_not_exercised(self):
+        for defects, log in (((), False), (["no_cancel_log"], True)):
+            with self.subTest(defects=defects, log=log):
+                _, report, _ = self.bench(defects, pace=.5).check("images,sessions", log=log)
+                statuses = self.statuses(report)
+                self.assertEqual((statuses["image_cancel_retry"], statuses["sessions_after_cancel"]),
+                                 ("NOT_EXERCISED", "NOT_EXERCISED"))
+                self.assertEqual(statuses["image_multiple"], "PASS")
+                self.assertEqual(report["status"], "INCOMPLETE")
+
+    def test_late_shared_prefix_defects(self):
+        for defect, text in (("late_share_loses_grid", "did not reuse the 2048-token grid checkpoint"),
+                             ("follower_accounting", "cached + prefill")):
+            with self.subTest(defect):
+                code, report, _ = self.bench([defect], pace=2).check("late_prefix")
+                gate = report["gates"]["late_shared_prefix"]
+                self.assertEqual((gate["status"], code), ("FAIL", 1), gate)
+                self.assertIn(text, gate["error"])
+
+    def test_complex_image_failure_is_inherited_only_with_the_same_control_answer(self):
+        code, control, control_output = self.bench(["image_wrong"]).check("images_complex")
+        self.assertEqual(set(self.statuses(control).values()), {"FAIL"})
+        self.assertEqual(code, 1)
+        code, report, _ = self.bench(["image_wrong"]).check(
+            "images_complex", extra=["--control-report", str(control_output)])
+        self.assertEqual(set(self.statuses(report).values()), {"INHERITED_FAIL"})
+        self.assertEqual((code, report["status"]), (2, "KNOWN_FAILURES"))
+
+    def test_wrong_tool_arguments_fail(self):
+        _, report, _ = self.bench(["tool_args"]).check("tools")
+        self.assertEqual(report["gates"]["tools_chat_sse"]["status"], "FAIL")
+        self.assertEqual(report["gates"]["tools_responses_sse"]["status"], "PASS")
+
+    def test_unreachable_server_fails_every_gate_without_raising(self):
+        bench = self.bench()
+        bench.fake.stop()
+        code, report, _ = bench.check("zero_prefill,tools")
+        self.assertEqual(set(self.statuses(report).values()), {"FAIL"})
+        self.assertEqual(code, 1)
+
+    # --- профиль и композиция ------------------------------------------------
+    def run_command(self, bench, name, *extra):
+        output = bench.root / ("out-" + name)
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            code = remediation.main([name, "--base-url", bench.url, "--output", str(output),
+                                     "--nonce", "c1", *extra])
+        return code, output
+
+    def test_profile_records_every_phase_of_every_request(self):
+        code, output = self.run_command(self.bench(pace=.3), "profile")
+        profile = json.loads((output / "profile.json").read_text())
+        self.assertEqual((code, profile["status"]), (0, "RECORDED"))
+        self.assertEqual(len(profile["rows"]), 12)
+        for row in profile["rows"]:
+            self.assertEqual(set(row["phases"]), set(remediation.PHASES))
+            self.assertIsNotNone(row["phases"]["wall_ms"])
+        repeat = next(row for row in profile["rows"] if row["case"] == "profile-repeat-4k")
+        self.assertEqual(repeat["work"]["prefill_tokens"], 0)
+
+    def test_composition_fills_four_long_sessions_and_mixes_operations(self):
+        code, output = self.run_command(self.bench(pace=.05), "compose", "--duration", "1", "--allow-short")
+        state = json.loads((output / "composition.json").read_text())
+        self.assertEqual((code, state["status"], state["failures"]),
+                         (0, "WORKLOAD_PASS_REQUIRES_MONITOR_VERDICT", []))
+        self.assertEqual(len(state["depths"]), 4)
+        self.assertTrue(all(remediation.MIN_DEPTH <= depth <= remediation.MAX_DEPTH
+                            for depth in state["depths"].values()))
+        kinds = {name.split("-")[0] for name in state["operations"]}
+        self.assertLessEqual({"fill", "continue", "new", "cancel", "image"}, kinds)
+        self.assertLess(state["timeline"]["fill_finished"], state["timeline"]["warmup_finished"])
+        self.assertLessEqual(state["timeline"]["warmup_finished"], state["timeline"]["load_finished"])
+
+    def test_composition_reports_foreign_data_and_missing_drafts(self):
+        for defect, text in (("cross_talk", "foreign session data"), ("no_drafts", "MTP drafts")):
+            with self.subTest(defect):
+                code, output = self.run_command(self.bench([defect], pace=.05), "compose",
+                                                "--duration", "1", "--allow-short", "--records", "5800")
+                state = json.loads((output / "composition.json").read_text())
+                self.assertEqual((code, state["status"]), (1, "FAIL"))
+                self.assertTrue(any(text in failure["error"] for failure in state["failures"]), state["failures"])
+
+    def test_registered_load_duration_cannot_be_shortened_silently(self):
+        with self.assertRaisesRegex(ValueError, "3600"):
+            self.run_command(self.bench(), "compose", "--duration", "60")
+
+
+class PureTests(unittest.TestCase):
+    def test_overall_status_never_promotes_unexercised_or_inherited(self):
+        def gates(*statuses):
+            return {str(index): {"status": status} for index, status in enumerate(statuses)}
+        self.assertEqual(remediation.overall(gates("PASS", "PASS")), "PASS")
+        self.assertEqual(remediation.overall(gates("PASS", "NOT_EXERCISED")), "INCOMPLETE")
+        self.assertEqual(remediation.overall(gates("PASS", "INHERITED_FAIL")), "KNOWN_FAILURES")
+        self.assertEqual(remediation.overall(gates("NOT_EXERCISED", "INHERITED_FAIL")), "INCOMPLETE")
+        self.assertEqual(remediation.overall(gates("PASS", "NOT_EXERCISED", "FAIL")), "FAIL")
+        self.assertEqual(remediation.overall(gates("PASS", "RUNNING")), "FAIL")
+
+    def test_missing_counters_are_failures_not_zeros(self):
+        with self.assertRaisesRegex(remediation.GateFail, "missing prompt/cache/prefill"):
+            remediation.work({"metrics": {"prompt_tokens": 10, "cached_tokens": 10}})
+        with self.assertRaisesRegex(remediation.GateFail, "draft counters"):
+            remediation.drafts({"metrics": {"draft_tokens": 3}})
+        with self.assertRaisesRegex(remediation.GateFail, "reasoning token counter"):
+            remediation.reasoning_tokens({"usage": {"completion_tokens_details": {}}})
+
+    def test_server_log_parsing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "server.log"
+            path.write_text(
+                "I http request=r7 event=received method=POST\n"
+                "I http request=r7 event=completed method=POST path=/v1/chat/completions status=200 "
+                "prompt_tokens=272 prefill_tokens=13 finish=stop cache=disk cached_tokens=259\n"
+                "I cache event=disk_cache action=skipped reason=min_step file_bytes=0 tokens=272\n"
+                "I cache event=disk_cache action=stored reason=saved file_bytes=9 tokens=259 write_ms=1\n")
+            log = remediation.ServerLog(path)
+            row = log.completed("r7", timeout=0)
+            self.assertEqual((row["cache"], row["cached_tokens"], row["prefill_tokens"]), ("disk", "259", "13"))
+            self.assertIsNone(log.completed("r70", timeout=0))
+            self.assertEqual(log.stored(0), [259])
+            self.assertEqual(log.stored(path.stat().st_size), [])
+        self.assertIsNone(remediation.ServerLog(None).completed("r7", timeout=0))
+
+    def test_complex_images_are_deterministic_png_with_exact_goldens(self):
+        probes = images.complex_probes()
+        self.assertEqual(len({probe["id"] for probe in probes}), 5)
+        for probe in probes:
+            data = base64.b64decode(probe["content"]["image_url"]["url"].split(",", 1)[1])
+            self.assertEqual(data[:8], b"\x89PNG\r\n\x1a\n")
+            width, height = struct.unpack(">II", data[16:24])
+            self.assertEqual(width, 448)
+            self.assertIn(height, (96, 160, 192))
+            self.assertTrue(probe["grade"](probe["expected"]))
+            self.assertFalse(probe["grade"]("unknown"))
+            self.assertEqual(images.image_sha(probe["content"]),
+                             images.image_sha(next(p for p in images.complex_probes()
+                                                   if p["id"] == probe["id"])["content"]))
+        by_id = {probe["id"]: probe for probe in probes}
+        self.assertTrue(by_id["paragraph-lines"]["grade"]("river port 583\n Nine owls watch.\nTHE NORTH GATE\n"))
+        self.assertFalse(by_id["paragraph-lines"]["grade"]("RIVER PORT 583\nTHE NORTH GATE"))
+        self.assertTrue(by_id["formula-transcribe"]["grade"]("x=(48+6)/9"))
+        self.assertTrue(by_id["table-second-row"]["grade"]("25, 604, 71"))
+        self.assertFalse(by_id["table-second-row"]["grade"]("417, 82, 936"))
+
+    def test_rendered_text_has_the_expected_ink(self):
+        """Каждая буква рисуется из шрифта: число чёрных пикселей равно сумме битов глифов."""
+        data = base64.b64decode(images.formula_image()["image_url"]["url"].split(",", 1)[1])
+        position, idat = 8, b""
+        while position < len(data):
+            length = int.from_bytes(data[position:position + 4], "big")
+            if data[position + 4:position + 8] == b"IDAT":
+                idat += data[position + 8:position + 8 + length]
+            position += 12 + length
+        raw = zlib.decompress(idat)
+        rows = [raw[index * (448 * 3 + 1) + 1:(index + 1) * (448 * 3 + 1)] for index in range(96)]
+        black = sum(row[x * 3:x * 3 + 3] == b"\0\0\0" for row in rows for x in range(448))
+        bits = sum(pattern.count("1") for character in images.FORMULA for pattern in images.FONT[character])
+        self.assertEqual(black, bits * images.SCALE ** 2)
+
+    def test_legacy_completion_transport(self):
+        usage = {"prompt_tokens": 20, "completion_tokens": 2, "total_tokens": 22, "cached_tokens": 20,
+                 "gufo": {"prefill_tokens": 0, "prefill_ms": 0, "decode_ms": 3, "cache_restore_ms": 1,
+                          "cache_snapshot_ms": 0, "cache_disk_enqueue_ms": 0, "cache_disk_hit": True}}
+        value = {"id": "cmpl-1", "object": "text_completion", "created": 1, "model": "qwen3.6-35b-a3b",
+                 "usage": usage, "choices": [{"text": " ok", "index": 0, "finish_reason": "stop"}]}
+        request = {"method": "POST", "path": "/v1/completions", "body": {
+            "model": "qwen3.6-35b-a3b", "prompt": "a", "max_tokens": 4, "stream": False}}
+        raw = json.dumps(value).encode()
+        row = transport.parse_response(request, raw, [(5, raw)], 200)
+        self.assertEqual((row["status"], row["text"], row["finish"]), ("PASS", " ok", "stop"))
+        self.assertEqual((row["metrics"]["cached_tokens"], row["metrics"]["prefill_tokens"]), (20, 0))
+        for broken in ({**value, "object": "chat.completion"}, {**value, "choices": []},
+                       {**value, "model": "other"}):
+            raw = json.dumps(broken).encode()
+            with self.assertRaises(ValueError):
+                transport.parse_response(request, raw, [(5, raw)], 200)
+
+
+if __name__ == "__main__":
+    unittest.main()
