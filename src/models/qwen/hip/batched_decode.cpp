@@ -186,15 +186,50 @@ SsmControls LaunchSsmControls(const models::QwenLayerWeights& layer,
       return {packed, packed + time_step_rank, row_stride};
     }
   }
-  LaunchProjection(alpha, scratch.decode.normed.data(),
-                   scratch.ssm.alpha.data(), batch_size, time_step_rank,
-                   hidden_size, stream);
-  LaunchProjection(beta, scratch.decode.normed.data(), scratch.ssm.beta.data(),
-                   batch_size, time_step_rank, hidden_size, stream);
+  LaunchDecodeRowsSsmControls(alpha, beta, scratch.decode.normed.data(),
+                              scratch.ssm.alpha.data(), scratch.ssm.beta.data(),
+                              batch_size, time_step_rank, hidden_size, stream);
   return {scratch.ssm.alpha.data(), scratch.ssm.beta.data(), time_step_rank};
 }
 
 }  // namespace
+
+void LaunchDecodeRowsSsmControls(const models::QwenTensorRef& alpha,
+                                 const models::QwenTensorRef& beta,
+                                 const float* input, float* alpha_output,
+                                 float* beta_output, std::size_t rows,
+                                 std::size_t time_step_rank,
+                                 std::size_t hidden_size, hipStream_t stream) {
+  const auto shared = [](core::GgmlType type) {
+    return SupportsExactSharedProjection(type) || type == core::GgmlType::kBF16;
+  };
+  if (shared(alpha.type) && shared(beta.type)) {
+    LaunchProjection(alpha, input, alpha_output, rows, time_step_rank,
+                     hidden_size, stream);
+    LaunchProjection(beta, input, beta_output, rows, time_step_rank,
+                     hidden_size, stream);
+    return;
+  }
+  // Single-token decode computes the controls in its fused input projection,
+  // whose sum tree differs from the plain GEMV. Run that kernel for the two
+  // control matrices alone, so each row keeps the bits it gets by itself.
+  for (std::size_t row = 0; row < rows; ++row) {
+    LaunchFusedSSMInputProjections(
+        nullptr, alpha.type, nullptr, alpha.type, alpha.data, alpha.type,
+        beta.data, beta.type, input + (row * hidden_size), nullptr, nullptr,
+        alpha_output + (row * time_step_rank),
+        beta_output + (row * time_step_rank), hidden_size, 0, 0, time_step_rank,
+        stream);
+  }
+}
+
+void LaunchDecodeRowsProjection(const models::QwenTensorRef& weight,
+                                const float* input, float* output,
+                                std::size_t rows, std::size_t output_size,
+                                std::size_t input_size, hipStream_t stream) {
+  LaunchProjection(weight, input, output, rows, output_size, input_size,
+                   stream);
+}
 
 void MoeFfnRows(const models::QwenLayerWeights& layer,
                 const core::ModelConfig& config, QwenGpuArena& arena,

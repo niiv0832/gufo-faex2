@@ -179,6 +179,26 @@ if (ENGINE_ENABLE_HIP)
   set_tests_properties(qwen_moe_rows_test PROPERTIES
     RUN_SERIAL TRUE TIMEOUT 900)
 
+  # Row operations of batched decode and verification equal the single-token
+  # decode operations bit for bit on real weights. Skipped without the model.
+  add_qwen_hip_test(qwen_decode_rows_ops_test
+    tests/models/qwen/hip/decode_rows_ops_test.cpp
+    "gpu;hip;qwen;moe;mtp;external-model")
+  target_link_libraries(qwen_decode_rows_ops_test PRIVATE
+    gufo_qwen38_flash_next)
+  set_tests_properties(qwen_decode_rows_ops_test PROPERTIES
+    RUN_SERIAL TRUE TIMEOUT 900)
+
+  # Speculative verification computes, bit for bit, the logits of ordinary
+  # decoding on real weights. Skipped without the model.
+  add_qwen_hip_test(qwen_ar_verify_parity_test
+    tests/models/qwen/hip/ar_verify_parity_test.cpp
+    "gpu;hip;qwen;moe;mtp;external-model")
+  target_link_libraries(qwen_ar_verify_parity_test PRIVATE
+    gufo_qwen38_flash_next)
+  set_tests_properties(qwen_ar_verify_parity_test PROPERTIES
+    RUN_SERIAL TRUE TIMEOUT 900)
+
   if (GUFO_BUILD_TOOLS)
     add_executable(qwen35moe_gpu_logits_tool
       ${PROJECT_SOURCE_DIR}/tests/models/qwen/hip/qwen35moe_gpu_logits_tool.cpp)
