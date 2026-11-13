@@ -680,6 +680,13 @@ if (BUILD_TESTING)
   set_tests_properties(speculative_corpus_test PROPERTIES
     LABELS "cpu;tools;benchmarks;speculative;ds4;qwen")
 
+  add_test(NAME logits_nll_report_test
+    COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/tools/logits_nll_report_test.py)
+  set_tests_properties(logits_nll_report_test PROPERTIES
+    LABELS "cpu;tools;quality;qwen"
+    SKIP_RETURN_CODE 77)
+
   add_test(NAME prof_test
     COMMAND ${Python3_EXECUTABLE}
       ${CMAKE_CURRENT_SOURCE_DIR}/tests/tools/prof_test.py)
