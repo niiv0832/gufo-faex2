@@ -471,7 +471,8 @@ void Dissect(World& world, Session& session, const Cut& cut,
   for (const Candidate& candidate : target)
     if (draft.Probability(candidate.token) == 0.0)
       outside += candidate.probability;
-  std::cout << label << ",position=" << position
+  std::cout << std::defaultfloat << std::setprecision(6) << label
+            << ",position=" << position
             << ",vocabulary=" << (prediction.whole ? "whole" : "draft")
             << ",support=" << target.size()
             << ",target_mass_outside_row=" << outside

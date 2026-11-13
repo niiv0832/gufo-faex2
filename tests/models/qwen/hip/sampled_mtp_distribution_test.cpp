@@ -481,7 +481,8 @@ Verdict RunContext(const gufo::test::Stand& stand, std::size_t context,
       (3.2905 + 1.2816) *
       std::sqrt(law.acceptance_rate * (1.0 - law.acceptance_rate) / n);
 
-  std::cout << text.name << ",position=" << position << ",current=" << current
+  std::cout << std::defaultfloat << std::setprecision(6) << text.name
+            << ",position=" << position << ",current=" << current
             << ",samples=" << samples << ",support=" << target.size()
             << ",cells=" << cells.probability.size()
             << ",p_max=" << target.front().probability
