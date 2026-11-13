@@ -1,7 +1,7 @@
 {
   "schema": "gufo-faex2.candidate.v1",
   "date": "2026-11-13",
-  "evidence_as_of": "2026-11-13T23:29:42+03:00",
+  "evidence_as_of": "2026-11-14T00:32:46+03:00",
   "status": "PREPARED_NOT_ACCEPTED",
   "ready_for_deployment": false,
   "deployment_performed": false,
@@ -48,7 +48,7 @@
       "sha256": "da63cb47a76763c712393f8a017070188a304fa39f8aeea6edc629ed7b975cfa"
     },
     "provenance_ref": ".local/remed-20261113/codex-closeout/remote-evidence/accept-out/final1/state.json",
-    "provenance_scope": "Хеши и окружение взяты из final1. Новые модельные результаты OpenCode на 6d52ac57 и отдельная diagnostic2 описаны в verification; численные результаты прежнего кандидата не объявлены повторенными."
+    "provenance_scope": "Хеши и окружение взяты из final1. Новые результаты OpenCode и final2 на 6d52ac57, а также отдельная diagnostic2 описаны в verification; численные результаты прежнего кандидата не объявлены повторенными."
   },
   "intended_profile": {
     "mode": "mtp1",
@@ -143,12 +143,12 @@
       "state_ref": ".local/remed-20261113/codex-closeout/remote-evidence/accept-out/codex-diagnostic2/state.json",
       "review_ref": ".local/remed-20261113/codex-closeout/diagnostic2-acceptance-review.json"
     },
-    "final2_on_this_binary": "NOT_ACCEPTED",
+    "final2_on_this_binary": "FAIL_MEMORY",
     "final2_composition": {
       "window": "codex-final2",
-      "status": "RUNNING",
+      "status": "COMPLETED",
       "acceptance": "NOT_ACCEPTED",
-      "observed_at": "2026-11-13T23:29:42+03:00",
+      "observed_at": "2026-11-14T00:32:46+03:00",
       "fill_finished_at": "2026-11-13T23:28:55+03:00",
       "filled_session_depths": [
         117756,
@@ -157,8 +157,60 @@
         117756
       ],
       "failures_observed_at_snapshot": [],
-      "completion_and_main_restore": "PENDING",
-      "required_load_seconds_after_warmup": 3600
+      "completion_and_main_restore": "VERIFIED",
+      "required_load_seconds_after_warmup": 3600,
+      "window_status": "FAIL",
+      "load_seconds_monotonic": 3604.0142669490306,
+      "load_seconds_after_warmup_wall": 3603.9694035053253,
+      "cycles": 179,
+      "warmup_cycles": 1,
+      "load_cycles": 178,
+      "requests_total": 1500,
+      "requests_after_warmup": 1487,
+      "complete_responses": 1321,
+      "confirmed_cancellations": 179,
+      "long_continuations": 716,
+      "long_continuations_with_cache": 714,
+      "qualified_long_c4_rounds": 177,
+      "partially_batched_rounds": [65, 83],
+      "correct_post_refill_continuations": 4,
+      "workload_status": "WORKLOAD_PASS_REQUIRES_MONITOR_VERDICT",
+      "independent_workload_review": "PASS",
+      "memory_status": "FAIL",
+      "memory_peak_growth_bytes": 2957139968,
+      "memory_gate": {
+        "threshold_bytes": 1073741824,
+        "comparison_window_seconds": 1200,
+        "first_window_samples": 240,
+        "last_window_samples": 239,
+        "gtt_growth_max_bytes": 2957000704,
+        "gpu_total_growth_max_bytes": 2957139968,
+        "gtt_growth_median_bytes": -81788928,
+        "gpu_total_growth_median_bytes": -81092608,
+        "rule": "Рост максимума ИЛИ медианы выше 1 GiB означает FAIL. Снижение медиан не отменяет превышение максимумов; критерий не изменён.",
+        "cause_status": "UNDER_INVESTIGATION"
+      },
+      "continuation_cache_observation": {
+        "status": "OPEN",
+        "reason": "Две полные перечитки длинной истории с prefix_changed; ответы правильны, причина cache miss и связь с пиком памяти пока не доказаны.",
+        "requests": [
+          {"id": "cmp-00540-continue-LAKE_394", "server_request_id": "r541", "cached_tokens": 0, "prefill_tokens": 124191, "prefill_ms": 86772.240393, "server_duration_ms": 92982.1, "server_log_line": 2470},
+          {"id": "cmp-00687-continue-OWL_142", "server_request_id": "r691", "cached_tokens": 0, "prefill_tokens": 125724, "prefill_ms": 88683.71296000002, "server_duration_ms": 94849.1, "server_log_line": 3184}
+        ],
+        "server_log_ref": ".local/remed-20261113/codex-closeout/remote-evidence/accept-out/codex-final2/servers/server-compose.log"
+      },
+      "state_ref": ".local/remed-20261113/codex-closeout/remote-evidence/accept-out/codex-final2/state.json",
+      "composition_ref": ".local/remed-20261113/codex-closeout/remote-evidence/accept-out/codex-final2/compose/composition.json",
+      "monitor_verdict_ref": ".local/remed-20261113/codex-closeout/remote-evidence/accept-out/codex-final2/steps/compose/verdict.json",
+      "independent_review_ref": ".local/remed-20261113/codex-closeout/final2-acceptance-review.json",
+      "live_restore_ref": ".local/remed-20261113/codex-closeout/final2-live-restore.json",
+      "live_restore": {
+        "checked_at": "2026-11-14T00:32:46.932576+03:00",
+        "status": "READY",
+        "main_binary_sha256": "e319b5f5b5198dc60e089d8b57b3e8826728aed5b6ba9f1534adf0b18a67d607",
+        "exact_request": true,
+        "remaining_remediation_model_workers": 0
+      }
     },
     "api_and_disk_recovery_on_this_binary": "PENDING",
     "deployment_and_rollback_rehearsal": "PENDING",
@@ -206,8 +258,13 @@
   "blocking_reasons": [
     {
       "id": "SOAK",
-      "status": "RUNNING_NOT_ACCEPTED",
-      "reason": "codex-final2 идёт на точном кандидате после исправления refill. Четыре истории заполнены; нужны полные 3600 с нагрузки после прогрева, correctness, C4 drafts, отмены, память, kernel и подтверждённый возврат main. Пустой список ошибок раннего снимка не является PASS; final1 остаётся FAIL."
+      "status": "FAIL_MEMORY",
+      "reason": "codex-final2 завершён: 3603,969 с после warmup, ответы/refill/C4/MTP/отмены и возврат main подтверждены. Общий FAIL сохранён: максимум GTT и суммарной GPU памяти вырос примерно на 2,75 GiB при прежнем пороге 1 GiB. Снижение медиан не закрывает gate; причина исследуется. final1 остаётся историческим FAIL."
+    },
+    {
+      "id": "CONTINUATION_CACHE",
+      "status": "OPEN_OBSERVATION",
+      "reason": "В final2 два из 716 длинных продолжений получили cached_tokens=0 и полностью прочитали 124191/125724 токена; серверные запросы заняли около 93/95 с. Ответы правильны. Нужен разбор prefix_changed и состояния cache; наблюдение не объявлено нормой и не меняет зарегистрированные критерии композиции."
     },
     {
       "id": "C4_TIMING",
