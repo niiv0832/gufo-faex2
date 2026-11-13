@@ -1491,6 +1491,72 @@ void TestLayeredPrefillAdmitsShortArrivals() {
          "the arrival does not split the long prompt's pass");
 }
 
+// A shared-prefix arrival inside a layered pass must not hide the pass's
+// existing grid checkpoint. The control run proves that 2048 is reusable;
+// the only changed input in the regression run is the arrival at 1200.
+void TestLayeredPrefillKeepsCheckpointAfterSharedArrival() {
+  for (const bool shared_arrival : {false, true}) {
+    auto control = SharedPrefixControl(true);
+    control->prefill_capacity = 4096;
+    control->layered_prefill_pass_tokens = 4096;
+    control->max_prefill_layer_groups = 16;
+    control->block_advance_label = 2;
+    control->block_prefill_label = 1;
+    auto scheduler = MakeScheduler(control, 4, {.decode_active_tokens = 256});
+
+    // Hold a decoder until the cold leader is queued, so the leader enters
+    // its first 2048-token pass with eight layer groups.
+    auto decoder = scheduler->Submit({2}, 40, 0.0F);
+    control->WaitForAdvance(2);
+    const auto prompt = SharedPrompt(1200, 7000, 2300);
+    auto leader = scheduler->Submit(prompt, 2, 0.0F);
+    control->ReleaseAdvance();
+    control->WaitForPrefill(1);
+    TextGenerationScheduler::Request follower;
+    if (shared_arrival)
+      follower = scheduler->Submit(SharedPrompt(1200, 90000, 100), 2, 0.0F);
+    control->ReleasePrefill();
+
+    const auto leader_result = leader.Wait();
+    Expect(leader_result.tokens == ExpectedTokens(1, 2) &&
+               decoder.Wait().tokens == ExpectedTokens(2, 40),
+           "layered checkpoint probe keeps leader and decoder isolated");
+    std::size_t follower_cached = 0;
+    std::size_t follower_prefilled = 0;
+    if (shared_arrival) {
+      const auto result = follower.Wait();
+      // The pass cannot stop at 1200 any more, so the arrival is not parked
+      // behind a boundary that will never be published.
+      Expect(result.tokens == ExpectedTokens(1, 2) &&
+                 result.shared_prefix_wait_ms == 0.0,
+             "the arrival does not wait for an unreachable boundary");
+      Expect(result.cached_prompt_tokens + result.prefill_tokens == 1300,
+             "the arrival accounts for every prompt token");
+      follower_cached = result.cached_prompt_tokens;
+      follower_prefilled = result.prefill_tokens;
+    }
+    const auto events = control->Events();
+    const auto first_pass = EventIndex(events, EventKind::kPrefill, 1);
+    Expect(first_pass != events.size() && events[first_pass].index == 0 &&
+               events[first_pass].count == 2048 &&
+               leader_result.max_prefill_layer_groups == 8,
+           "the original pass finishes at the planned 2048-token checkpoint");
+
+    // This edit can reuse the old 2048 checkpoint, but neither the leader's
+    // complete 3500-token snapshot nor the follower's divergent 1300 tokens.
+    auto edited = prompt;
+    edited.resize(2148);
+    edited[2048] = 500000;
+    const auto resumed = scheduler->Submit(std::move(edited), 2, 0.0F).Wait();
+    Expect(resumed.tokens == ExpectedTokens(1, 2),
+           "the edited request preserves its output trajectory");
+    Expect(
+        resumed.cached_prompt_tokens == 2048 && resumed.prefill_tokens == 100,
+        "a shared-prefix arrival inside a layered pass preserves the "
+        "existing 2048-token checkpoint");
+  }
+}
+
 void TestNonIncrementalRunnerFallsBackSafely() {
   auto control = std::make_shared<FakeControl>();
   control->incremental_prefill = false;
@@ -3168,6 +3234,7 @@ int main() {
     }
   }
   TestLayeredPrefillAdmitsShortArrivals();
+  TestLayeredPrefillKeepsCheckpointAfterSharedArrival();
   TestNonIncrementalRunnerFallsBackSafely();
   TestPendingLimitsRejectBeforeStateAdmission();
   TestPendingClientsAreRoundRobinAndIndividuallyBounded();

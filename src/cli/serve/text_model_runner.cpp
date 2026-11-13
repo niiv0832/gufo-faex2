@@ -1227,6 +1227,11 @@ struct TextRunnerPool::Request::Impl {
   std::vector<std::size_t> checkpoints;
   /// Checkpoints shared with other requests, retained like continuations.
   std::vector<std::size_t> shared_checkpoints;
+  /// End of the prefill pass now executing; zero between passes. A position
+  /// inside the pass can no longer become a boundary of its own.
+  std::size_t executing_end{0};
+  /// Prompt snapshot position the executing pass captures on its way.
+  std::size_t executing_capture{0};
   bool boundary_capture{false};
   std::vector<TextRunnerToken> generated;
   std::size_t prefill_offset{0};
@@ -1367,9 +1372,17 @@ std::size_t TextRunnerPool::Request::ShareCheckpoint(
     return 0;
   // Prefill already publishes the fallback, this turn's stable boundary and
   // intermediate checkpoints before advancing past them.
+  // A layer yield admits arrivals while a pass is executing. That pass stops
+  // only where it was planned to: a later boundary inside it would never be
+  // captured and would hide the planned one behind it.
+  const auto executing_end = impl_->executing_end;
+  const auto reachable = [&](std::size_t position) {
+    return position >= executing_end || position == impl_->executing_capture;
+  };
   std::size_t planned = 0;
   const auto consider = [&](std::size_t position) {
-    if (position > offset && position <= target && position > planned)
+    if (position > offset && position <= target && position > planned &&
+        reachable(position))
       planned = position;
   };
   if (impl_->snapshot_tokens.size() < impl_->prompt.size())
@@ -1378,9 +1391,11 @@ std::size_t TextRunnerPool::Request::ShareCheckpoint(
   for (const auto position : impl_->checkpoints)
     consider(position);
   auto& checkpoints = impl_->checkpoints;
-  const auto position =
-      planned != 0 && target - planned <= kSharedCheckpointSlack ? planned
-                                                                 : target;
+  const bool use_planned =
+      planned != 0 && target - planned <= kSharedCheckpointSlack;
+  if (!use_planned && target <= executing_end)
+    return 0;
+  const auto position = use_planned ? planned : target;
   if (position == target && !std::ranges::binary_search(checkpoints, target))
     checkpoints.insert(std::ranges::upper_bound(checkpoints, target), target);
   // Prompt snapshots are retained as continuation boundaries already.
@@ -1497,6 +1512,12 @@ TextPrefillStep TextRunnerPool::Request::Prefill(std::size_t max_input_tokens,
     TextRunnerState& state;
     ~ClearYield() { state.SetPrefillYield(1, {}); }
   } clear_yield{state};
+  struct ExecutingPass {
+    Impl& impl;
+    ~ExecutingPass() { impl.executing_end = impl.executing_capture = 0; }
+  } executing_pass{*impl_};
+  impl_->executing_end = impl_->prefill_offset + pass_tokens;
+  impl_->executing_capture = in_pass ? snapshot_position : 0;
   if (layer_groups > 1)
     state.SetPrefillYield(layer_groups, yield);
   auto step =
@@ -1514,6 +1535,7 @@ TextPrefillStep TextRunnerPool::Request::Prefill(std::size_t max_input_tokens,
   }
 
   impl_->prefill_offset += step.consumed_tokens;
+  impl_->executing_end = impl_->executing_capture = 0;
   const bool reached_frontier = impl_->prefill_offset == impl_->prompt.size();
   if (step.decode_ready != (impl_->prefill_offset == model_prompt.size())) {
     throw std::runtime_error(
