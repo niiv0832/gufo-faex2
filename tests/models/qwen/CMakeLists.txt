@@ -225,6 +225,16 @@ if (ENGINE_ENABLE_HIP)
   set_tests_properties(qwen_moe_rows_test PROPERTIES
     RUN_SERIAL TRUE TIMEOUT 900)
 
+  # The Q8_0 copy of Q6_K expert down weights read by the grouped-expert
+  # prefill: repeatable, within the format's bound, and its measured loss
+  # against the original blocks. Skipped without the model.
+  add_qwen_hip_test(qwen_moe_requant_test
+    tests/models/qwen/hip/moe_requant_test.cpp
+    "gpu;hip;qwen;moe;quant;external-model")
+  target_link_libraries(qwen_moe_requant_test PRIVATE gufo_qwen38_flash_next)
+  set_tests_properties(qwen_moe_requant_test PROPERTIES
+    RUN_SERIAL TRUE TIMEOUT 900)
+
   # Row operations of batched decode and verification equal the single-token
   # decode operations bit for bit on real weights. Skipped without the model.
   add_qwen_hip_test(qwen_decode_rows_ops_test
