@@ -289,6 +289,8 @@ bool SameBits(std::span<const float> a, std::span<const float> b) {
 // ------------------------------------------------------------------
 
 struct Verdict {
+  /// Statistical checks carried out.
+  std::size_t checks{0};
   bool invalid{false};
   bool exact_failure{false};
   std::size_t rejections{0};
@@ -458,6 +460,19 @@ Verdict RunContext(const gufo::test::Stand& stand, std::size_t context,
     }
   }
 
+  // Every sample is counted, in both arms.
+  std::size_t counted_mtp = 0;
+  std::size_t counted_ordinary = 0;
+  for (std::size_t cell = 0; cell < cells.probability.size(); ++cell) {
+    counted_mtp += mtp[cell];
+    counted_ordinary += ordinary[cell];
+  }
+  if (samples == 0 || counted_mtp != samples || counted_ordinary != samples ||
+      cells.probability.size() < 2) {
+    std::cout << text.name << ",INVALID: the samples were not all counted\n";
+    verdict.invalid = true;
+    return verdict;
+  }
   const Test fit_mtp = GoodnessOfFit(cells, mtp, samples);
   const Test fit_ordinary = GoodnessOfFit(cells, ordinary, samples);
   const Test homogeneity = Homogeneity(mtp, ordinary);
@@ -501,6 +516,7 @@ Verdict RunContext(const gufo::test::Stand& stand, std::size_t context,
   const auto report = [&](const char* name, const Test& test, double w) {
     const bool rejected = test.p_value < kAlpha;
     verdict.rejections += rejected;
+    ++verdict.checks;
     std::cout << text.name << ',' << name << ",chi2=" << test.statistic
               << ",df=" << test.df << ",p_value=" << test.p_value
               << ",detectable_w=" << w
@@ -512,6 +528,7 @@ Verdict RunContext(const gufo::test::Stand& stand, std::size_t context,
   report("mtp_vs_ordinary", homogeneity, two_w);
   const bool acceptance_rejected = acceptance_p < kAlpha;
   verdict.rejections += acceptance_rejected;
+  ++verdict.checks;
   std::cout << text.name << ",acceptance,accepted=" << accepted
             << ",expected_rate=" << law.acceptance_rate
             << ",observed_rate=" << static_cast<double>(accepted) / n
@@ -547,6 +564,7 @@ int main(int argc, char** argv) {
                 << " is not the registered N=" << kSamples
                 << "; this run is not the acceptance check\n";
     std::size_t ran = 0;
+    std::size_t checks = 0;
     std::size_t rejections = 0;
     bool invalid = false;
     bool exact_failure = false;
@@ -556,6 +574,7 @@ int main(int argc, char** argv) {
       ++ran;
       const Verdict verdict = RunContext(*stand, context, samples);
       rejections += verdict.rejections;
+      checks += verdict.checks;
       invalid = invalid || verdict.invalid;
       exact_failure = exact_failure || verdict.exact_failure;
     }
@@ -563,7 +582,9 @@ int main(int argc, char** argv) {
       std::cerr << "unknown context " << wanted << '\n';
       return 2;
     }
-    std::cout << "contexts=" << ran << ",checks=" << 4 * ran
+    // A context that did not carry out its four checks is not a pass.
+    invalid = invalid || checks != 4 * ran;
+    std::cout << "contexts=" << ran << ",checks=" << checks
               << ",alpha_per_check=" << kAlpha
               << ",family_bound=" << 16 * kAlpha << ",rejections=" << rejections
               << ',';

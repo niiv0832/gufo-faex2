@@ -60,8 +60,18 @@ using gufo::test::Token;
 constexpr std::uint32_t kContext = 1024;
 
 bool g_passed = true;
+// What a run executed.
+std::size_t g_checks = 0;
+std::size_t g_dissections = 0;
+std::size_t g_thresholds = 0;
+std::size_t g_residuals = 0;
+std::size_t g_masked = 0;
+std::size_t g_steps = 0;
+std::size_t g_shared_rounds = 0;
+std::size_t g_shared_schedules = 0;
 
 void Expect(bool condition, const std::string& message) {
+  ++g_checks;
   if (!condition) {
     g_passed = false;
     std::cout << "FAIL: " << message << '\n';
@@ -281,6 +291,14 @@ void Dissect(World& world, Session& session, const Cut& cut,
   if (constraint != nullptr)
     config.constraint = constraint->constraint;
   gufo::sampling::SamplerState base(config, cut.prompt);
+  // A restricting grammar takes the executor's samplers to the host: the
+  // device kernels carry no mask. The host results below are held to double
+  // precision, which the device path would not meet.
+  if (constraint != nullptr) {
+    Expect(base.NeedsConstraintMask(),
+           label + ": the grammar does not restrict the tokens");
+    ++g_masked;
+  }
   if (constraint == nullptr)
     base.Accept(cut.current);
 
@@ -398,6 +416,7 @@ void Dissect(World& world, Session& session, const Cut& cut,
     const double threshold = sampled_oracle::DecisionThreshold(accepts);
     const double error = std::abs(threshold - std::min(1.0, p / q)) * q;
     worst_accepted = std::max(worst_accepted, error);
+    ++g_thresholds;
     std::size_t kept = 0;
     while (kept < target.size() && target[kept].token != token)
       ++kept;
@@ -412,7 +431,12 @@ void Dissect(World& world, Session& session, const Cut& cut,
   // second draw choose a first draw that rejects.
   const int depth = target.size() > 4096 ? 14 : 30;
   double conditional = -1.0;
+  // A residual the reference finds must be checked.
+  if (!reference.residual.empty())
+    Expect(least_acceptance < 0.95,
+           label + ": the residual of this row was not checked");
   if (least_acceptance < 0.95) {
+    ++g_residuals;
     const Token token = draft.ids[least];
     const double q = draft.probabilities[least];
     const auto measure =
@@ -448,9 +472,10 @@ void Dissect(World& world, Session& session, const Cut& cut,
                std::to_string(conditional * reference.rejection_mass));
   }
 
-  // The ordinary sampler on the same row.
+  // The ordinary sampler on the same row; with a mask it is the host sampler
+  // on a copy of the row.
   double plain = -1.0;
-  if (!host) {
+  {
     const auto measure =
         sampled_oracle::MeasureRuns(sampled_oracle::RecoverRuns(
             [&](double uniform) {
@@ -461,11 +486,12 @@ void Dissect(World& world, Session& session, const Cut& cut,
             },
             depth));
     plain = sampled_oracle::MeasureError(measure, target);
-    Expect(plain <= bound.sampled + std::ldexp(1.0, -depth - 2),
+    Expect(plain <= (host ? 1e-9 : bound.sampled) + std::ldexp(1.0, -depth - 2),
            label + ": the ordinary sampler draws p with error " +
                std::to_string(plain));
   }
   session.executor->FinishVerification();
+  ++g_dissections;
 
   double outside = 0.0;
   for (const Candidate& candidate : target)
@@ -647,6 +673,7 @@ void EndToEnd(World& world, Session& session, const Cut& cut,
   for (const Token token : expected)
     std::cout << token << ' ';
   std::cout << "\n";
+  ++g_steps;
   session.verifier->Reset();
 }
 
@@ -752,6 +779,7 @@ void CheckSharedProposals(World& world, std::vector<Session>& sessions,
     Expect(differing == 0, "proposal round " + std::to_string(round) + " of " +
                                std::to_string(group.size()) +
                                " sessions differs from the lone proposals");
+    ++g_shared_rounds;
     std::cout << "shared-proposals,round=" << round
               << ",sessions=" << group.size() << ",leader=" << group.front()
               << ",differing=" << differing << '\n';
@@ -859,6 +887,7 @@ void CheckSharedSteps(World& world, std::vector<Session>& sessions,
     Expect(differing == 0 && steps > 0,
            request.name + "," + name +
                ": batched verifier steps differ from the lone steps");
+    ++g_shared_schedules;
     std::cout << "shared-steps," << request.name << ',' << name
               << ",drafts=" << steps << ",accepted=" << accepted
               << ",differing=" << differing << '\n';
@@ -1032,6 +1061,19 @@ int main(int argc, char** argv) {
     std::cerr << "qwen_sampled_mtp_chain_test: " << failure.what() << '\n';
     return 1;
   }
+  // Six texts: four under three requests, two under two, and two masked
+  // dissections; whole steps for both outcomes of each unmasked pair with
+  // the four chosen-token steps; five proposal rounds; three schedules under
+  // three requests.
+  std::cout << "checks=" << g_checks << ",dissections=" << g_dissections
+            << ",thresholds=" << g_thresholds << ",residuals=" << g_residuals
+            << ",masked=" << g_masked << ",steps=" << g_steps
+            << ",shared_rounds=" << g_shared_rounds
+            << ",shared_schedules=" << g_shared_schedules << '\n';
+  Expect(g_dissections == 18 && g_thresholds >= 36 && g_residuals == 18 &&
+             g_masked == 2 && g_steps == 28 && g_shared_rounds == 5 &&
+             g_shared_schedules == 9 && g_checks >= 1000,
+         "the run executed fewer checks than it must");
   std::cout << (g_passed ? "PASS" : "FAIL") << '\n';
   return g_passed ? 0 : 1;
 #else
