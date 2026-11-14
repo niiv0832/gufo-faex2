@@ -1613,7 +1613,13 @@ public:
   void StreamPersistentSnapshot(const TextRunnerSnapshot& snapshot,
                                 const SnapshotSink& sink) const override {
     const auto expected_bytes = PersistentSnapshotPayloadBytes(snapshot);
-    const auto& qwen = static_cast<const QwenTextRunnerSnapshot&>(snapshot);
+    const auto* qwen_snapshot =
+        dynamic_cast<const QwenTextRunnerSnapshot*>(&snapshot);
+    if (qwen_snapshot == nullptr) {
+      throw std::invalid_argument(
+          "Qwen persistent snapshot does not belong to this runner");
+    }
+    const auto& qwen = *qwen_snapshot;
     const auto target_bytes = qwen.snapshot->CompactPayloadBytes();
     const auto verifier_bytes =
         qwen.verifier_snapshot != nullptr
