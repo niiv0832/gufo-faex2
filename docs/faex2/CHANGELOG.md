@@ -4,6 +4,13 @@
 
 ## 2026-11-14
 
+### 06:13 MSK: ordinary кандидат собран, первый A остановлен на Btrfs identity preflight
+
+- Ordinary `ffc8580a6edb0eae5e26c2a99c0712084faa948d`, binary `8acf34daf647512159ca29c331f380d4472a7fc3d310968fa4cafc4098bb67a1`, manifest `4f13939e97eb2a34008e95b444fc741b83befea723783e141ba92d9883985347`. Тот же toolchain/flags,16 изменённых source/test SHA равны GREEN3, diagnostic patch отсутствует; сборка299steps сохранила mainPID945631. Все84 functional SHA control/candidate совпали. Prepared runtime61ELF, package/Python/env pins;9inputs offlinePASS, concreteconfigreview без blocker.
+- `codex-stream-timing-a` загрузил controlb641, но preflight отверг maps/stat device mismatch. Ни одного measured request, B NOT_RUN, timing/hour квалификации нет. Fail сохранён полностью:74файла, архивSHA `7f28883188bfe0ac70b2a5044c281a9822724894a769c3369f5d47b6f56ac097`. Main возвращён27,000с, smoke4PASS/kernelCLEAN; независимый06:13:18READY PID951824/exact request/identity/SHAe319.
+- Read-only факты: у main, библиотек и GGUF inode совпадает, proc/maps device00:23, stat device отличается по subvolume (37/59/88). map_files readlink доступен, follow-stat EPERM; sudo не применялся. Main/collector mount namespace и mountinfo совпали. CPU private mmap4096 без записи для gufo/libc/HIP даёт тот же maps00:23/inode, что основной процесс. Это основа строгого bridge в helper, не разрешение игнорировать identity. Дополнительно обнаружены char devices и anonymous /dev/zero(deleted): их нельзя читать как ELF.
+- Production source не меняется. Перед новым окном нужны исправленные CPU negative tests, независимое review и live-readonly capture на уже работающем main; новая версия пакета/каталог сохранят A1FAIL. Кандидат не переведён, Q1 остаётся проектом; два oldfullJSONmiss остаются OPEN/NOT_PROVEN.
+
 ### 05:59 MSK: потоковая запись Qwen/MTP прошла настоящий GREEN
 
 - Frozen source36e46+patch1e492388, manifestec040ff8. Plain binarya94ebe7a: payload19542208bytes/direct equality,9callbacks, largest chunk/allocation8388608,292observedallocations, peak-live8409971, remaining0. Два sink throws и byte-exact retry прошли с прежним16MiB+4096 guard.
