@@ -4,6 +4,12 @@
 
 ## 2026-11-14
 
+### 05:45 MSK: первый streaming GREEN остановлен на OOM, main возвращён
+
+- Frozen source36e46+patch5c5a58e4 собран в семь targets; четыре CPU targets прошли за1,63с. CTest4.5 печатает новый summary `100% tests passed out of 4`, поэтому старое сравнение строки остановило оформление manifest (исходный job rc1 сохранён). Отдельная проверка четырёх Passed и нового summary оформила manifest70147af2; пересборки/повтора CPU не было. Общий clang-format PASS727.
+- Первый actual Qwen GPU stream завершился rc1/runtime `out of memory` после успешных prefill/snapshot/direct serialization и fixture19542208. Plain binaryb5cb2956; MTP/compact tests автоматически NOT_RUN. Причина пока не локализована: ограничитель C++ allocations может превращаться HIP API в runtime OOM; это гипотеза, не доказанный дефект observer. Следующий diagnostictest печатает ledger после unwinding, пределы16MiB+4096 и production неизменны.
+- Полный архив56 файлов SHA `c4dc51f1d72a652819580f0cf7c7af143e40982c45a89f296724ab5822697305` сохранён. Main возвращён автоматически за25,282с, полный smoke PASS/kernel CLEAN; независимая проверка05:45:43 READY PID936523/exact request/identity/SHAe319. Ни перевода, ни push, ни установкиpi, ни принятияQ1 не было.
+
 ### Устранены прежние замечания общего format-check
 
 - Исправлены36 diagnostics в девяти ранее неформатированных файлах: JSON constraint, DFlash policy/backend и шесть тестовых/диагностических файлов. Diff проверен: только отступы, переносы строк и комментариев, без изменения выражений, констант, include order или поведения.
