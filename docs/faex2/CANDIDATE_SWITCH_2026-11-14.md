@@ -3,7 +3,7 @@
 **Статус: проект для проверки; комплект launcher не сгенерирован, перевод не
 разрешён и не выполнен.** В [manifest](CANDIDATE_2026-11-14.json) установлено
 `ready_for_deployment=false`. Новый ordinary `ffc8580a/8acf34da` собран;
-узкие snapshot-контракты GREEN3 прошли, A2/B2 correctness/storage прошли, comparative timing **INCONCLUSIVE** (9flags); final4 **RUNNING**.
+узкие snapshot-контракты GREEN3 прошли, A2/B2 correctness/storage прошли, comparative timing **INCONCLUSIVE** (9flags); final4 **PASS всех девяти gates**.
 Исторический final3 на `b641/ef7e` остаётся **NOT_ACCEPTED / FAIL_MEMORY** по RSS
 (+2,34GiB при пороге1GiB). Возврат main1195/e319 проверен в завершённых окнах;
 актуальные PID/состояние проверять по CONTEXT и launcher, а не по этому проекту.
@@ -48,7 +48,7 @@ freeze/publication и final writer recheck прежние, будущие cache 
 
 | Проверка | Состояние и оставшееся обязательство |
 |---|---|
-| Новый ordinary ffc | A2/B2: по9 correct requests,4 byte-equal stable cache image pairs;9timing flags/46issues дают INCONCLUSIVE. Final4 RUNNING, hour memory PASS пока не получен. A1 завершилось до запросов из-за Btrfs identity helper; исправление прошло CPU и отдельный live no-request capture, не модельную приёмку |
+| Новый ordinary ffc | A2/B2: по9 correct requests,4 byte-equal stable cache image pairs;9timing flags/46issues дают INCONCLUSIVE. Final4: 3602,261 с, 1600 запросов, все девять gates PASS; RSS max +452956160 байт при прежнем лимите 1 GiB. A1 завершилось до запросов из-за Btrfs identity helper; исправление прошло CPU и отдельный live no-request capture, не модельную приёмку |
 | Historical ordinary final3 b641 | **NOT_ACCEPTED / FAIL_MEMORY**: RSS first/last max6628700160→9136889856, delta2508189696 bytes; остальные8gates PASS. 3610,648с,1610requests/768long/192C4/192cancel/4postrefill. Полный raw проверен. Тот же harness `76bd2ef2`, nonce `6af771b5`, два calibration, четыре fill, warmup и не менее 3600 с после него, без agent holds. Memory gate первых/последних 20 минут прежний: 1200 с с каждого края, минимум 20 samples, FAIL при росте максимума или медианы выше 1 GiB |
 | Cache5 | 14 запросов: 13 точных полных ответов и одна подтверждённая отмена; target disk 128309 и live 117825, четыре physical width4 с drafts. Окно и возврат прошли, но focused memory — `INCONCLUSIVE_MONITOR`: gap 310.258 мс > заранее заданных 250 мс. Все 24 timing flags сохранены; comparative timing — `INCONCLUSIVE` |
 | Предыдущая композиция | `final2` на `6d52ac57/27ef2c9c` остаётся `FAIL_MEMORY/NOT_ACCEPTED`. Две полные перечитки остаются OPEN. Полный final3 разобран: новых полных JSON misses нет, timing flags сохранены при runtime mismatch; причина двух старых misses не установлена, квота допустимых misses не вводится |
@@ -87,7 +87,8 @@ ownership в cache5 сохраняется; `INCONCLUSIVE_MONITOR` и 24 timing 
 переквалифицируются. Самостоятельные correctness и hour gates внутри final3
 остаются применимы: final3 завершён отказом по RSS, остальные восемь gates прошли.
 
-Для выполняемого ordinary final4 сохранены [plan/config/reviewer](../../.local/remed-20261113/codex-closeout/final4-proposal-ffc/proposal-freeze.json).
+Для завершённого ordinary final4 сохранены [plan/config/reviewer](../../.local/remed-20261113/codex-closeout/final4-proposal-ffc/proposal-freeze.json).
+[Полный strict review](../../.local/remed-20261113/codex-closeout/final4-ffc-acceptance-review.json) подтверждает scoped hour PASS; это не comparative timing или quality PASS.
 План побайтно равен final3: прежние calibration/fill, nonce6af771b5, warmup,
 3600с и first/last20,1GiB. Окно запущено после разбора ordinary A2/B2 пары с сохранением INCONCLUSIVE и всех9flags.
 Actual loaded-module proof пары сохранён; static ldd и helper validation

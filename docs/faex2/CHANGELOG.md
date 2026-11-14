@@ -4,6 +4,15 @@
 
 ## 2026-11-14
 
+### 08:11 MSK: final4 прошёл исходный часовой gate, main возвращён
+
+- Ordinary `ffc8580a`/`8acf34da`: все девять gates PASS; 3602,261 с после warmup, 1600 raw/result пар, 764 длинных продолжения, 191 C4, 191 отмена, четыре post-refill истории. Новых полных JSON miss нет; два старых final2 остаются OPEN.
+- Memory first/last 1200 с, по 239 samples: RSS max +452956160 байт, GTT +291520512, VRAM +45056, GPU total +291737600; все приросты max/median ниже прежнего 1 GiB. Старые final2/final3 FAIL сохранены, причинное сравнение памяти и общий bound RSS/HIP не объявлены.
+- Main `1195d154`/`e319b5f5` независимо READY в 08:11:18, PID 970495, exact request/identities/SHA; smoke4 PASS, kernel CLEAN. Полный архив SHA `ad50b20a516a2e2a19b5a97e00ce7e48325d280aec55b3862eb7669bf15b2f04`, strict review `2a452b70a1c8ae63c146adea8e96913ff04e05fc074c5055f033822aa6b1ff0f`.
+- Полные model/mmproj SHA пересчитаны. Endpoint captures вне нагрузки показали поздние hipBLASLt ELF/metadata; endpoint comparison INCONCLUSIVE. Full final3→final4 ledger сохраняет 2768 timing flags/928 запросов и 200 work differences; A2/B2 — прежние 9 flags. Comparative timing не квалифицирован.
+- Обновлены manifest, процедура, реестр, текущая сводка и эксплуатационные записи; исправлены устаревшие утверждения о HEAD и словаре MTP. Q1 DRAFT, pi NOT_EXERCISED, old OpenCode evidence отдельно. Перевода/push нет. [Подробный итог](CLOSEOUT_2026-11-13.md#итог-final4-2026-11-14-0811-msk).
+
+
 ### 07:03 MSK: ordinary пара и целостность проверены, начат исходный час final4
 
 - A2 `b641/ef7e` и B2 `ffc/8acf`: по9 правильных полных ответов,15 этапов PASS, C1/C4 disk restore с ожидаемыми token/work/width/MTP. Четыре seed images сохранялись во всех трёх процессах каждой роли. Оба окна вернули main со smoke4PASS/kernelCLEAN; независимо A2 PID955147 в06:48:28, B2 PID958177 в06:56:26, exact request/identities/SHAe319. Архивы A2 `bbf288e5f5fa30336654c50f5b2c14f4a13f33cf1cad42d9c6544ad6396eae8e`, B2 `652411d9cd0d8516e0dda730dd48d5f9278d4573f9c9f40eae4e484a4a638246`.

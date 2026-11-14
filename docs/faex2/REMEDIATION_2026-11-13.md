@@ -9,27 +9,27 @@
 измерений качества; менять его после просмотра результатов нельзя** — можно только
 добавлять с датой и объяснением.
 
-## Текущая сводка после ordinary A2/B2, час final4 выполняется
+## Текущая сводка: ordinary A2/B2 и час final4 завершены
 
-Обычный кандидат — `ffc8580a` / `8acf34da`, сборка от 06:06 MSK. A2/B2: по9 correct requests и4 byte-equal cache pairs; timing INCONCLUSIVE (9flags), final4 RUNNING с07:02 MSK.
+Обычный кандидат — `ffc8580a` / `8acf34da`, сборка от 06:06 MSK. A2/B2: по9 correct requests и4 byte-equal cache pairs; timing INCONCLUSIVE (9 flags); final4 завершён в 08:10 MSK, все девять gates PASS. Main независимо проверен в 08:11:18.
 **Общая приёмка NOT_QUALIFIED; ready_for_deployment=false.** Ниже датированные
 сводки и исходный реестр сохраняют историю; их «идёт»/«в работе» не означают
 текущее состояние. Полный перечень №1–14, А–Е и I1–I7 сверен в
-[карте закрытия v3 до новой пары](../../.local/remed-20261113/codex-closeout/AUDIT_CLOSURE_TABLE_DRAFT_V3.md).
+[итоговой таблице закрытия](AUDIT_CLOSURE_2026-11-14.md).
 
 | Область | Подтверждённый результат | Остаток |
 |---|---|---|
 | Исходные исправления №1–6,8,10–11; А–Е; I1–I5 | Сохранены fixes и тесты с исходным scope/provenance; HTTP позднего checkpoint, orchestration cleanup/monitor/VRAM/missing tables, sampled/requant уже проверены | Это inherited evidence, не новый model PASS ordinary8acf; границы fault injection, BF16 synthetic и MTP1 не расширены |
-| №7 / I6: host snapshot buffer | `ffc8580a`: Qwen/MTP stream, host scratch8MiB для копирования GPU, callback≤16MiB; actual RED3→GREEN3, CPU4/GPU3 PASS, 16 изменённых файлов совпали с ordinary source | Устранён полный write-buffer в проверенном Qwen stream path. Старые final2/final3 memory FAIL сохранены; полный RSS/HIP bound не доказан, новый час RUNNING |
+| №7 / I6: host snapshot buffer | `ffc8580a`: Qwen/MTP stream, host scratch8MiB для копирования GPU, callback≤16MiB; actual RED3→GREEN3, CPU4/GPU3 PASS, 16 изменённых файлов совпали с ordinary source | Устранён полный write-buffer в проверенном Qwen stream path. Старые final2/final3 memory FAIL сохранены; полный RSS/HIP bound не доказан. Final4 hour PASS: RSS max +452956160 байт, прежний лимит 1 GiB |
 | №9 / №12: prefill/vision | Операторные причины, meas4, exact snapshot restore и oracle проверены | Approximate prefill и cold-vision FAIL сохранены; Q1 DRAFT, новый holdout/evaluator не исполнены, lossless не заявлен |
 | №13: агенты/проверяющие средства | OpenCode4/4 каждой роли на old binaries; поздние false PASS закрыты CPU44/offline8/8. Btrfs runtime identity helper отдельно CPU32 + live no-request PASS | Агенты на8acf не повторены; pi NOT_EXERCISED. Helper PASS не является A2/B2 model/timing PASS |
-| №14: композиция/cache | Historical final3:1610 rows,768 long,192C4,192cancel,4refill; восемь gates PASS, RSS FAIL | Новый час ffc RUNNING. Два полных JSON misses final2 OPEN/NOT_PROVEN; отсутствие новых misses в final3 не закрывает их причину |
+| №14: композиция/cache | Historical final3:1610 rows,768 long,192C4,192cancel,4refill; восемь gates PASS, RSS FAIL | Final4: 1600 запросов, 764 long, 191 C4/отмена, 4 refill; все девять gates PASS. Два полных JSON misses final2 OPEN/NOT_PROVEN; отсутствие новых misses в final3/final4 не закрывает их причину |
 | Скорость / I7 | Все old flags, admission/LRU trade-offs и runtime mismatch сохранены; A1 до измеряемых запросов FAIL на техническом identity gate, main возвращён | Ordinary A2/B2 INCONCLUSIVE: late mappings/monitor gaps/admission,9flags сохранены. Прежние5%+3ms на каждую ячейку и memory1GiB/first-last20 неизменны; средние и иной runtime не заменяют qualification |
 | Назначение рабочим | Сохранены main/recovery1195/e319, проект процедуры и backup требования | Новый launcher не сгенерирован/не установлен; отдельного deployment approval нет |
 
 [GREEN3 scope/raw](../../.local/remed-20261113/codex-closeout/snapshot-stream-green3-independent-review.json),
 [ordinary manifest](../../.local/remed-20261113/codex-closeout/snapshot-stream-step2/staged-remote-v2/cand/ffc8580a6edb0eae5e26c2a99c0712084faa948d/MANIFEST.json),
-[проект следующего часа](../../.local/remed-20261113/codex-closeout/final4-proposal-ffc/proposal-freeze.json).
+[завершённый час final4](../../.local/remed-20261113/codex-closeout/final4-ffc-acceptance-review.json).
 Ни один прежний FAIL не заменён PASS; правила приёмки ниже не изменены.
 
 ## Итог final3, 2026-11-14 04:08 MSK
@@ -105,7 +105,7 @@ gate**; `final2 FAIL_MEMORY`, timing INCONCLUSIVE и два старых cache m
 простого увеличения бюджета недостаточно. Это дефект воспроизводителя,
 а не доказательство ошибки production identity.
 
-## Сводка продолжения, 2026-11-14 03:01 MSK
+## Историческая сводка продолжения на 2026-11-14 03:01 MSK
 
 Подробный реестр ниже сохраняет ход расследования и исходные ревизии.
 Новый обычный кандидат — `b641fe3e`/`ef7e3040`, его часовая проверка идёт.

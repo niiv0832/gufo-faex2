@@ -1,9 +1,9 @@
 {
   "schema": "gufo-faex2.candidate.v1",
   "date": "2026-11-14",
-  "prepared_at": "2026-11-14T07:03:01+03:00",
+  "prepared_at": "2026-11-14T08:14:04.662293+03:00",
   "status": "PREPARED_NOT_ACCEPTED",
-  "document_status": "DRAFT_FFC_PAIR_REVIEWED_HOUR_RUNNING",
+  "document_status": "DRAFT_FINAL4_REVIEWED_NOT_QUALIFIED",
   "ready_for_deployment": false,
   "deployment_performed": false,
   "authorization": {
@@ -105,7 +105,7 @@
     "change_cause": "PACKAGE_TRANSACTION_OBSERVED: /var/log/pacman.log фиксирует обновления Python/OpenSSL/curl и других пакетов 2026-11-14 01:34:46–54 MSK. Кто запустил обновление, не установлено; причина конкретных timing pauses из этого не следует.",
     "package_history_ref": ".local/remed-20261113/codex-closeout/runtime-package-history.json",
     "package_history_sha256": "4b74b828c519085eedf667d3397d6b5844eb34f5c9ceaa83efba50c5d30ee11f",
-    "acceptance_scope": "A2/B2 correctness/storage PASS в узком scope, strict timing INCONCLUSIVE. Final4 RUNNING; historical failures не изменены.",
+    "acceptance_scope": "Ordinary A2/B2 correctness/storage и отдельный final4 hour gate PASS. Comparative timing остаётся INCONCLUSIVE; исторические отказы сохранены.",
     "pending_ordinary_pair": {
       "status": "ACTUAL_PAIR_REVIEWED_INCONCLUSIVE",
       "canonical_runtime_expected_sha256": "bbfc01d2ae1fab6ead5273fef81e068c74370326f72e0fa7241bd47e26c9d6c9",
@@ -119,6 +119,31 @@
       "comparison_sha256": "0242bca23a16f3c85804e3585e6fcbd9b7fcd46f84bae90ae199d1d1edd837ec",
       "late_mapping_observation": "Каждый lifetime63ELF/3nonELF→64/4; поздние hipBLASLt hsaco и metadata, first probes8192B/ELF hash3623704B. Все исходные strict issues сохранены.",
       "main_vocab_environment_note": "GUFO_MTP_VOCAB=0 у main vs absent isolated; source1195/ffc подтверждает инертность для actual Qwen3.6 embedded MTP, не effective draft-profile difference."
+    },
+    "final4_endpoints": {
+      "status": "INCONCLUSIVE_ENDPOINT_DIFFERENCE",
+      "scope": "ENDPOINTS_ONLY",
+      "state_ref": ".local/remed-20261113/codex-closeout/remote-evidence/accept-out/codex-final4-ffc/state.json",
+      "state_sha256": "c9b53117b8d53bc40c08d119df60eb03e8045a7ad3055e2a045df4d92287931b",
+      "comparison": {
+        "scope": "ENDPOINTS_ONLY; no continuous-module or performance qualification",
+        "elf_added": [
+          "therock-10.1.0/lib/hipblaslt/library/gfx1151/Kernels.so-000-gfx1151.hsaco"
+        ],
+        "elf_removed": [],
+        "elf_changed": [],
+        "non_elf_added": [
+          "therock-10.1.0/lib/hipblaslt/library/gfx1151/TensileLibrary_BB_SB_HA_Bias_SAV_UA_Type_BS_HPA_Contraction_l_Alik_Bljk_Cijk_Dijk_gfx1151.co"
+        ],
+        "non_elf_removed": [],
+        "non_elf_changed": [],
+        "environment_differences": {},
+        "status": "INCONCLUSIVE_ENDPOINT_DIFFERENCE",
+        "memory_gate_changed": false,
+        "performance_qualification": "NOT_EVALUATED"
+      },
+      "observer_outside_measured_load": true,
+      "path_display": "Пути относительно каталога toolchain; точные пути и identity находятся в private state по указанным ref/SHA."
     }
   },
   "assets": {
@@ -132,9 +157,10 @@
       "bytes": 902822528,
       "sha256": "da63cb47a76763c712393f8a017070188a304fa39f8aeea6edc629ed7b975cfa"
     },
-    "provenance_ref": ".local/remed-20261113/codex-closeout/remote-evidence/accept-out/final1/state.json",
-    "provenance_scope": "Ожидаемые SHA модели/mmproj сохранены из исторического manifest. Это не заявление о новом ordinary8acf inference/quality PASS; actual окна должны подтверждать pins отдельно.",
-    "freshly_reverified_for_current_candidate": false
+    "provenance_ref": ".local/remed-20261113/codex-closeout/remote-evidence/accept-out/codex-final4-ffc/state.json",
+    "provenance_scope": "Полные SHA модели и mmproj пересчитаны перед ordinary final4: sha256_basis=COMPUTED_NOW. Это проверка артефактов, не принятие численного качества.",
+    "freshly_reverified_for_current_candidate": true,
+    "provenance_sha256": "c9b53117b8d53bc40c08d119df60eb03e8045a7ad3055e2a045df4d92287931b"
   },
   "intended_profile": {
     "mode": "mtp1",
@@ -190,8 +216,154 @@
     "subject_binary_sha256": "8acf34daf647512159ca29c331f380d4472a7fc3d310968fa4cafc4098bb67a1",
     "binary_kind": "ordinary",
     "composition": {
-      "status": "RUNNING_NOT_EVALUATED",
-      "result": null,
+      "status": "VERIFIED_SCOPED_PASS",
+      "result": {
+        "review_ref": ".local/remed-20261113/codex-closeout/final4-ffc-acceptance-review.json",
+        "review_sha256": "2a452b70a1c8ae63c146adea8e96913ff04e05fc074c5055f033822aa6b1ff0f",
+        "state_ref": ".local/remed-20261113/codex-closeout/remote-evidence/accept-out/codex-final4-ffc/state.json",
+        "state_sha256": "c9b53117b8d53bc40c08d119df60eb03e8045a7ad3055e2a045df4d92287931b",
+        "archive_sha256": "ad50b20a516a2e2a19b5a97e00ce7e48325d280aec55b3862eb7669bf15b2f04",
+        "scope": "Only completed composition/restore; not quality or performance acceptance",
+        "gates": {
+          "duration": {
+            "status": "PASS"
+          },
+          "wire_and_answers": {
+            "status": "PASS"
+          },
+          "post_refill": {
+            "status": "PASS"
+          },
+          "long_c4_mtp": {
+            "status": "PASS",
+            "qualified_rounds": 191,
+            "total_rounds": 191,
+            "partial_rounds": []
+          },
+          "cancellations": {
+            "status": "PASS"
+          },
+          "process_identity": {
+            "status": "PASS"
+          },
+          "restore": {
+            "status": "PASS"
+          },
+          "kernel": {
+            "status": "PASS"
+          },
+          "memory": {
+            "status": "PASS",
+            "threshold_bytes": 1073741824,
+            "failed_metrics": {}
+          }
+        },
+        "load_seconds_after_warmup": 3602.261189222336,
+        "cycles": 191,
+        "load_cycles": 190,
+        "requests": 1600,
+        "complete_responses": 1409,
+        "long_continuations": 764,
+        "long_continuations_with_cache": 764,
+        "qualified_long_c4_rounds": 191,
+        "confirmed_cancellations": 191,
+        "post_refill_checks": [
+          {
+            "refill": "cmp-00962-refill-MOON_853",
+            "next_continuation": "cmp-00966-continue-MOON_853",
+            "correct_json": true,
+            "antecedent_preserved": true
+          },
+          {
+            "refill": "cmp-00963-refill-PINE_627",
+            "next_continuation": "cmp-00967-continue-PINE_627",
+            "correct_json": true,
+            "antecedent_preserved": true
+          },
+          {
+            "refill": "cmp-00964-refill-LAKE_394",
+            "next_continuation": "cmp-00968-continue-LAKE_394",
+            "correct_json": true,
+            "antecedent_preserved": true
+          },
+          {
+            "refill": "cmp-00990-refill-OWL_142",
+            "next_continuation": "cmp-00991-continue-OWL_142",
+            "correct_json": true,
+            "antecedent_preserved": true
+          }
+        ],
+        "efficiency_observations": {
+          "status": "NONE_OBSERVED",
+          "full_long_history_cache_misses": [],
+          "partial_c4_rounds": []
+        },
+        "memory": {
+          "rss_bytes": {
+            "first_samples": 239,
+            "last_samples": 239,
+            "first_max": 6089416704,
+            "last_max": 6542372864,
+            "first_median": 3282087936,
+            "last_median": 3334787072,
+            "growth_max_bytes": 452956160,
+            "growth_median_bytes": 52699136
+          },
+          "gtt_used_bytes": {
+            "first_samples": 239,
+            "last_samples": 239,
+            "first_max": 66140852224,
+            "last_max": 66432372736,
+            "first_median": 61126561792,
+            "last_median": 61032206336,
+            "growth_max_bytes": 291520512,
+            "growth_median_bytes": -94355456
+          },
+          "vram_used_bytes": {
+            "first_samples": 239,
+            "last_samples": 239,
+            "first_max": 158011392,
+            "last_max": 158056448,
+            "first_median": 157745152,
+            "last_median": 157925376,
+            "growth_max_bytes": 45056,
+            "growth_median_bytes": 180224
+          },
+          "gpu_used_bytes": {
+            "first_samples": 239,
+            "last_samples": 239,
+            "first_max": 66298580992,
+            "last_max": 66590318592,
+            "first_median": 61284274176,
+            "last_median": 61190066176,
+            "growth_max_bytes": 291737600,
+            "growth_median_bytes": -94208000
+          }
+        },
+        "restore": {
+          "attempt": 1,
+          "launcher_rc": 0,
+          "ready_and_identities": true,
+          "request_exactly_as_before": true,
+          "binary_sha256": "e319b5f5b5198dc60e089d8b57b3e8826728aed5b6ba9f1534adf0b18a67d607",
+          "binary_sha_matches": true,
+          "smoke": {
+            "health": true,
+            "text": true,
+            "tool": true,
+            "vision": true
+          },
+          "verified": true
+        },
+        "kernel": {
+          "status": "CLEAN",
+          "findings": []
+        },
+        "independent_main_ref": ".local/remed-20261113/codex-closeout/remote-evidence/accept-out/codex-final4-ffc/independent-main-after.json",
+        "independent_main_sha256": "800866d39fe32679957a290d8234737f593d621a5457494f032e85f671a73604",
+        "independent_main_pid": 970495,
+        "independent_main_verified_at": "2026-11-14T08:11:18.761525+03:00"
+      },
       "proposal_ref": ".local/remed-20261113/codex-closeout/final4-proposal-ffc/proposal-freeze.json",
       "plan_ref": ".local/remed-20261113/codex-closeout/final4-proposal-ffc/plan-final4.json",
       "config_ref": ".local/remed-20261113/codex-closeout/final4-proposal-ffc/config-final4.json",
@@ -207,7 +379,18 @@
       "prerequisite": "Пара разобрана со всеми flags; correctness и integrity прошли, timing остаётся INCONCLUSIVE. Час проверяет отдельный неизменённый memory/correctness gate.",
       "window_name": "codex-final4-ffc",
       "started_at": "2026-11-14T07:02:24.733073+03:00",
-      "runtime_wrapper_sha256": "4d390370e891104c8f17c46fa5bd48a1ca91e1ba939548e59ff37691bc2e2b58"
+      "runtime_wrapper_sha256": "4d390370e891104c8f17c46fa5bd48a1ca91e1ba939548e59ff37691bc2e2b58",
+      "finished_at": "2026-11-14T08:10:21.472131+03:00",
+      "independent_reviews": [
+        {
+          "report_ref": ".local/remed-20261113/codex-closeout/final4-independent-full-review.json",
+          "report_sha256": "3c60117086f0f968842acbff5ac69991843ce25d4efc7144d3cdc590119f1e05"
+        },
+        {
+          "report_ref": ".local/remed-20261113/codex-closeout/final4-independent-memory-and-timing-review.json",
+          "report_sha256": "910c884b743a73844614d0ccf685bee822fa7d37bffbf9240fe194e68460b593"
+        }
+      ]
     },
     "matched_speed": {
       "status": "INCONCLUSIVE_EVIDENCE",
@@ -240,6 +423,31 @@
       "equality_ref": ".local/remed-20261113/codex-closeout/snapshot-stream-step2/timing-a2-b2-cache-byte-equality.json",
       "equality_sha256": "e79f4e8ecaa9de2e9b96c95e6fb53656e31fafbdb5a59a02771e9e2dd7087f62",
       "scope": "Холодные seeds и C1/C4 disk restore с pinned ответами/работой. Не весь API/agent/numerical/vision sweep."
+    },
+    "historical_hour_timing": {
+      "status": "ALL_ROLE_DIAGNOSTIC_ONLY_NOT_QUALIFIED",
+      "runtime_qualification": "INCONCLUSIVE_HISTORICAL_RUNTIME_NOT_FULLY_OBSERVED",
+      "control_rows": 1610,
+      "candidate_rows": 1600,
+      "exact_role_and_input_pairs": 1600,
+      "control_only_rows": 10,
+      "timing_cells": 27200,
+      "missing_cells": 1146,
+      "timing_flags": 2768,
+      "distinct_flagged_candidate_requests": 928,
+      "retained_long_flags": 1952,
+      "normalized_work_difference_pairs": 200,
+      "phase_cells": 3,
+      "phase_flags": 0,
+      "full_ledger": {
+        "report_ref": ".local/remed-20261113/codex-closeout/final4-full-all-role-timing-v2.json",
+        "report_sha256": "77b6d9a967135de3897fe765e12192e70825a206e948830078843a0d40ce2147"
+      },
+      "long_comparison": {
+        "report_ref": ".local/remed-20261113/codex-closeout/final4-vs-final3-full-comparison.json",
+        "report_sha256": "54804668977d30cabaa275899cdfbf11c51a9f436c50786555e5ecd06fe71dad"
+      },
+      "scope": "Все исходные timing cells/flags сохранены; missing cancel byte counters остаются null. Совпадение input не доказывает одинаковую работу/порядок/runtime; общей квалификации скорости нет."
     }
   },
   "diagnostic_experiments": {
@@ -610,16 +818,6 @@
   },
   "blocking_reasons": [
     {
-      "id": "CURRENT_COMPOSITION",
-      "status": "RUNNING_CURRENT_ORDINARY_HOUR",
-      "reason": "Final4 ffc/8acf начат07:02MSK, итог ещё неизвестен. Final2/final3 FAIL_MEMORY сохранены; streaming correctness не заменяет hour gate."
-    },
-    {
-      "id": "FOCUSED_MEMORY",
-      "status": "INCONCLUSIVE_MONITOR",
-      "reason": "В cache5 один target monitor gap 310.258 мс превысил заранее заданные 250 мс. Прямой эффект сокращения queue ownership наблюдался, но focused benefit и исходный hour gate этим не закрыты."
-    },
-    {
       "id": "CONTINUATION_CACHE",
       "status": "OPEN_OBSERVATION",
       "reason": "В final2 два из 716 длинных продолжений получили cached_tokens=0 и полностью прочитали 124191/125724 токена; серверные запросы заняли около 93/95 с. Ответы правильны. Нужен разбор prefix_changed и состояния cache; наблюдение не объявлено нормой и не меняет зарегистрированные критерии композиции."
@@ -646,8 +844,8 @@
     },
     {
       "id": "SNAPSHOT_STREAMING_MEASURED_EFFECT",
-      "status": "TIMING_INCONCLUSIVE_HOUR_RUNNING",
-      "reason": "Actual ordinary9+9 correctness и4 byte-equal stable image pairs PASS; scoped RSS observation не заменяет hour.9timing flags при runtime/monitor/admission confounds сохранены; final4 RUNNING."
+      "status": "HOUR_PASS_TIMING_INCONCLUSIVE",
+      "reason": "Ordinary 9+9 correctness, четыре byte-equal stable image pairs и final4 hour memory/correctness PASS. Все 9 timing flags A2/B2 и ограничения runtime/monitor/admission сохранены; причинное ускорение или общий bound RSS/HIP не доказаны."
     }
   ],
   "cache_compatibility": {
@@ -675,7 +873,7 @@
   },
   "procedure_ref": "docs/faex2/CANDIDATE_SWITCH_2026-11-14.md",
   "procedure_status": "DRAFT_NOT_GENERATED_NOT_INSTALLED_NOT_AUTHORIZED",
-  "evidence_attribution": "Ordinary ffc/8acf:9focused requests PASS, C1/C4 restore и4 byte-equal cache image pairs; strict timing INCONCLUSIVE, final4 RUNNING. GREEN3 CPU4/GPU3 source-equivalent16files перечислены отдельно. Historical b641 final3 FAIL_MEMORY/cache5 INCONCLUSIVE и old model/agent/numerical evidence не переименованы.",
+  "evidence_attribution": "Ordinary ffc/8acf: focused 9 requests PASS, четыре byte-equal cache pairs и final4 1600 requests/764 long/191 C4/191 cancel/4 refill, все девять hour gates PASS. Strict comparative timing INCONCLUSIVE; GREEN3 CPU4/GPU3 source-equivalent16files отдельно. Historical FAIL, прежние numerical/OpenCode результаты и два OPEN miss не перенесены на новый бинарник.",
   "agent_verification_scope": {
     "opencode": "PASS только на перечисленных older ordinary binaries; на ffc/8acf не повторён.",
     "pi": "NOT_EXERCISED: pi не установлен; обязательство реального replay не заменено OpenCode."
@@ -731,5 +929,38 @@
       "Synthetic storage cases не доказывают качество полной35B/vision; generic unknown-draft fallback по-прежнему допускает full-vector.",
       "Перенос old ordinary hour/model/agent PASS на8acf запрещён."
     ]
+  },
+  "closed_or_historical_requirements": [
+    {
+      "id": "CURRENT_COMPOSITION",
+      "previous_status": "RUNNING_CURRENT_ORDINARY_HOUR",
+      "previous_reason": "Final4 ffc/8acf начат07:02MSK, итог ещё неизвестен. Final2/final3 FAIL_MEMORY сохранены; streaming correctness не заменяет hour gate.",
+      "status": "CLOSED_CURRENT_HOUR_GATE",
+      "resolution": "Final4 ordinary ffc/8acf: все девять gates PASS по неизменённому контракту. Старые final2/final3 FAIL и cache5 INCONCLUSIVE сохраняются; причинное сравнение памяти этим не доказано."
+    },
+    {
+      "id": "FOCUSED_MEMORY",
+      "previous_status": "INCONCLUSIVE_MONITOR",
+      "previous_reason": "В cache5 один target monitor gap 310.258 мс превысил заранее заданные 250 мс. Прямой эффект сокращения queue ownership наблюдался, но focused benefit и исходный hour gate этим не закрыты.",
+      "status": "HISTORICAL_INCONCLUSIVE_PRESERVED",
+      "resolution": "Final4 ordinary ffc/8acf: все девять gates PASS по неизменённому контракту. Старые final2/final3 FAIL и cache5 INCONCLUSIVE сохраняются; причинное сравнение памяти этим не доказано."
+    }
+  ],
+  "final_handoff": {
+    "status": "READY_SAME_MAIN_INDEPENDENT_RECHECK",
+    "checked_at": "2026-11-14T08:24:08.349995+03:00",
+    "pid": 970495,
+    "binary_sha256": "e319b5f5b5198dc60e089d8b57b3e8826728aed5b6ba9f1534adf0b18a67d607",
+    "model_requests_performed": 0,
+    "proof_ref": ".local/remed-20261113/codex-closeout/final4-main-handoff-check.json",
+    "proof_sha256": "d565682fa51fd29fe20da98e3c8890cb7cafc9f517476af93277ed51e957f9ea"
+  },
+  "closure_table": {
+    "report_ref": "docs/faex2/AUDIT_CLOSURE_2026-11-14.md",
+    "report_sha256": "957d211f092fea6fb061bac391e2004de23c59297d0667bfd8d5f8222fd12025",
+    "private_source_ref": ".local/remed-20261113/codex-closeout/AUDIT_CLOSURE_TABLE_ACTUAL_V4.json",
+    "private_source_sha256": "200466309b369c6227b52a3ddd55f711b57c73c8a815e5d4f6ed323a628d1d35",
+    "obligations": 27,
+    "status": "SCOPED_HOUR_PASS_OVERALL_NOT_QUALIFIED"
   }
 }
