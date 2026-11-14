@@ -267,9 +267,9 @@ public:
     for (std::uint32_t length = 1; length <= cap; ++length) {
       survival *= probability;
       expected_tokens += survival;
-      const float score =
-          expected_tokens / ((*relative_costs)[length - 1] +
-                             attention_cost_scale * kMoeContextCost[length - 1]);
+      const float score = expected_tokens /
+                          ((*relative_costs)[length - 1] +
+                           attention_cost_scale * kMoeContextCost[length - 1]);
       if (score > best_score) {
         best_score = score;
         best_length = length;
@@ -387,8 +387,7 @@ private:
       0.264F, 0.451F, 0.492F, 0.569F, 0.737F, 0.807F, 1.021F};
   // Target-only steps (speculative off) cost 15.6/19.8/27.2 ms at C1/C2/C4,
   // relative to each cohort's one-draft cycle; 20.2 ms at ~30K (C1).
-  static constexpr std::array<float, 3> kMoeNoDraftCost{0.641F, 0.620F,
-                                                        0.595F};
+  static constexpr std::array<float, 3> kMoeNoDraftCost{0.641F, 0.620F, 0.595F};
   static constexpr float kMoeNoDraftContextCost = 0.190F;
   DFlashDraftPolicy policy_;
   std::uint32_t limit_;

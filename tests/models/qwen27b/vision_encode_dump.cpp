@@ -1,6 +1,7 @@
-// vision_encode_dump MMPROJ WIDTH IMAGE OUT.bin [REPEAT] — encodes one image with
-// the Qwen vision tower, writes the merged embedding (float32, rows x width) and
-// prints the warm encode time. Used to compare encoder variants end to end.
+// vision_encode_dump MMPROJ WIDTH IMAGE OUT.bin [REPEAT] — encodes one image
+// with the Qwen vision tower, writes the merged embedding (float32, rows x
+// width) and prints the warm encode time. Used to compare encoder variants end
+// to end.
 #include <hip/hip_runtime.h>
 
 #include <chrono>
@@ -16,7 +17,8 @@
 
 int main(int argc, char** argv) {
   if (argc < 5) {
-    std::cerr << "usage: vision_encode_dump MMPROJ WIDTH IMAGE OUT.bin [REPEAT]\n";
+    std::cerr
+        << "usage: vision_encode_dump MMPROJ WIDTH IMAGE OUT.bin [REPEAT]\n";
     return 2;
   }
   try {
@@ -40,7 +42,8 @@ int main(int argc, char** argv) {
       if (i > 0 && ms < best)
         best = ms;
     }
-    std::vector<float> host(std::size_t{embedding->rows()} * embedding->width());
+    std::vector<float> host(std::size_t{embedding->rows()} *
+                            embedding->width());
     if (hipMemcpy(host.data(), embedding->data(), host.size() * sizeof(float),
                   hipMemcpyDeviceToHost) != hipSuccess)
       throw std::runtime_error("embedding download failed");

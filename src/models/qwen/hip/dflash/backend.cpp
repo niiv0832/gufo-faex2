@@ -187,16 +187,15 @@ QwenDFlashGpuDraftBackend::QwenDFlashGpuDraftBackend(
     QwenDFlashGpuDraftConfig config)
     : executor_(std::move(executor)),
       config_(config),
-      controller_(
-          config.policy, config.max_draft_tokens,
-          // A MoE target has its own measured costs. Otherwise the tied
-          // output tensor distinguishes the qualified Q8 target (Q8_0 head)
-          // from Q4 (Q6_K head) for verification cost selection.
-          config.moe_target ? speculative::DFlashTargetProfile::kMoe
-          : executor_->GetModel().GetWeights().output.type ==
-                  core::GgmlType::kQ8_0
-              ? speculative::DFlashTargetProfile::kDenseQ8
-              : speculative::DFlashTargetProfile::kDenseQ4) {}
+      controller_(config.policy, config.max_draft_tokens,
+                  // A MoE target has its own measured costs. Otherwise the tied
+                  // output tensor distinguishes the qualified Q8 target (Q8_0
+                  // head) from Q4 (Q6_K head) for verification cost selection.
+                  config.moe_target ? speculative::DFlashTargetProfile::kMoe
+                  : executor_->GetModel().GetWeights().output.type ==
+                          core::GgmlType::kQ8_0
+                      ? speculative::DFlashTargetProfile::kDenseQ8
+                      : speculative::DFlashTargetProfile::kDenseQ4) {}
 
 std::unique_ptr<QwenDFlashGpuDraftBackend> QwenDFlashGpuDraftBackend::Create(
     std::shared_ptr<const QwenDFlashGpuModel> model,

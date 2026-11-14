@@ -273,8 +273,7 @@ void TestMoeLengthController() {
 
   DFlashLengthController code(DFlashDraftPolicy::kAdaptive, 7,
                               DFlashTargetProfile::kMoe);
-  Expect(code.Choose(7, kPlain, 1) >= 1,
-         "a fresh MoE history still drafts");
+  Expect(code.Choose(7, kPlain, 1) >= 1, "a fresh MoE history still drafts");
   for (int round = 0; round < 32; ++round)
     code.Observe(7, 7);
   for (const std::size_t users : {1U, 2U, 4U})

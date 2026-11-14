@@ -339,7 +339,7 @@ void CheckDsparkServing(const char* model_path, const char* support_path) {
             {.role = "user",
              .content = "Continue the pattern with twenty terms: red, blue, "
                         "blue, red, blue, blue,"},
-        };
+    };
     const auto direct_prompt =
         model->EncodeChat(direct_messages, ResolveDeepSeekChatOptions({}));
     InferenceBackend backend;
@@ -559,7 +559,7 @@ int main(int argc, char** argv) {
           direct_messages = {
               {.role = "system", .content = "Answer with one short sentence."},
               {.role = "user", .content = "Name one primary color."},
-          };
+      };
       const auto direct_chat = GenerateDirect(
           model,
           model->EncodeChat(direct_messages, ResolveDeepSeekChatOptions({})),
@@ -663,14 +663,14 @@ int main(int argc, char** argv) {
                .content =
                    "Continue this sequence with four short items: one, two, "
                    "three,"},
-          };
+      };
       const std::vector<gufo::models::deepseek_v4_flash::ChatMessage>
           direct_b_messages = {
               {.role = "user",
                .content =
                    "Continue this sequence with four short items: red, green, "
                    "blue,"},
-          };
+      };
       const auto direct_a = GenerateDirect(
           model,
           model->EncodeChat(direct_a_messages, ResolveDeepSeekChatOptions({})),

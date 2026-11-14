@@ -3,6 +3,8 @@
 Контрольная точка: **2026-11-10**, `faex2` опубликована и выбрана основной веткой; защита от удаления/force-push активна, Issues включены, Actions выключены.
 Это актуальная сводка, не журнал всех действий. После значимого шага обновлять её и [CHANGELOG.md](CHANGELOG.md) в том же сеансе.
 
+**Форматирование, 2026-11-14:** исправлены прежние36 замечаний в девяти файлах; это переносы строк/отступы и комментарии, поведение не менялось. Все девять файлов проходят clang-format. Общая проверка будет повторена после завершения текущей streaming-реализации: сейчас её новые файлы ещё редактируются.
+
 **Состояние 2026-11-14 05:08:58 MSK:** main `1195d154`/`e319b5f5` независимо проверен READY, PID930455, точные request/identity/SHA. `codex-stream-red3` подтвердил нужный RED: настоящий Qwen прошёл HIP/model/prefill/snapshot/direct-serialize, затем старый stream запросил ровно19542208байт и был остановлен guard single-allocation (test rc1, wrapper RED_VERIFIED). Окно/возврат PASS, простой24,885с, health/text/tool/vision PASS, kernel CLEAN. Начата реализация byte-exact потоковой записи; GREEN/эффект RSS ещё не проверены, MTP этим RED не покрыт. Кандидат не переводился, final3 FAIL_MEMORY и Q1 DRAFT сохранены.
 
 **Следующая доработка:** [план потоковой сериализации Qwen](SNAPSHOT_STREAMING_PLAN.md). Старый diagnostic cache3 доказал перекрытие двух полноразмерных host buffers5724710484байт на1,480035с. Выбран byte-exact stream с scratch16MiB и MTP host spans; cache policy, budgets и критерии прежние. Настоящий allocation RED подтверждён; далее реализация/GREEN и затронутые проверки. Точная allocation-атрибуция ordinary final3 пика не доказана.

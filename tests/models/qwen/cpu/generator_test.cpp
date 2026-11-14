@@ -70,7 +70,7 @@ void TestSyntheticGeneration() {
   const std::unordered_map<std::string, gufo::tokenization::TokenId> specials =
       {
           {std::string(kImEnd), 7},
-      };
+  };
 
   auto tokenizer = gufo::tokenization::QwenTokenizer::CreateFromVocabulary(
       vocab, merges, specials);

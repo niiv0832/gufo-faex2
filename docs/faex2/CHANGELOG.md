@@ -4,6 +4,11 @@
 
 ## 2026-11-14
 
+### Устранены прежние замечания общего format-check
+
+- Исправлены36 diagnostics в девяти ранее неформатированных файлах: JSON constraint, DFlash policy/backend и шесть тестовых/диагностических файлов. Diff проверен: только отступы, переносы строк и комментариев, без изменения выражений, констант, include order или поведения.
+- Проверка этих девяти файлов PASS. Общий required check запущен, прежние ошибки исчезли; оставшиеся diagnostics относятся к незавершённым streaming-файлам другого параллельного шага. Финальный общий PASS пока не заявляется. Модельные/GPU-тесты ради форматирования не запускались.
+
 ### 05:08 MSK: настоящий Qwen allocation RED подтверждён, начата потоковая запись
 
 - Тест RED3 прошёл все setup stages, prefill и старую direct serialization. Старый StreamPersistentSnapshot попытался выделить ровно19542208байт, guard подтвердил single-allocation/expected_full_payload=1/peak_live0, test rc1. Wrapper RED_VERIFIED означает воспроизведение дефекта, а не готовое исправление. Plain synthetic Qwen без MTP; отдельные MTP/pending/GPU-format tests ещё готовятся.

@@ -95,10 +95,12 @@ void TestSampleRow() {
   using gufo::speculative::MtpSampleRow;
   const std::vector<gufo::tokenization::TokenId> ids{7, 8, 9};
   const std::vector<float> probs{0.5F, 0.3F, 0.2F};
-  Expect(MtpSampleRow(ids, probs, 0.0) == 7 && MtpSampleRow(ids, probs, 0.49) == 7,
-         "low uniforms select the first candidate");
-  Expect(MtpSampleRow(ids, probs, 0.5) == 8 && MtpSampleRow(ids, probs, 0.79) == 8,
-         "inverse CDF selects the middle candidate");
+  Expect(
+      MtpSampleRow(ids, probs, 0.0) == 7 && MtpSampleRow(ids, probs, 0.49) == 7,
+      "low uniforms select the first candidate");
+  Expect(
+      MtpSampleRow(ids, probs, 0.5) == 8 && MtpSampleRow(ids, probs, 0.79) == 8,
+      "inverse CDF selects the middle candidate");
   Expect(MtpSampleRow(ids, probs, 0.99999) == 9,
          "high uniforms select the last candidate");
   const std::vector<float> tail{1.0F, 0.0F, 0.0F};

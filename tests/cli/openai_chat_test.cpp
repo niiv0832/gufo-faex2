@@ -5980,7 +5980,7 @@ void TestToolTagBoundaries() {
             continue;
           const auto prefix =
               initial == Initial::kContent ? std::string{}
-              : implicit                   ? std::string("Check tags.\n\n")
+              : implicit ? std::string("Check tags.\n\n")
                          : (initial == Initial::kAuto ? "<think>" : "") +
                                std::string("Check tags.</think>\n");
           const auto raw = prefix + call + "\n" + noop;
