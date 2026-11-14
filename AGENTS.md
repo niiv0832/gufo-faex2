@@ -13,6 +13,7 @@
 7. Git-идентичность не менять самовольно. Использовать уже настроенный локальный noreply; перед коммитом/публикацией проверить автора/committer. Не stage `.local/`, бэкапы, старые патчи с личными метаданными, семейные изображения/ответы, ключи или токены. Не использовать `git add -f` для обхода защиты.
 8. Для нашего проекта Git — достаточный рабочий инструмент; установка `jj`, `gh`, Nix не является автоматическим требованием. При отсутствии `gh` допустимы согласованные действия владельца в браузере и стандартный Git. Общие upstream-инструкции сборки ниже не заменяют manifest конкретного стенда. Упоминания main/PR в методике ниже означают явно выбранные контрольную ревизию и кандидата; main не является автоматическим baseline нашей ветки.
 9. Корневой CHANGELOG и release workflow принадлежат исходной линии. Наш журнал — `docs/faex2/CHANGELOG.md`; автоматический выпуск/Actions не включать без отдельного проектирования. NPU остаётся экспериментом; неизвестное качество не выдавать за lossless.
+10. Гигиена агентов: по завершении задачи и переносе своих коммитов в `faex2` удалить собственный временный `git worktree` (`git worktree remove`) и свои временные сборочные каталоги. Строго запрещено: трогать чужие `worktree`, использовать `git clean`, удалять сохранённые сырые отчёты, логи и артефакты приёмки (включая неуспешные прогоны) до завершения независимой проверки этапа.
 
 ## Platform and build
 
@@ -78,7 +79,9 @@ unqualified; do not widen margins or stop at reporting failures. Use the code
 diff to select affected metrics; unrelated timing variance does not justify
 another full matrix.
 For reported coding-agent loops, also replay the affected workflow with
-`tests/functional/pi_agent.py`; retain its sessions and inspect actual tool results.
+`tests/functional/opencode_agent.py` in isolated mode (OpenCode 2.3.0); retain
+its sessions and inspect actual tool results. `pi` (`tests/functional/pi_agent.py`)
+is NOT_EXERCISED by the owner's decision of 2026-11-14 and must not be installed.
 Retain numerical quality tests and the standard speed benchmark. Keep these
 tests in `tests/functional/`, outside hosted model CI; avoid full sweeps.
 
