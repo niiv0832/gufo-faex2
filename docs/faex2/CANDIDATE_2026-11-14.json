@@ -1,0 +1,456 @@
+{
+  "schema": "gufo-faex2.candidate.v1",
+  "date": "2026-11-14",
+  "prepared_at": "2026-11-14T00:05:40.061752+00:00",
+  "status": "PREPARED_NOT_ACCEPTED",
+  "document_status": "DRAFT_FOR_REVIEW",
+  "ready_for_deployment": false,
+  "deployment_performed": false,
+  "authorization": {
+    "scope": "Доработки, сборки и приёмочные проверки с возвратом прежнего main; без назначения кандидата рабочим и публикации.",
+    "owner_quality_acceptance": false,
+    "owner_deployment_approval": false,
+    "historical_approvals_apply": false
+  },
+  "candidate": {
+    "source_sha": "b641fe3eb4d6a91352a007587b4f17a440fc4aff",
+    "binary_sha256": "ef7e3040138761614641311e12efe6e335dfbd5e5b244b578a0e4b4833310cb1",
+    "binary_kind": "ordinary",
+    "diagnostic": false,
+    "expected_version": "gufo version development (b641fe3eb4d6a91352a007587b4f17a440fc4aff)",
+    "built_at": "2026-11-14T02:30:26.942865+03:00",
+    "build_status": "COMPLETED",
+    "deployed_as_main": false,
+    "change_kind": "EARLY_ADVISORY_MIN_STEP_BEFORE_QUEUE_RETENTION",
+    "writer_final_recheck_preserved": true,
+    "ram_freeze_and_publication_unchanged": true,
+    "numerical_arithmetic_unchanged": true,
+    "identical_future_cache_hits_guaranteed": false,
+    "full_private_manifest_ref": ".local/remed-20261113/codex-closeout/remote-evidence/build-minstep1/cand/b641fe3eb4d6a91352a007587b4f17a440fc4aff/MANIFEST.json",
+    "full_private_manifest_sha256": "c225ca732721e4e344cdd64ec38b48d808667f2c2ccb52549d1e2c67c502ea1f"
+  },
+  "build_environment": {
+    "target": "Linux x86-64 gfx1151",
+    "c_and_cxx_compiler": "c++ (GCC) 16.2.1 20260810",
+    "hip_compiler": "AMD clang version 24.0.0git (https://github.com/ROCm/llvm-project.git d6f6cb691863e9258034ab48c1dfce21689d5606)",
+    "matched_control_build_settings": true,
+    "provenance_ref": ".local/remed-20261113/codex-closeout/remote-evidence/build-minstep1/cand/b641fe3eb4d6a91352a007587b4f17a440fc4aff/MANIFEST.json",
+    "python_on_stand": "3.14.10 (main, Nov 11 2026, 08:10:30) [GCC 16.2.1 20260810]",
+    "python_provenance_scope": "Фактический Python клиента из partial state final3, не историческое значение final2 и не итог модельной приёмки.",
+    "matched_control_build_settings_scope": "Поле build manifest относится к настройкам сборки. Совпадение версий cc/HIP не доказывает идентичный runtime или набор загруженных библиотек."
+  },
+  "runtime_provenance": {
+    "audit_ref": ".local/remed-20261113/codex-closeout/composition-runtime-provenance-audit.json",
+    "audit_sha256": "c063052176cf5421d9ec97a94b53def82ea40582aac6fb8555d93692a2438572",
+    "observations": {
+      "final2": {
+        "subject_binary_sha256": "27ef2c9c5f63ab0f829784818b27f1b55a585f77e4a91b0483c34b71aa5bc614",
+        "python": "3.14.9 (main, Oct 25 2026, 14:52:47) [GCC 16.2.1 20260810]",
+        "openssl_sonames": [
+          "libcrypto.so.3",
+          "libssl.so.3"
+        ],
+        "state_ref": ".local/remed-20261113/codex-closeout/remote-evidence/accept-out/codex-final2/state.json",
+        "state_sha256": "da99599dbea0afad7b5b655f48361c843a03f728c98dd401cbdea6dd01b0f7c8"
+      },
+      "final3_partial": {
+        "subject_binary_sha256": "ef7e3040138761614641311e12efe6e335dfbd5e5b244b578a0e4b4833310cb1",
+        "python": "3.14.10 (main, Nov 11 2026, 08:10:30) [GCC 16.2.1 20260810]",
+        "openssl_sonames": [
+          "libcrypto.so.4",
+          "libssl.so.4"
+        ],
+        "state_ref": ".local/remed-20261113/codex-closeout/final3-partial-warmup/state.json",
+        "state_sha256": "2874f0f3982a999cb13ca2e7cfcc6bdb9bfe88b7db05c11aa5dca7a4ae1891f5"
+      },
+      "cache4": {
+        "subject_binary_sha256": "e08026a982583b57d537e8eff19a95232a916212aed351410a8bdd5c598a8bd3",
+        "python": "3.14.10 (main, Nov 11 2026, 08:10:30) [GCC 16.2.1 20260810]",
+        "openssl_sonames": [
+          "libcrypto.so.3",
+          "libcrypto.so.4",
+          "libssl.so.4"
+        ],
+        "state_ref": ".local/remed-20261113/codex-closeout/remote-evidence/accept-out/codex-cache4/state.json",
+        "state_sha256": "379812c604ae70f4d4e18e6d761c7691f2a0b18ce135bac31647b2305cfc311b"
+      },
+      "cache5": {
+        "subject_binary_sha256": "5b80416539494bb64574092ae305a442564fd26935087c5684fb0c22f164eb9f",
+        "python": "3.14.10 (main, Nov 11 2026, 08:10:30) [GCC 16.2.1 20260810]",
+        "openssl_sonames": [
+          "libcrypto.so.4",
+          "libssl.so.4"
+        ],
+        "state_ref": ".local/remed-20261113/codex-closeout/remote-evidence/accept-out/codex-cache5/state.json",
+        "state_sha256": "75e30393ce6dc40e7354cf6c2eb9ebb29a9acb8e940e3fbb484fab037838df05"
+      }
+    },
+    "recorded_kernel_string_equal": true,
+    "recorded_environment_equal": true,
+    "cc_and_hip_version_strings_equal_all_four_builds": true,
+    "historical_ordinary_comparison": {
+      "status": "ENVIRONMENT_MISMATCH",
+      "identical_runtime": false,
+      "scope": "final2 использовал Python 3.14.9 и ssl3/crypto3; final3 использует Python 3.14.10 и ssl4/crypto4. Историческое сравнение не квалифицирует производительность при одинаковом окружении."
+    },
+    "focused_cache4_cache5_comparison": {
+      "status": "NORMALIZED_LDD_MISMATCH",
+      "identical_runtime": false,
+      "scope": "Python совпадает, но cache4 содержит crypto3 и crypto4 вместе с ssl4, cache5 — только crypto4 и ssl4. Это дополнительное различие к изменению порядка Acquire и instrumentation; пару нельзя объявлять same-runtime."
+    },
+    "change_cause": "UNKNOWN: причина различий не установлена; обновление ОС или причина пауз не выводятся из этих данных.",
+    "acceptance_scope": "Прямое ownership-наблюдение cache5 сохраняется; INCONCLUSIVE_MONITOR и 24 timing flags не переквалифицируются. Различия runtime не отменяют самостоятельные correctness/hour gates внутри final3; их итог пока RUNNING."
+  },
+  "assets": {
+    "model": {
+      "name": "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
+      "bytes": 22853663008,
+      "sha256": "55983c5a75a1ab969824077b3bb3de4146e82a9234072b48ad4e8f92ad3fe9f1"
+    },
+    "mmproj": {
+      "name": "mmproj-BF16.gguf",
+      "bytes": 902822528,
+      "sha256": "da63cb47a76763c712393f8a017070188a304fa39f8aeea6edc629ed7b975cfa"
+    },
+    "provenance_ref": ".local/remed-20261113/codex-closeout/remote-evidence/accept-out/final1/state.json",
+    "provenance_scope": "Ожидаемые SHA модели и mmproj перенесены из сохранённого final1; здесь не заявлена новая проверка файлов для final3. Перед переводом их требуется сверить с фактически загруженными артефактами.",
+    "freshly_reverified_for_final3": false
+  },
+  "intended_profile": {
+    "mode": "mtp1",
+    "draft_tokens": 1,
+    "sessions": 4,
+    "context_per_session": 131072,
+    "vision": true,
+    "reasoning_budget_tokens": 512,
+    "ram_cache_gib": 16,
+    "disk_cache_gib": 64,
+    "environment": {
+      "HSA_ENABLE_SDMA": "0",
+      "GUFO_MTP_MOE_MAX_COHORT": "4"
+    },
+    "library_path": "Путь TheRock из проверенного эксплуатационного manifest; не угадывать.",
+    "experimental_numerical_overrides": "Не включать NPU, внешний hipBLASLt plan или иные незаявленные overrides."
+  },
+  "harness": {
+    "composition_source_sha": "76bd2ef2cc0e19acc595b4fb610c48662b34a40e",
+    "composition_file_sha256": {
+      "tests/functional/faex2_remediation.py": "7b7d075e91d5c76048b94619946078c5e0b0d83af7cbe3b9efe9c637f5e0edf6",
+      "tests/functional/faex2.py": "2d0203a7c9f3d9208df5911ffa6ce1ed74ca157de30c38f7474dde66c43d3cf4",
+      "tests/functional/faex2_transport.py": "aacf5310f48e3f10c0b4f4ac5b6261039733b90a7fc5839e59bacfd017a28bb0",
+      "tests/functional/faex2_remediation_images.py": "334cc681c954c1d17e0eefa15c84aaf256f127719f2f23d81d82ba08e4a4c3b1",
+      "tests/functional/faex2_acceptance.py": "1e122d9ffb890b5375886075b6420b10e9d0dd4222b5c96c33c2ab4a97dbe9c2",
+      "tests/functional/run.py": "70d545391a9c9db363d52527ba206f361535e69ad98454533e53d4414a1afba2"
+    },
+    "orchestrator_sha256": "4e62cc27775cc202b2c1466a171208eadecac45f576b66d9528e3cbd8bd55c2b",
+    "input_proof_ref": ".local/remed-20261113/codex-closeout/final3-proposal-b641/input-provenance-proof.json"
+  },
+  "fresh_cpu_verification": {
+    "subject_source_sha": "b641fe3eb4d6a91352a007587b4f17a440fc4aff",
+    "associated_ordinary_binary_sha256": "ef7e3040138761614641311e12efe6e335dfbd5e5b244b578a0e4b4833310cb1",
+    "freshly_tested_on_current_source": true,
+    "status": "PASS",
+    "targets": [
+      "continuation_cache_test",
+      "continuation_disk_store_test",
+      "text_model_runner_test"
+    ],
+    "evidence_ref": ".local/remed-20261113/codex-closeout/remote-evidence/build-minstep1/cand/b641fe3eb4d6a91352a007587b4f17a440fc4aff/MANIFEST.json",
+    "scope": "Три Linux CPU-targets текущего source прошли; этот результат не является модельной, численной или скоростной квалификацией ordinary binary."
+  },
+  "ordinary_verification": {
+    "subject_source_sha": "b641fe3eb4d6a91352a007587b4f17a440fc4aff",
+    "subject_binary_sha256": "ef7e3040138761614641311e12efe6e335dfbd5e5b244b578a0e4b4833310cb1",
+    "binary_kind": "ordinary",
+    "composition": {
+      "status": "RUNNING",
+      "plan_ref": ".local/remed-20261113/codex-closeout/final3-proposal-b641/plan-final3.json",
+      "plan_sha256": "1a320db88d7acfcfe482b451eaf9b98099c2c00ef15020b98028e5b4bb149001",
+      "config_ref": ".local/remed-20261113/codex-closeout/final3-proposal-b641/config-final3.json",
+      "config_sha256": "a1592a4df69e337f1b03d965b82fc18acb7308f4d502821e356aee89b846053a",
+      "analysis_ledger_ref": ".local/remed-20261113/codex-closeout/final3-proposal-b641/analysis-ledger-preregistered.json",
+      "window_name": "codex-final3-b641",
+      "result": null,
+      "status_basis": "Сообщение ведущего агента: запуск 2026-11-14 в 03:00 MSK, tmux codex-final3-b641; на момент сообщения стадия fill. Финальных raw/review ещё нет.",
+      "expected_main_before_pid": 903758,
+      "nonce": "6af771b5",
+      "duration_seconds_after_warmup": 3600,
+      "calibration": "Два исходных запроса 256/512, затем четыре fill; без --records и без agent holds.",
+      "memory_gate": {
+        "comparison_window_seconds": 1200,
+        "growth_threshold_bytes": 1073741824,
+        "minimum_samples_per_window": 20,
+        "rule": "Прежние first/last20: рост максимума ИЛИ медианы выше порога даёт FAIL; результаты final3 пока отсутствуют."
+      },
+      "reviewer_ref": ".local/remed-20261113/codex-closeout/final3-proposal-b641/final3-review.py",
+      "reviewer_sha256": "a0fb29959bfa263fa00699f7851a1b22193853c64d520709526546acf42ea0c3",
+      "cold_partial_c4_policy": "Сохранить каждый cold reread, частичный C4 и тайминги; прежние две перечитки остаются OPEN. Новая квота допустимых misses не вводится.",
+      "comparison_scope": "Сравнение с final2 только диагностическое: runtime различается, historical result не даёт matched performance qualification; собственные критерии final3 неизменны."
+    },
+    "model_agents": "NOT_EXECUTED",
+    "matched_speed": "NOT_EXECUTED",
+    "dedicated_api_smoke_and_restart_recovery": "NOT_EXECUTED"
+  },
+  "diagnostic_experiments": {
+    "cache5": {
+      "subject_source_sha": "b641fe3eb4d6a91352a007587b4f17a440fc4aff",
+      "subject_binary_sha256": "5b80416539494bb64574092ae305a442564fd26935087c5684fb0c22f164eb9f",
+      "binary_kind": "diagnostic",
+      "status": "DIAGNOSTIC_COMPLETED",
+      "status_basis": "Проверены завершённые local raw и замороженные reviews cache5. PASS окна означает исполнение и проверенный возврат main, а не qualification.",
+      "patch_sha256": "26bc2a653823e01704bc8c79dfc2154eb31b032bfddea9aa0f4579219a1e9828",
+      "build_manifest_ref": ".local/remed-20261113/codex-closeout/remote-evidence/build-minstep1/diagnostic-cache2/b641fe3eb4d6a91352a007587b4f17a440fc4aff/MANIFEST.json",
+      "plan_ref": ".local/remed-20261113/codex-closeout/window-plan-cache5.json",
+      "config_ref": ".local/remed-20261113/codex-closeout/window-cache5.json",
+      "acceptance": "NOT_QUALIFIED",
+      "window_status": "PASS",
+      "freshly_tested_on_subject_binary": true,
+      "is_ordinary_candidate_binary": false,
+      "raw_ref": ".local/remed-20261113/codex-closeout/remote-evidence/accept-out/codex-cache5",
+      "workload": {
+        "requests": 14,
+        "exact_complete_responses": 13,
+        "confirmed_cancellations": 1,
+        "target_disk_boundary_tokens": 128309,
+        "target_live_boundary_tokens": 117825,
+        "all_four_target_physical_width": 4,
+        "actual_drafts_verified": true
+      },
+      "focused_memory_status": "INCONCLUSIVE_MONITOR",
+      "focused_memory_max_gap_ms": 310.2576732635498,
+      "preregistered_max_gap_ms": 250,
+      "timing_status": "INCONCLUSIVE_FLAGS_REQUIRE_INVESTIGATION",
+      "timing_flag_cells": 24,
+      "timing_rule": "Для каждой ячейки одновременно 5% и 3 мс; повторы client/native/API не удалены, среднее или длительность всей фазы не компенсируют флаги.",
+      "mechanism": "Три точных RAM captures сохранены. PINE: early min_step, без queue pin, освобождён при следующем RAM eviction. MOON: early min_step, без enqueue, остаётся в RAM до shutdown. LAKE: enqueue и поздний writer min_step; busy против ещё не подходящего durable prefix по trace не различены.",
+      "causal_limits": "Порядок Acquire изменился с 966→968→967→965 на 967→968→965→966. Всё снижение sampled peak нельзя приписать только новому check; diagnostic counters не являются общим physical memory budget или универсальным доказательством отсутствия утечек. Runtime cache4/cache5 также различается: в cache4 дополнительно присутствует libcrypto.so.3; identical-runtime performance attribution запрещена.",
+      "restore_verified": true,
+      "restored_main_pid": 903758,
+      "kernel_status": "CLEAN",
+      "original_final2_fail_preserved": true,
+      "manual_review_ref": ".local/remed-20261113/codex-closeout/cache5-strict-manual-review.json",
+      "manual_review_sha256": "42fa6db30ec2406aa8dc71eaa059295d8297dafdc7defad9abdd7aea54b54d43",
+      "workload_review_ref": ".local/remed-20261113/codex-closeout/cache5-independent-workload-review.json",
+      "workload_review_sha256": "79cebc6bf84a5072d7decc1b268fec8faef28fb70a860ae50c91c3d84b98b437",
+      "focused_comparison_ref": ".local/remed-20261113/codex-closeout/cache5-focused-comparison-v4.json",
+      "focused_comparison_sha256": "6fab499cfaf818168c764b1869c1e0018f5ce98db27d523587744990ce771887",
+      "source_review_ref": ".local/remed-20261113/codex-closeout/cache5-early-minstep-source-review.json",
+      "source_review_sha256": "5bdc9682329358bbea48ce35e48f5f206afca1513ab801a2b3cb90b6bce78d85"
+    }
+  },
+  "inherited_evidence": [
+    {
+      "id": "feae-model-quality-speed",
+      "subject_source_sha": "feae3fc66032f7b1d3760fddb238d7ea7e386c7c",
+      "subject_binary_sha256": "d4df0f6864ed01cac05cd0bbcf7096e29502d155a96729662104f5b7c015fd96",
+      "binary_kind": "ordinary",
+      "freshly_tested_on_current_binary": false,
+      "statuses": {
+        "final1": "FAIL",
+        "speed1": {
+          "PASS": 217,
+          "INCONCLUSIVE": 14,
+          "REGRESSION": 3
+        },
+        "speed2": "HARNESS_FAILURE_BEFORE_GPU",
+        "speed3_early": {
+          "PASS": 58,
+          "INCONCLUSIVE": 38
+        },
+        "speed3_late": {
+          "PASS": 93,
+          "INCONCLUSIVE": 3
+        },
+        "vision_cold_prefill": "FAIL",
+        "numerical_quality": "NOT_ACCEPTED"
+      },
+      "evidence_ref": "docs/faex2/CLOSEOUT_2026-11-13.md",
+      "speed_review_ref": ".local/remed-20261113/codex-closeout/acceptance-speed3-review.json"
+    },
+    {
+      "id": "6d52-final2",
+      "subject_source_sha": "6d52ac57224b4d91d23fcbaba6fe053a411d65dc",
+      "subject_binary_sha256": "27ef2c9c5f63ab0f829784818b27f1b55a585f77e4a91b0483c34b71aa5bc614",
+      "binary_kind": "ordinary",
+      "freshly_tested_on_current_binary": false,
+      "status": "FAIL_MEMORY",
+      "acceptance": "NOT_ACCEPTED",
+      "state_ref": ".local/remed-20261113/codex-closeout/remote-evidence/accept-out/codex-final2/state.json",
+      "review_ref": ".local/remed-20261113/codex-closeout/final2-acceptance-review.json",
+      "memory_gate": {
+        "threshold_bytes": 1073741824,
+        "comparison_window_seconds": 1200,
+        "first_window_samples": 240,
+        "last_window_samples": 239,
+        "gtt_growth_max_bytes": 2957000704,
+        "gpu_total_growth_max_bytes": 2957139968,
+        "gtt_growth_median_bytes": -81788928,
+        "gpu_total_growth_median_bytes": -81092608,
+        "rule": "Рост максимума ИЛИ медианы выше 1 GiB означает FAIL. Снижение медиан не отменяет превышение максимумов; критерий не изменён.",
+        "cause_status": "COMPARABLE_TRANSIENT_MECHANISM_REPRODUCED_ORIGINAL_GATE_FAIL_PRESERVED"
+      },
+      "continuation_cache_observation": {
+        "status": "OPEN",
+        "reason": "Две полные перечитки длинной истории с prefix_changed; ответы правильны, причина cache miss и связь с пиком памяти пока не доказаны.",
+        "requests": [
+          {
+            "id": "cmp-00540-continue-LAKE_394",
+            "server_request_id": "r541",
+            "cached_tokens": 0,
+            "prefill_tokens": 124191,
+            "prefill_ms": 86772.240393,
+            "server_duration_ms": 92982.1,
+            "server_log_line": 2470
+          },
+          {
+            "id": "cmp-00687-continue-OWL_142",
+            "server_request_id": "r691",
+            "cached_tokens": 0,
+            "prefill_tokens": 125724,
+            "prefill_ms": 88683.71296000002,
+            "server_duration_ms": 94849.1,
+            "server_log_line": 3184
+          }
+        ],
+        "server_log_ref": ".local/remed-20261113/codex-closeout/remote-evidence/accept-out/codex-final2/servers/server-compose.log"
+      }
+    },
+    {
+      "id": "6d52-linux-identity-guard",
+      "subject_source_sha": "6d52ac57224b4d91d23fcbaba6fe053a411d65dc",
+      "subject_binary_sha256": "27ef2c9c5f63ab0f829784818b27f1b55a585f77e4a91b0483c34b71aa5bc614",
+      "binary_kind": "ordinary",
+      "freshly_tested_on_current_binary": false,
+      "status": "PASS",
+      "scope": "Затронутый CPU-тест qwen_numerical_overrides_test, без заявления о новом GPU/model PASS."
+    },
+    {
+      "id": "opencode-old-ordinary",
+      "subjects": [
+        {
+          "subject_source_sha": "6d52ac57224b4d91d23fcbaba6fe053a411d65dc",
+          "subject_binary_sha256": "27ef2c9c5f63ab0f829784818b27f1b55a585f77e4a91b0483c34b71aa5bc614",
+          "binary_kind": "ordinary",
+          "freshly_tested_on_current_binary": false
+        },
+        {
+          "subject_source_sha": "1195d15427a43c45516ab9e7dd90777f8216b326",
+          "subject_binary_sha256": "e319b5f5b5198dc60e089d8b57b3e8826728aed5b6ba9f1534adf0b18a67d607",
+          "binary_kind": "ordinary",
+          "freshly_tested_on_current_binary": false
+        }
+      ],
+      "status": "PASS_HISTORICAL_NOT_RERUN",
+      "review_ref": ".local/remed-20261113/codex-closeout/opencode-actual-review.json",
+      "offline_replay_ref": ".local/remed-20261113/codex-closeout/final-harness-offline-replay.json"
+    },
+    {
+      "id": "diagnostic2-old-comparison",
+      "subjects": [
+        {
+          "subject_source_sha": "1195d15427a43c45516ab9e7dd90777f8216b326",
+          "subject_binary_sha256": "a1414a7ea122d3637cee3a9b26c6ad584b5a4ef89f662464b45b1e16e6d60cae",
+          "binary_kind": "diagnostic",
+          "freshly_tested_on_current_binary": false
+        },
+        {
+          "subject_source_sha": "6d52ac57224b4d91d23fcbaba6fe053a411d65dc",
+          "subject_binary_sha256": "a8eb3a0ecb8a7d73cd4aaa2819357cc9fd3213a485839eca855e26b03e78dd87",
+          "binary_kind": "diagnostic",
+          "freshly_tested_on_current_binary": false
+        }
+      ],
+      "status": "INCONCLUSIVE",
+      "review_ref": ".local/remed-20261113/codex-closeout/diagnostic2-acceptance-review.json"
+    },
+    {
+      "id": "codex-cache3",
+      "subject_source_sha": "6d52ac57224b4d91d23fcbaba6fe053a411d65dc",
+      "subject_binary_sha256": "e08026a982583b57d537e8eff19a95232a916212aed351410a8bdd5c598a8bd3",
+      "binary_kind": "diagnostic",
+      "freshly_tested_on_current_binary": false,
+      "status": "INCOMPLETE",
+      "acceptance": "NOT_QUALIFIED",
+      "review_ref": ".local/remed-20261113/codex-closeout/cache3-final-memory-analysis.json",
+      "state_ref": ".local/remed-20261113/codex-closeout/remote-evidence/accept-out/codex-cache3/state.json"
+    },
+    {
+      "id": "codex-cache4",
+      "subject_source_sha": "6d52ac57224b4d91d23fcbaba6fe053a411d65dc",
+      "subject_binary_sha256": "e08026a982583b57d537e8eff19a95232a916212aed351410a8bdd5c598a8bd3",
+      "binary_kind": "diagnostic",
+      "freshly_tested_on_current_binary": false,
+      "status": "PASS",
+      "acceptance": "NOT_QUALIFIED",
+      "review_ref": ".local/remed-20261113/codex-closeout/cache4-strict-manual-review.json",
+      "state_ref": ".local/remed-20261113/codex-closeout/remote-evidence/accept-out/codex-cache4/state.json"
+    }
+  ],
+  "legacy_manifest": {
+    "path": "docs/faex2/CANDIDATE_2026-11-13.json",
+    "sha256_at_preparation": "63b0accf5309e904ee2b4f26eec46ca5268a30fcf8c35c596382e0147fe671ce",
+    "preserve_unchanged": true
+  },
+  "blocking_reasons": [
+    {
+      "id": "CURRENT_COMPOSITION",
+      "status": "RUNNING",
+      "reason": "Обычный b641/ef7e проходит final3; завершённого часового результата, kernel/restore review и нового memory verdict ещё нет."
+    },
+    {
+      "id": "FOCUSED_MEMORY",
+      "status": "INCONCLUSIVE_MONITOR",
+      "reason": "В cache5 один target monitor gap 310.258 мс превысил заранее заданные 250 мс. Прямой эффект сокращения queue ownership наблюдался, но focused benefit и исходный hour gate этим не закрыты."
+    },
+    {
+      "id": "CONTINUATION_CACHE",
+      "status": "OPEN_OBSERVATION",
+      "reason": "В final2 два из 716 длинных продолжений получили cached_tokens=0 и полностью прочитали 124191/125724 токена; серверные запросы заняли около 93/95 с. Ответы правильны. Нужен разбор prefix_changed и состояния cache; наблюдение не объявлено нормой и не меняет зарегистрированные критерии композиции."
+    },
+    {
+      "id": "C4_TIMING",
+      "status": "INCONCLUSIVE",
+      "reason": "diagnostic2 завершена и воспроизвела общий механизм пауз на обеих ревизиях. Это не закрывает сравнительные queue/server TTFT/client TTFT gates mixed-MTP C4: исходные 3 REGRESSION speed1 сохранены. Пороги 5% и 3 мс действуют для каждой фазы/ранга; matched-cohort разбор не заменяет исходную совокупность запросов. Cache5 также оставил 24 timing flags и статус INCONCLUSIVE; это отдельная diagnostic пара, не matched ordinary speed PASS."
+    },
+    {
+      "id": "QUALITY_CONTRACT",
+      "status": "DRAFT_NOT_APPROVED",
+      "reason": "Владелец выбрал подготовку проекта контракта, не принятие потерь качества. Prefill quality и vision FAIL остаются видимыми; exact/lossless не объявлены."
+    },
+    {
+      "id": "CUTOVER",
+      "status": "NOT_AUTHORIZED",
+      "reason": "Нужны все согласованные gates, проверенный комплект launcher/recovery и отдельное одобрение владельца этого кандидата."
+    }
+  ],
+  "cache_compatibility": {
+    "numerical_identity": "qwen-bf16-fp32-prefill-v2",
+    "means_snapshot_file_format_version": false,
+    "old_working_numeric_state_must_restore": false,
+    "expected_old_state_behavior": "Несовместимая численная identity даёт cache miss; старые state не переименовывать и не принудительно загружать.",
+    "current_candidate_own_state": "Обязан восстановиться после перезапуска с подтверждённой identity и правильным ответом.",
+    "operational_policy": "Новый отдельный namespace; старые каталоги, launcher snapshot и бинарники сохраняются для отката."
+  },
+  "rollback": {
+    "source_sha": "1195d15427a43c45516ab9e7dd90777f8216b326",
+    "binary_sha256": "e319b5f5b5198dc60e089d8b57b3e8826728aed5b6ba9f1534adf0b18a67d607",
+    "expected_version": "gufo version development (1195d15427a43c45516ab9e7dd90777f8216b326)",
+    "release_directory_name": "1195d154-e319b5f5",
+    "current_launcher_baseline": "v13; перепроверить перед подготовкой",
+    "future_recovery_role": "Нынешний main 1195d154 должен стать recovery только в новом проверенном комплекте launcher.",
+    "launcher_backup_required": [
+      "faex2_owner.py",
+      "faex2-launch.json",
+      "fork_restart.sh",
+      "SHA256SUMS"
+    ],
+    "without_rebuild": true
+  },
+  "procedure_ref": "docs/faex2/CANDIDATE_SWITCH_2026-11-14.md",
+  "procedure_status": "DRAFT_NOT_GENERATED_NOT_INSTALLED_NOT_AUTHORIZED",
+  "evidence_attribution": "Новые CPU-проверки относятся к source b641; cache5 выполнен на отдельном diagnostic binary 5b804165. Обычный кандидат ef7e3040 проходит final3, итог ещё не получен. Все прежние модельные доказательства перечислены отдельно с исходными source/binary SHA.",
+  "agent_verification_scope": {
+    "opencode": "PASS только у перечисленных older ordinary binaries; на b641 не повторён.",
+    "pi": "NOT_EXECUTED: pi не установлен; прежние OpenCode результаты не заменяют обязательство pi replay."
+  }
+}
