@@ -2,10 +2,7 @@
 
 **Статус: проект для проверки; комплект launcher не сгенерирован, перевод не
 разрешён и не выполнен.** В [manifest](CANDIDATE_2026-11-14.json) установлено
-`ready_for_deployment=false`. Ordinary `final3` запущен ведущим агентом
-2026-11-14 в 03:00 MSK; последний сообщённый этап — fill, результат пока
-`RUNNING`. Это временное приёмочное окно, не развёртывание кандидата как main.
-После завершения нужны полные raw и отдельный итоговый review.
+`ready_for_deployment=false`. Ordinary `final3` завершён 2026-11-14 в 04:08 MSK: **NOT_ACCEPTED / FAIL_MEMORY** по RSS (+2,34 GiB при пороге 1 GiB). Полные raw и strict review сохранены; остальные восемь gates PASS. Main1195/e319 восстановлен и независимо проверен READY PID915853. Продолжается разбор host-памяти; этот проект не разрешает переключение.
 
 Документы [кандидата 13 ноября](CANDIDATE_2026-11-13.json) и
 [его процедуры](CANDIDATE_SWITCH_2026-11-13.md) остаются историческими.
@@ -39,7 +36,7 @@
 
 | Проверка | Состояние и оставшееся обязательство |
 |---|---|
-| Ordinary final3 | `RUNNING`, итога нет. Тот же harness `76bd2ef2`, nonce `6af771b5`, два calibration, четыре fill, warmup и не менее 3600 с после него, без agent holds. Memory gate первых/последних 20 минут прежний: 1200 с с каждого края, минимум 20 samples, FAIL при росте максимума или медианы выше 1 GiB |
+| Ordinary final3 | **NOT_ACCEPTED / FAIL_MEMORY**: RSS first/last max6628700160→9136889856, delta2508189696 bytes; остальные8gates PASS. 3610,648с,1610requests/768long/192C4/192cancel/4postrefill. Полный raw проверен. Тот же harness `76bd2ef2`, nonce `6af771b5`, два calibration, четыре fill, warmup и не менее 3600 с после него, без agent holds. Memory gate первых/последних 20 минут прежний: 1200 с с каждого края, минимум 20 samples, FAIL при росте максимума или медианы выше 1 GiB |
 | Cache5 | 14 запросов: 13 точных полных ответов и одна подтверждённая отмена; target disk 128309 и live 117825, четыре physical width4 с drafts. Окно и возврат прошли, но focused memory — `INCONCLUSIVE_MONITOR`: gap 310.258 мс > заранее заданных 250 мс. Все 24 timing flags сохранены; comparative timing — `INCONCLUSIVE` |
 | Предыдущая композиция | `final2` на `6d52ac57/27ef2c9c` остаётся `FAIL_MEMORY/NOT_ACCEPTED`. Две полные перечитки остаются OPEN. Новые cold rereads, partial C4 и тайминги final3 надо разобрать по каждому запросу; квота допустимых misses не вводится |
 | Скорость и качество | Прежние 3 REGRESSION speed1 и последующие INCONCLUSIVE не закрыты. Пороги одновременно 5% и 3 мс для каждой фазы/ранга не меняются. Численные и cold-vision FAIL на `feae3fc6/d4df0f68` сохранены; [Q1](PREFILL_QUALITY_CONTRACT_DRAFT.md) — неутверждённый проект |
@@ -75,7 +72,7 @@ LLVM/CMake; кто их запустил, не установлено. [Выде
 Это объясняет смену версий, но не устанавливает причину конкретных пауз. Прямое наблюдение
 ownership в cache5 сохраняется; `INCONCLUSIVE_MONITOR` и 24 timing flags не
 переквалифицируются. Самостоятельные correctness и hour gates внутри final3
-остаются применимы, их итог пока `RUNNING`.
+остаются применимы: final3 завершён отказом по RSS, остальные восемь gates прошли.
 
 План final3 [закреплён](../../.local/remed-20261113/codex-closeout/final3-proposal-b641/plan-final3.json)
 SHA `1a320db88d7acfcfe482b451eaf9b98099c2c00ef15020b98028e5b4bb149001`,
