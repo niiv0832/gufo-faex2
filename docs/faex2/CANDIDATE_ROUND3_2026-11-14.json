@@ -2,10 +2,10 @@
   "schema": "gufo-faex2.candidate.v1",
   "date": "2026-11-14",
   "prepared_at": "2026-11-14T21:09:00+03:00",
-  "status": "APPROVED_BY_OWNER_NOT_DEPLOYED",
-  "document_status": "ROUND3_MEASURED_OWNER_APPROVED_CUTOVER_PENDING_WINDOW",
+  "status": "DEPLOYED_AS_MAIN_BY_OWNER_DECISION",
+  "document_status": "ROUND3_MEASURED_OWNER_APPROVED_DEPLOYED",
   "ready_for_deployment": true,
-  "deployment_performed": false,
+  "deployment_performed": true,
   "ready_for_deployment_note": "Решение владельца от 2026-11-14 (около 21:30 MSK): кандидат abbfb006/e760a663 одобрен к переводу в рабочие. Значение true выставлено по этому решению, а не по выводу исполнителя: общая приёмка качества не объявлена. Перевод не выполнен; выполняется только в согласованное с владельцем окно.",
   "authorization": {
     "scope": "Перевод кандидата abbfb006/e760a663 в рабочие в согласованное окно с сохранением 1195d154/e319b5f5 для возврата; публикация ветки faex2.",
@@ -24,7 +24,7 @@
     "expected_version": "gufo version development (abbfb006db834e67ec8b6ebfeb95fd690b5f91e7)",
     "built_at": "2026-11-14T13:29:39+03:00",
     "build_status": "COMPLETED",
-    "deployed_as_main": false,
+    "deployed_as_main": true,
     "stand_path": "~/gufo-remed-20261113/cand/abbfb006db834e67ec8b6ebfeb95fd690b5f91e7/gufo",
     "change_kind": "FFC8580A_PLUS_ROUND3_CACHE_MISS_LOGGING_DEFENSIVE_CHECK_AND_TESTS",
     "changes_since_previous_candidate": [
@@ -44,7 +44,8 @@
     "full_private_manifest_sha256": "41894d3dea38b776db3ae9b5a346ef311a6223d0951656bd74f61596329f9f40",
     "inherited_min_step_policy": "b641 early advisory min_step сохранён; одинаковые будущие cache hits не гарантированы.",
     "identical_future_cache_hits_guaranteed": false,
-    "change_scope_note": "fb816341 и 767c6018 меняют код сервера (журнал причин промаха кэша; защитная проверка типа снимка), остальные четыре коммита — только тесты. По рецензии: fb816341 меняет только диагностику, выбор кэша не тронут; проверка из 767c6018 недостижима (тот же отказ раньше даёт PersistentSnapshotPayloadBytes) — защитный код, не исправление дефекта."
+    "change_scope_note": "fb816341 и 767c6018 меняют код сервера (журнал причин промаха кэша; защитная проверка типа снимка), остальные четыре коммита — только тесты. По рецензии: fb816341 меняет только диагностику, выбор кэша не тронут; проверка из 767c6018 недостижима (тот же отказ раньше даёт PersistentSnapshotPayloadBytes) — защитный код, не исправление дефекта.",
+    "release_path": "/home/truezero/gufo-release/abbfb006-e760a663/bin/gufo"
   },
   "build_environment": {
     "target": "Linux x86-64 gfx1151",
@@ -201,13 +202,7 @@
       "note": "Python-проверки этапа 1 на Mac, не окно r3-tests"
     }
   },
-  "blocking_reasons": [
-    {
-      "id": "CUTOVER",
-      "status": "APPROVED_KIT_NOT_PREPARED_WINDOW_NOT_AGREED",
-      "reason": "Перевод одобрен владельцем. Осталось: подготовить и проверить комплект launcher/recovery; согласовать с владельцем дату и длительность окна."
-    }
-  ],
+  "blocking_reasons": [],
   "cache_compatibility": {
     "numerical_identity": "qwen-bf16-fp32-prefill-v2",
     "means_snapshot_file_format_version": false,
@@ -229,10 +224,12 @@
       "fork_restart.sh",
       "SHA256SUMS"
     ],
-    "without_rebuild": true
+    "without_rebuild": true,
+    "current_recovery_role": "1195d154/e319b5f5 — роль recovery в launcher v14, запуск проверен 2026-11-14 21:41:52",
+    "launcher_backup_dir": "~/gufo-release/launcher-backup-1195d154-abbfb006"
   },
   "procedure_ref": "docs/faex2/CANDIDATE_SWITCH_ROUND3_2026-11-14.md",
-  "procedure_status": "APPROVED_BY_OWNER_KIT_NOT_GENERATED_NOT_INSTALLED",
+  "procedure_status": "EXECUTED_2026-11-14",
   "legacy_manifest": {
     "path": "docs/faex2/CANDIDATE_2026-11-14.json",
     "sha256_at_preparation": "9801b9e3dd742b5629842c1883f486c727aa124323d418e19577bc4abda51971",
@@ -241,11 +238,11 @@
     "closure_report_note": "В прежний отчёт docs/faex2/AUDIT_CLOSURE_2026-11-14.md в третьем круге добавлена одна строка-пометка «историческая версия» со ссылкой на новый; поэтому его SHA-256 больше не равен записанному в прежнем manifest (957d211f…). Исходный текст — в git до коммита этапа 9 (ревизия f6c7f88f)."
   },
   "final_handoff": {
-    "status": "READY_SAME_MAIN",
-    "checked_at": "2026-11-14T20:51:00+03:00",
-    "pid": 1058034,
-    "binary_sha256": "e319b5f5b5198dc60e089d8b57b3e8826728aed5b6ba9f1534adf0b18a67d607",
-    "source": "after-window.sh r3-agents"
+    "status": "READY_NEW_MAIN",
+    "checked_at": "2026-11-14T21:42:53+03:00",
+    "pid": 1067080,
+    "binary_sha256": "e760a663f8dd75ea3d89b46ac8edab9ec4a56ba50829df22ed53e1bb57e3e3b6",
+    "source": "verify-final.log комплекта v14"
   },
   "closure_table": {
     "report_ref": "docs/faex2/AUDIT_CLOSURE_ROUND3_2026-11-14.md",
@@ -326,7 +323,7 @@
     "blocking_findings": 0,
     "ref": ".local/remed-20261113/round3/stage10/REVIEW.md"
   },
-  "updated_at": "2026-11-14T21:40:00+03:00",
+  "updated_at": "2026-11-14T21:43:00+03:00",
   "owner_decisions_2026_11_14": [
     {
       "id": "EARLY_SKIP_RULE",
@@ -404,5 +401,59 @@
       "комментарий о запасе в persistent_snapshot_mtp_stream_test.cpp"
     ],
     "requires": "новая сборка, повтор затронутых измерений, отдельное подтверждение владельца для нового бинарника"
+  },
+  "deployment": {
+    "window_named_by_owner": "Переключай сейчас (2026-11-14, около 21:40 MSK)",
+    "launcher_version": 14,
+    "launcher_sha256": {
+      "faex2_owner.py": "9e16c248a4bc1bf58fcd33f13d633a4795ca5134fd2c7dd75812c69a12d43e1f",
+      "faex2-launch.json": "6cbdf5869af2c79a7e01bb1d2765c1d89ce72acdb6b6c39665a400bd96fab6b7",
+      "fork_restart.sh": "9450608e20ae88c272159ccfde47e110258144ed469cf453ff02900c6ff206a9"
+    },
+    "prepare": "21:37 PREPARE_OK без остановки сервера",
+    "cutover": {
+      "stopped": "21:40:55",
+      "ready": "21:41:20",
+      "automatic_rollback_used": false
+    },
+    "recovery_check": {
+      "time_msk": "21:41:51–21:42:40",
+      "recovery_binary": "1195d154/e319b5f5",
+      "recovery_answer_ok": true,
+      "dropped_path_rejected": true
+    },
+    "disk_snapshot_restart_check": {
+      "before_prefill_tokens": 7796,
+      "after_prefill_tokens": 7,
+      "after_cached_tokens": 7789,
+      "disk_hit": true,
+      "restore_ms": 190.0,
+      "same_text": true
+    },
+    "final_check": {
+      "time_msk": "21:42:53",
+      "status": "READY",
+      "pid": 1067080,
+      "identities_match": true,
+      "proc_exe_sha256_matches": true,
+      "health": true,
+      "text": true,
+      "tool": true,
+      "vision": true,
+      "kernel_clean": true,
+      "server_log_errors": 0
+    },
+    "api_downtime_s": [
+      25,
+      49
+    ],
+    "namespace": "main-abbfb006-e760a663",
+    "not_verified": [
+      "длительная работа на рабочем порту",
+      "автоперезапуск после настоящей аварии",
+      "нагрузочный сценарий «сосед»",
+      "независимость сеансов и потоковый ответ отдельной проверкой"
+    ],
+    "evidence_ref": "LLM_FAEX2/results/2026-11-14-gufo-cutover-v14/"
   }
 }
