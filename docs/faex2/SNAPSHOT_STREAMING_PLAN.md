@@ -40,9 +40,11 @@
 
 Файлы: новая фабрика, `tests/models/qwen/persistent_snapshot_stream_test.cpp`, регистрация рядом с существующим `qwen_serving_test_support` в `tests/models/qwen27b/CMakeLists.txt`.
 
-- [ ] Создать bounded synthetic Qwen model через существующие synthetic weights, настоящий runner/state/snapshot с payload больше 16 MiB. Setup и reference/output allocations — до наблюдаемого участка.
-- [ ] Test-only thread-local allocation guard запрещает отдельную C++ allocation больше 16 MiB только внутри настоящего runner.StreamPersistentSnapshot и ведёт preallocated pointer/size ledger для peak-live limit 16 MiB + 4096 B. Observer не выделяет память рекурсивно; исчерпание его фиксированного ledger — ошибка, не потеря учёта. Reference/output storage выделены заранее, callback пишет в заранее выделенный destination. Старый полный vector должен дать наблюдаемый allocation RED, а не ошибку конфигурации или skip. Несколько накопленных малых chunks тоже должны быть отвергнуты guard.
-- [ ] RED фиксирует requested bytes отвергнутой allocation, равные computed persistent payload. Observer учитывает scalar/array/aligned new/delete. Заморозить исходники/patch теста и выполнить отдельный Linux synthetic GPU RED с точным baseline, устойчивым запуском и возвратом main. Production streaming ещё не исправлен в этом baseline.
+- [x] Создать bounded synthetic Qwen model через существующие synthetic weights, настоящий runner/state/snapshot с payload больше 16 MiB. Setup и reference/output allocations — до наблюдаемого участка.
+- [x] Test-only thread-local allocation guard запрещает отдельную C++ allocation больше 16 MiB только внутри настоящего runner.StreamPersistentSnapshot и ведёт preallocated pointer/size ledger для peak-live limit 16 MiB + 4096 B. Observer не выделяет память рекурсивно; исчерпание его фиксированного ledger — ошибка, не потеря учёта. Reference/output storage выделены заранее, callback пишет в заранее выделенный destination. Старый полный vector должен дать наблюдаемый allocation RED, а не ошибку конфигурации или skip. Несколько накопленных малых chunks тоже должны быть отвергнуты guard.
+- [x] RED фиксирует requested bytes отвергнутой allocation, равные computed persistent payload. Observer учитывает scalar/array/aligned new/delete. Заморозить исходники/patch теста и выполнить отдельный Linux synthetic GPU RED с точным baseline, устойчивым запуском и возвратом main. Production streaming ещё не исправлен в этом baseline.
+
+**Фактический результат:** RED3 подтверждён05:08 MSK, source b641 + patch f59f6aa7 / binary ae6fdad9; два setup FAIL сохранены отдельно. Это ещё не GREEN.
 
 ## Шаг 2. Реализация и узкие GREEN
 

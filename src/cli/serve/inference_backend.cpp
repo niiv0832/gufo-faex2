@@ -22,6 +22,7 @@
 #include <utility>
 
 #include "src/cli/serve/logging.hpp"
+#include "src/cli/serve/qwen_text_model_runner.hpp"
 #include "src/cli/serve/text_generation_scheduler.hpp"
 #include "src/cli/serve/text_model_runner.hpp"
 #include "src/core/gguf_identity.hpp"
@@ -4549,6 +4550,20 @@ private:
 
 }  // namespace
 
+#if defined(ENGINE_ENABLE_HIP)
+std::shared_ptr<TextModelRunner> CreateQwenTextRunner(
+    std::shared_ptr<const hip::QwenGpuModel> model,
+    QwenTextRunnerOptions options) {
+  return std::make_shared<QwenTextRunner>(
+      std::move(model), options.max_context,
+      QwenDraftModels{.dflash = std::move(options.dflash),
+                      .mtp = std::move(options.mtp)},
+      options.speculative_options,
+      std::move(options.model_artifact_fingerprint),
+      std::move(options.draft_model_artifact_fingerprint));
+}
+#endif
+
 struct InferenceBackend::Impl {
 #if defined(ENGINE_ENABLE_HIP)
   struct State {
@@ -5210,10 +5225,16 @@ bool InferenceBackend::load(std::shared_ptr<const hip::QwenGpuModel> model,
         sampling::TextPreset(model->GetConfig());
     new_state->sampling_defaults.supplied = {};
     new_state->supports_images = model->VisionEncoder() != nullptr;
-    auto runner = std::make_shared<QwenTextRunner>(
-        std::move(model), max_context, std::move(drafts), speculative_options,
-        disk_cache_config.model_artifact_fingerprint,
-        disk_cache_config.draft_model_artifact_fingerprint);
+    auto runner = CreateQwenTextRunner(
+        std::move(model),
+        {.max_context = max_context,
+         .dflash = std::move(drafts.dflash),
+         .mtp = std::move(drafts.mtp),
+         .speculative_options = speculative_options,
+         .model_artifact_fingerprint =
+             disk_cache_config.model_artifact_fingerprint,
+         .draft_model_artifact_fingerprint =
+             disk_cache_config.draft_model_artifact_fingerprint});
     new_state->model_id = runner->Descriptor().model_id;
     new_state->max_context = max_context;
     std::optional<TextRunnerDiskCacheOptions> runner_disk_cache;

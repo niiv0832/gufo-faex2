@@ -4,6 +4,18 @@
 
 ## 2026-11-14
 
+### 05:08 MSK: настоящий Qwen allocation RED подтверждён, начата потоковая запись
+
+- Тест RED3 прошёл все setup stages, prefill и старую direct serialization. Старый StreamPersistentSnapshot попытался выделить ровно19542208байт, guard подтвердил single-allocation/expected_full_payload=1/peak_live0, test rc1. Wrapper RED_VERIFIED означает воспроизведение дефекта, а не готовое исправление. Plain synthetic Qwen без MTP; отдельные MTP/pending/GPU-format tests ещё готовятся.
+- Source b641 + полный patch `f59f6aa7`, binary `ae6fdad9`, build manifest `71110298`. Пересобран только test TU;28 неизменных библиотек проверены SHA до/после, все outputs вынесены в новый namespace. V1/V2 source/binary/raw сохранены. Архив54 файлов SHA `bd6c30d391c1045e5c8c22ecb123af136b72547d08c32f69d94826cd9741b557`.
+- Main автоматически возвращён за24,885с с полным smoke и kernel CLEAN; независимо05:08:58 READY PID930455/exact request/identity/process SHAe319. Завершённый шаг сохраняет узкую фабрику настоящего runner и regression с aggregate-live/single-allocation/callback guards; production streaming override в этой точке ещё отсутствует.
+- При подготовке были два честно сохранённых setup FAIL: некорректное low-alignment выделение в observer (CPU RED→GREEN) и неверный synthetic fingerprint. Производственные validators/допуски не ослаблены. Следующий шаг — streaming implementation и реальные GREEN, затем matched timings и исходный час; перевода/push/pi/Q1 acceptance нет.
+
+### 04:59 MSK: RED2 прошёл HIP setup, выявлен невалидный fingerprint теста
+
+- Binary `c869ce6f`, patch `b3fd3232`: исправление test allocator позволило пройти HIP/device/model setup. До measured stream тест остановлен обычным validator: `Qwen disk cache requires an artifact fingerprint`, поскольку фикстура передавала имя вместо64hex. Это setup FAIL, не нужный allocation RED. Production validator не ослабляется; тест получает фиксированный SHA256 synthetic label, явно не hash GGUF.
+- Полный архив52 файлов SHA `e81ac063708d1ed739abc404eb27e9be2a337b1d13338b47d7c5fa29e442bfef` сохранён. Main автоматически возвращён за25,373с, smoke/identity/kernel PASS; независимо04:59:51 READY PID927433 и процесс SHAe319. Для следующего теста переиспользуются неизменные библиотеки с отдельным source/binary/manifest и проверкой SHA до/после.
+
 ### 04:49 MSK: сохранён сбой подготовки RED, проверена атомарность при исключении
 
 - Целевой Linux HIP test собран без остановки main: source b641 + frozen factory/test patch `d059641a`, binary `3ab3eda9`, manifest `4820abd7`. В коротком GPU-окне actual Qwen fixture не дошла до проверяемого участка: rc−6, LLVM Buffer allocation failed. Это setup FAIL, не нужный RED и не принятие исправления. Полный архив53 файлов SHA `31ea4866daa0f5f926c8ed2bb4991d7eb06b983064d2eee313d0b9059cf27461` сохранён, вывод не отбрасывался.
