@@ -96,7 +96,7 @@
     "focused_cache4_cache5_comparison": {
       "status": "NORMALIZED_LDD_MISMATCH",
       "identical_runtime": false,
-      "scope": "Python совпадает, но cache4 содержит crypto3 и crypto4 вместе с ssl4, cache5 — только crypto4 и ssl4. Это дополнительное различие к изменению порядка Acquire и instrumentation; пару нельзя объявлять same-runtime."
+      "scope": "Python совпадает, но cache4 содержит crypto3 и crypto4 вместе с ssl4, cache5 — только crypto4 и ssl4. Это дополнительное различие к изменению порядка Acquire; оба бинарника используют одинаковые instrumentation patch и macro. Пару нельзя объявлять same-runtime."
     },
     "change_cause": "UNKNOWN: причина различий не установлена; обновление ОС или причина пауз не выводятся из этих данных.",
     "acceptance_scope": "Прямое ownership-наблюдение cache5 сохраняется; INCONCLUSIVE_MONITOR и 24 timing flags не переквалифицируются. Различия runtime не отменяют самостоятельные correctness/hour gates внутри final3; их итог пока RUNNING."
