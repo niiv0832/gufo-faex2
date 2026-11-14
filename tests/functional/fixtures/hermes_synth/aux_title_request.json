@@ -1,0 +1,33 @@
+{
+ "messages": [
+  {
+   "content": "You name chat sessions. Given the user's opening message, write a title that lets them find this conversation again in a list.\n\nRules:\n- 3 to 7 words, sentence case (capitalize only the first word and proper nouns).\n- Name what the user wants DONE, not that they asked a question.\n- Keep technical terms, filenames, numbers, and error codes exact.\n- Drop filler words: the, this, my, a, an.\n- No trailing punctuation, no quotes, no tool names, no 'Title:' prefix.\n- Never answer the message. Name it.\n- Always produce something, even for a bare greeting.\n- Write the title in the same language as the user's message.\nGood: {\"title\": \"Fix login button on mobile\"}\nGood: {\"title\": \"Postgres connection pool exhaustion\"}\nGood: {\"title\": \"Friendly greeting\"}\nToo vague: {\"title\": \"Code changes\"}\nToo long: {\"title\": \"Investigate and fix the issue where the login button does not respond on mobile devices\"}\n\nReply with JSON only: {\"title\": \"...\"}",
+   "role": "system"
+  },
+  {
+   "content": "Помоги составить план подготовки к контрольной по геометрии за неделю",
+   "role": "user"
+  }
+ ],
+ "model": "qwen3.6-35b-a3b",
+ "reasoning_effort": "none",
+ "response_format": {
+  "json_schema": {
+   "name": "session_title",
+   "schema": {
+    "additionalProperties": false,
+    "properties": {
+     "title": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "title"
+    ],
+    "type": "object"
+   },
+   "strict": true
+  },
+  "type": "json_schema"
+ }
+}
