@@ -1,0 +1,343 @@
+{
+  "schema": "gufo-faex2.candidate.v1",
+  "date": "2026-11-14",
+  "prepared_at": "2026-11-14T21:40:00+03:00",
+  "status": "PREPARED_NOT_ACCEPTED",
+  "document_status": "ROUND3_MEASURED_NOT_QUALIFIED_PENDING_OWNER_DECISIONS",
+  "ready_for_deployment": false,
+  "deployment_performed": false,
+  "ready_for_deployment_note": "По формальному условию плана третьего круга этапы 2–7 закрыты. Значение false оставлено исполнителем, потому что остаются перечисленные blocking_reasons: решения владельца (правило раннего отказа, контракт качества), неготовый комплект launcher и отсутствие разрешения на перевод. Менять значение — решение владельца.",
+  "authorization": {
+    "scope": "Доработки, сборки и приёмочные проверки с возвратом прежнего main; без назначения кандидата рабочим и публикации.",
+    "owner_quality_acceptance": false,
+    "owner_deployment_approval": false,
+    "historical_approvals_apply": false
+  },
+  "candidate": {
+    "source_sha": "abbfb006db834e67ec8b6ebfeb95fd690b5f91e7",
+    "binary_sha256": "e760a663f8dd75ea3d89b46ac8edab9ec4a56ba50829df22ed53e1bb57e3e3b6",
+    "binary_kind": "ordinary",
+    "diagnostic": false,
+    "expected_version": "gufo version development (abbfb006db834e67ec8b6ebfeb95fd690b5f91e7)",
+    "built_at": "2026-11-14T13:29:39+03:00",
+    "build_status": "COMPLETED",
+    "deployed_as_main": false,
+    "stand_path": "~/gufo-remed-20261113/cand/abbfb006db834e67ec8b6ebfeb95fd690b5f91e7/gufo",
+    "change_kind": "FFC8580A_PLUS_ROUND3_TEST_AND_LOG_CHANGES",
+    "changes_since_previous_candidate": [
+      "fb816341 промах кэша называет причину в журнале",
+      "5f8bf68d пик выделений при потоковой записи снимка ограничен проверкой",
+      "767c6018 проверяемое приведение типа снимка",
+      "d2ab1696 окно статистики больше 256 значений",
+      "e2d2bf97 снимок с двумя изображениями",
+      "abbfb006 изоляция OpenCode обязательна"
+    ],
+    "previous_candidate": {
+      "source_sha": "ffc8580a6edb0eae5e26c2a99c0712084faa948d",
+      "binary_sha256": "8acf34daf647512159ca29c331f380d4472a7fc3d310968fa4cafc4098bb67a1",
+      "manifest": "docs/faex2/CANDIDATE_2026-11-14.json"
+    },
+    "full_private_manifest_ref": ".local/remed-20261113/round3/stage9/cand-abbfb006/MANIFEST.json",
+    "full_private_manifest_sha256": "41894d3dea38b776db3ae9b5a346ef311a6223d0951656bd74f61596329f9f40",
+    "inherited_min_step_policy": "b641 early advisory min_step сохранён; одинаковые будущие cache hits не гарантированы.",
+    "identical_future_cache_hits_guaranteed": false
+  },
+  "build_environment": {
+    "target": "Linux x86-64 gfx1151",
+    "c_and_cxx_compiler": "c++ (GCC) 16.2.1 20260810",
+    "hip_compiler": "AMD clang version 24.0.0git (https://github.com/ROCm/llvm-project.git d6f6cb691863e9258034ab48c1dfce21689d5606)",
+    "matched_control_build_settings": true,
+    "matched_build_settings_reference": "ffc8580a6edb0eae5e26c2a99c0712084faa948d",
+    "matched_build_settings_scope": "CMakeCache без путей совпал с прежним кандидатом ffc8580a; SHA журнала пакетов c1b2ef33… тот же, что при сборке ffc8580a. Это не доказывает одинаковое окружение исполнения с историческими окнами до обновления пакетов 2026-11-14 01:34.",
+    "package_log_sha256": "c1b2ef33c17033d1faad352658d3f09b1b8fe222dd12c5665cff8b5dd8b2f231"
+  },
+  "diagnostic_build": {
+    "purpose": "Только измерение этапа 5; кандидатом не является",
+    "binary_sha256": "5a1bf4aa55d89000baa67c88c27b8def75589a8f2b090f7bd4a97f7bf5a32a81",
+    "patch": "no-early-min-step.patch",
+    "patch_sha256": "972bd161586b73120d23ed0c82d0618cfa6d0a77e14f29f191e1624950ef4631",
+    "diagnostic": true
+  },
+  "assets": {
+    "model": {
+      "name": "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
+      "bytes": 22853663008,
+      "sha256": "55983c5a75a1ab969824077b3bb3de4146e82a9234072b48ad4e8f92ad3fe9f1"
+    },
+    "mmproj": {
+      "name": "mmproj-BF16.gguf",
+      "bytes": 902822528,
+      "sha256": "da63cb47a76763c712393f8a017070188a304fa39f8aeea6edc629ed7b975cfa"
+    },
+    "provenance_scope": "SHA модели и mmproj заданы в конфигурации окон третьего круга и проверяются оркестратором перед запуском."
+  },
+  "intended_profile": {
+    "mode": "mtp1",
+    "draft_tokens": 1,
+    "sessions": 4,
+    "context_per_session": 131072,
+    "vision": true,
+    "reasoning_budget_tokens": 512,
+    "ram_cache_gib": 16,
+    "disk_cache_gib": 64,
+    "environment": {
+      "HSA_ENABLE_SDMA": "0",
+      "GUFO_MTP_MOE_MAX_COHORT": "4"
+    },
+    "library_path": "Путь TheRock из проверенного эксплуатационного manifest; не угадывать.",
+    "experimental_numerical_overrides": "Не включать NPU, внешний hipBLASLt plan или иные незаявленные overrides."
+  },
+  "criteria": {
+    "recorded_before_measurement": true,
+    "commits": [
+      "d991901f",
+      "37ce52fb"
+    ],
+    "ref": "docs/faex2/REMEDIATION_2026-11-13.md"
+  },
+  "round3_verification": {
+    "tests": {
+      "window": "r3-tests",
+      "time_msk": "13:45:14–14:05:07",
+      "checks": 36,
+      "passed": 35,
+      "failed_known": [
+        "qwen_vision_serving_test: continued image cache differs from cold prefill (известная, не ослаблялась)"
+      ],
+      "old_candidate_snapshot_readable": true,
+      "python_checks": 100,
+      "orchestrator_state_note": "state.json окна показывает FAIL из-за ошибки счётчика в скрипте (ждал 38 проверок); читать по summary.txt",
+      "ref": ".local/remed-20261113/round3/stage2/README.md"
+    },
+    "speed": {
+      "windows": [
+        "r3-speed 14:07:18–14:45:05",
+        "r3-speed-repeat 14:49:56–14:57:34"
+      ],
+      "cells_pass": 211,
+      "cells_noise": 19,
+      "regression_flags_first_run": 4,
+      "regression_confirmed_after_repeat": 0,
+      "cache_write_cells": "по букве правила UNMATCHED_WORK (файл кандидата длиннее на 85 байт); по цифрам кандидат не медленнее",
+      "ref": ".local/remed-20261113/round3/stage3/README.md",
+      "orchestrator_state_note": "state.json окна r3-speed показывает FAIL из-за четырёх шагов cachewrite-*: скрипт замера записи кэша неверно оценил длину истории 120 тыс. токенов (отказ сервера 400); исправленный замер выполнен в r3-speed-repeat (PASS)"
+    },
+    "memory_hours": {
+      "gate": "рост максимума и медианы RSS/GTT/VRAM/GTT+VRAM между первыми и последними 20 минутами ≤ 1 ГиБ; монитор раз в 1 с",
+      "runs": [
+        {
+          "window": "r3-mem1-cand",
+          "binary": "candidate",
+          "time_msk": "15:05:43–16:13:27",
+          "gate": "PASS",
+          "rss_max_growth_bytes": 18276352,
+          "gtt_max_growth_bytes": -142577664,
+          "rss_hour_max_bytes": 6326329344
+        },
+        {
+          "window": "r3-mem2-control",
+          "binary": "1195d154/e319b5f5",
+          "time_msk": "16:15:10–17:22:48",
+          "gate": "PASS",
+          "rss_max_growth_bytes": 241119232,
+          "gtt_max_growth_bytes": 343932928,
+          "rss_hour_max_bytes": 9390903296
+        },
+        {
+          "window": "r3-mem3-cand",
+          "binary": "candidate",
+          "time_msk": "17:24–18:32",
+          "gate": "PASS",
+          "rss_max_growth_bytes": 175267840,
+          "gtt_max_growth_bytes": -142606336,
+          "rss_hour_max_bytes": 6543380480
+        }
+      ],
+      "interpretation": "Память кандидата не хуже контроля в трёх прогонах; не квалификация 24/7",
+      "ref": ".local/remed-20261113/round3/stage4/README.md"
+    },
+    "early_skip": {
+      "window": "r3-earlyskip",
+      "time_msk": "19:11:58–20:44:05",
+      "result": "Попадания кэша, перечитанные токены и время чтения с правилом и без совпали при 16 и 64 ГиБ; без правила очередь записи до 7,73 ГиБ и 4 потерянных снимка при 64 ГиБ",
+      "gates": "нет, таблица для решения владельца",
+      "ref": ".local/remed-20261113/round3/stage5/README.md"
+    },
+    "agents": {
+      "window": "r3-agents",
+      "time_msk": "20:47:36–20:50:52",
+      "opencode_version": "2.3.0",
+      "isolated": true,
+      "candidate": "4 pass / 0 fail, 15 цепочек",
+      "control": "4 pass / 0 fail, 14 цепочек",
+      "sessions": [
+        "/Users/vlad/gufo-agent-runs/round3-candidate",
+        "/Users/vlad/gufo-agent-runs/round3-control"
+      ],
+      "pi": "NOT_EXERCISED — по решению владельца от 2026-11-14 заменён OpenCode",
+      "ref": ".local/remed-20261113/round3/stage6/README.md"
+    },
+    "continuation_misses": {
+      "candidate_full_rereads": 0,
+      "candidate_continuations": 1584,
+      "control_full_rereads": 2,
+      "control_continuations": 736,
+      "fisher_p": 0.23,
+      "final2_cause": "NOT_ESTABLISHED (вероятно kBusy при дисковом поиске; не доказано)",
+      "ref": ".local/remed-20261113/round3/stage7/README.md"
+    },
+    "quality": {
+      "measured": false,
+      "note": "Только расчёт стоимости проверки контракта Q1",
+      "ref": ".local/remed-20261113/round3/stage8/README.md"
+    }
+  },
+  "blocking_reasons": [
+    {
+      "id": "QUALITY_CONTRACT",
+      "status": "DRAFT_NOT_APPROVED",
+      "reason": "Контракт точности чтения запроса не утверждён; проверка зрения «continued image cache differs from cold prefill» падает. Нужен выбор владельца (варианты A–C, stage8/README.md §5)."
+    },
+    {
+      "id": "EARLY_SKIP_RULE",
+      "status": "OWNER_DECISION_PENDING",
+      "reason": "Варианты B и C меняют код и требуют новой сборки и повторения тестов, скорости и памяти; вариант A оставляет кандидата как есть."
+    },
+    {
+      "id": "CONTINUATION_CACHE",
+      "status": "OPEN_OBSERVATION",
+      "reason": "Причина двух полных перечитываний final2 не установлена; явление повторилось у рабочего бинарника (2 из 736), у кандидата за два часа — нет, но разница статистически неразличима (p=0,23)."
+    },
+    {
+      "id": "SPEED_NOISE",
+      "status": "NO_CONFIRMED_REGRESSION_19_CELLS_NOISE",
+      "reason": "Подтверждённых замедлений нет; 19 ячеек остались шумом, ячейки записи кэша по букве правила UNMATCHED_WORK."
+    },
+    {
+      "id": "AGENT_SCOPE",
+      "status": "SHORT_SCENARIO_SINGLE_RUN",
+      "reason": "OpenCode: по одному короткому прогону на бинарник; pi не исполнялся по решению владельца."
+    },
+    {
+      "id": "CUTOVER",
+      "status": "NOT_AUTHORIZED",
+      "reason": "Комплект launcher/recovery для этого кандидата не сгенерирован и не проверен; нужно отдельное одобрение владельца именно этого кандидата."
+    },
+    {
+      "id": "INDEPENDENT_REVIEW",
+      "status": "PENDING_STAGE_10",
+      "reason": "Независимая проверка коммитов и документов третьего круга ещё не выполнена на момент подготовки manifest."
+    }
+  ],
+  "cache_compatibility": {
+    "numerical_identity": "qwen-bf16-fp32-prefill-v2",
+    "means_snapshot_file_format_version": false,
+    "old_working_numeric_state_must_restore": false,
+    "expected_old_state_behavior": "Несовместимая численная identity даёт cache miss; старые state не переименовывать и не принудительно загружать.",
+    "current_candidate_own_state": "Обязан восстановиться после перезапуска с подтверждённой identity и правильным ответом.",
+    "operational_policy": "Новый отдельный namespace; старые каталоги, launcher snapshot и бинарники сохраняются для отката."
+  },
+  "rollback": {
+    "source_sha": "1195d15427a43c45516ab9e7dd90777f8216b326",
+    "binary_sha256": "e319b5f5b5198dc60e089d8b57b3e8826728aed5b6ba9f1534adf0b18a67d607",
+    "expected_version": "gufo version development (1195d15427a43c45516ab9e7dd90777f8216b326)",
+    "release_directory_name": "1195d154-e319b5f5",
+    "current_launcher_baseline": "v13; перепроверить перед подготовкой",
+    "future_recovery_role": "Нынешний main 1195d154 должен стать recovery только в новом проверенном комплекте launcher.",
+    "launcher_backup_required": [
+      "faex2_owner.py",
+      "faex2-launch.json",
+      "fork_restart.sh",
+      "SHA256SUMS"
+    ],
+    "without_rebuild": true
+  },
+  "procedure_ref": "docs/faex2/CANDIDATE_SWITCH_ROUND3_2026-11-14.md",
+  "procedure_status": "DRAFT_NOT_GENERATED_NOT_INSTALLED_NOT_AUTHORIZED",
+  "legacy_manifest": {
+    "path": "docs/faex2/CANDIDATE_2026-11-14.json",
+    "sha256_at_preparation": "9801b9e3dd742b5629842c1883f486c727aa124323d418e19577bc4abda51971",
+    "preserve_unchanged": true,
+    "note": "Подробные сведения о прежнем кандидате ffc8580a, final4 и исторических окнах — там; здесь не повторяются.",
+    "closure_report_note": "В прежний отчёт docs/faex2/AUDIT_CLOSURE_2026-11-14.md в третьем круге добавлена одна строка-пометка «историческая версия» со ссылкой на новый; поэтому его SHA-256 больше не равен записанному в прежнем manifest (957d211f…). Исходный текст — в git до коммита этапа 9 (ревизия f6c7f88f)."
+  },
+  "final_handoff": {
+    "status": "READY_SAME_MAIN",
+    "checked_at": "2026-11-14T20:51:00+03:00",
+    "pid": 1058034,
+    "binary_sha256": "e319b5f5b5198dc60e089d8b57b3e8826728aed5b6ba9f1534adf0b18a67d607",
+    "source": "after-window.sh r3-agents"
+  },
+  "closure_table": {
+    "report_ref": "docs/faex2/AUDIT_CLOSURE_ROUND3_2026-11-14.md",
+    "status": "ROUND3_MEASURED_OVERALL_NOT_QUALIFIED",
+    "report_sha256_note": "SHA отчёта не записан: отчёт и manifest ссылаются друг на друга и правятся по замечаниям рецензента; истина — git."
+  },
+  "stand_windows": [
+    {
+      "window": "r3-tests",
+      "orchestrator_status": "FAIL (ошибка счётчика скрипта, см. tests)",
+      "time_msk": "13:45:14–14:05:07",
+      "downtime_s": 1193,
+      "kernel": "CLEAN",
+      "production_pid_after": 994477
+    },
+    {
+      "window": "r3-speed",
+      "orchestrator_status": "FAIL (шаги cachewrite, см. speed)",
+      "time_msk": "14:07:18–14:45:05",
+      "downtime_s": 2266,
+      "kernel": "CLEAN",
+      "production_pid_after": 1000627
+    },
+    {
+      "window": "r3-speed-repeat",
+      "orchestrator_status": "PASS",
+      "time_msk": "14:49:56–14:57:34",
+      "downtime_s": 458,
+      "kernel": "CLEAN",
+      "production_pid_after": 1004410
+    },
+    {
+      "window": "r3-mem1-cand",
+      "orchestrator_status": "PASS",
+      "time_msk": "15:05:43–16:13:27",
+      "downtime_s": 4063,
+      "kernel": "CLEAN",
+      "production_pid_after": 1016935
+    },
+    {
+      "window": "r3-mem2-control",
+      "orchestrator_status": "PASS",
+      "time_msk": "16:15:10–17:22:48",
+      "downtime_s": 4057,
+      "kernel": "CLEAN",
+      "production_pid_after": 1028511
+    },
+    {
+      "window": "r3-mem3-cand",
+      "orchestrator_status": "PASS",
+      "time_msk": "17:24:37–18:32:15",
+      "downtime_s": 4058,
+      "kernel": "CLEAN",
+      "production_pid_after": 1041345
+    },
+    {
+      "window": "r3-earlyskip",
+      "orchestrator_status": "PASS",
+      "time_msk": "19:11:58–20:44:05",
+      "downtime_s": 5527,
+      "kernel": "CLEAN",
+      "production_pid_after": 1054774
+    },
+    {
+      "window": "r3-agents",
+      "orchestrator_status": "PASS",
+      "time_msk": "20:47:36–20:50:52",
+      "downtime_s": 196,
+      "kernel": "CLEAN",
+      "production_pid_after": 1058034
+    }
+  ],
+  "stand_windows_total_downtime_s": 21818
+}
