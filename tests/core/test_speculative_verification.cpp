@@ -1656,6 +1656,105 @@ void TestPersistentVerifierStreamingContract() {
          "stream preserves independent nonzero counters and rolling bytes");
 }
 
+// A rolling window above 256 values fills the 1024-byte stack block of
+// StreamPersistent at least once. The expected bytes are built here, without
+// the production header builder or serializer.
+void TestPersistentVerifierStreamsLongRollingWindow() {
+  constexpr std::size_t kRollingCount = 300;
+  ScriptedTargetExecutor target({10, 11}, 900);
+  auto backend =
+      std::make_unique<PersistentDraftBackend>(std::vector<TokenId>{10, 11}, 1);
+  gufo::speculative::SpeculativeOptions options;
+  options.max_draft_tokens = 4;
+  options.min_draft_tokens = 1;
+  options.initial_draft_tokens = 2;
+  options.rolling_window = kRollingCount;
+  gufo::speculative::SpeculativeVerifier verifier(target, std::move(backend),
+                                                  options);
+
+  constexpr std::size_t kHeaderBytes = 96;
+  constexpr std::size_t kRollingBytes = kRollingCount * 4;
+  constexpr std::size_t kTotalBytes = kHeaderBytes + kRollingBytes + 4;
+  std::vector<std::uint8_t> expected(kTotalBytes, 0);
+  const std::array<std::uint8_t, 8> magic = {'G', 'S', 'P', 'V',
+                                             'E', 'R', '0', '1'};
+  std::copy(magic.begin(), magic.end(), expected.begin());
+  const auto put = [&](std::size_t offset, std::uint64_t value,
+                       std::size_t bytes) {
+    for (std::size_t i = 0; i < bytes; ++i)
+      expected[offset + i] = static_cast<std::uint8_t>(value >> (8U * i));
+  };
+  put(8, 2, 4);
+  put(12, kHeaderBytes, 4);
+  put(16, 4, 8);
+  put(24, kRollingCount, 8);
+  put(32, 1700, 8);
+  put(40, 1100, 8);
+  put(48, 300, 8);
+  put(56, 1400, 8);
+  put(64, 3, 4);
+  put(72, kTotalBytes, 8);
+  // Distinct values in [0, 1): a dropped, repeated or reordered block shows.
+  for (std::size_t index = 0; index < kRollingCount; ++index) {
+    put(kHeaderBytes + index * 4,
+        std::bit_cast<std::uint32_t>(static_cast<float>(index + 1) / 512.0F),
+        4);
+  }
+  put(kHeaderBytes + kRollingBytes, 0x12345678U, 4);
+
+  verifier.RestorePersistentSnapshot(expected);
+  const auto snapshot = verifier.Snapshot();
+  Expect(snapshot->PersistentPayloadBytes() == kTotalBytes,
+         "long rolling window is sized exactly");
+  std::vector<std::uint8_t> streamed;
+  std::vector<std::size_t> chunks;
+  snapshot->StreamPersistent([&](auto bytes) {
+    streamed.insert(streamed.end(), bytes.begin(), bytes.end());
+    chunks.push_back(bytes.size());
+  });
+  Expect(streamed == expected,
+         "stream preserves a rolling window longer than one stack block");
+  // Header, one full 1024-byte block, the 176-byte remainder, provider bytes.
+  Expect(chunks == std::vector<std::size_t>{kHeaderBytes, 1024,
+                                            kRollingBytes - 1024, 4},
+         "a full rolling block is flushed once and the remainder follows");
+  std::vector<std::uint8_t> direct(kTotalBytes, 0xA5);
+  Expect(snapshot->SerializePersistent(direct) == kTotalBytes &&
+             direct == expected,
+         "direct serializer agrees on the long rolling window");
+
+  // Exactly 256 values: the block fills on the last value and no empty
+  // remainder may be emitted.
+  options.rolling_window = 256;
+  ScriptedTargetExecutor exact_target({10, 11}, 900);
+  gufo::speculative::SpeculativeVerifier exact(
+      exact_target,
+      std::make_unique<PersistentDraftBackend>(std::vector<TokenId>{10, 11}, 1),
+      options);
+  std::vector<std::uint8_t> exact_expected(expected.begin(),
+                                           expected.begin() + kHeaderBytes);
+  exact_expected.insert(exact_expected.end(), expected.begin() + kHeaderBytes,
+                        expected.begin() + kHeaderBytes + 1024);
+  exact_expected.insert(exact_expected.end(), expected.end() - 4,
+                        expected.end());
+  for (std::size_t i = 0; i < 8; ++i) {
+    exact_expected[24 + i] =
+        static_cast<std::uint8_t>(std::uint64_t{256} >> (8U * i));
+    exact_expected[72 + i] = static_cast<std::uint8_t>(
+        static_cast<std::uint64_t>(exact_expected.size()) >> (8U * i));
+  }
+  exact.RestorePersistentSnapshot(exact_expected);
+  streamed.clear();
+  chunks.clear();
+  exact.Snapshot()->StreamPersistent([&](auto bytes) {
+    streamed.insert(streamed.end(), bytes.begin(), bytes.end());
+    chunks.push_back(bytes.size());
+  });
+  Expect(streamed == exact_expected &&
+             chunks == std::vector<std::size_t>{kHeaderBytes, 1024, 4},
+         "an exactly full rolling block emits no empty remainder");
+}
+
 }  // namespace
 
 int main() {
@@ -1682,6 +1781,7 @@ int main() {
   TestConcurrentVerificationChunks();
   TestPersistentVerifierSnapshotRoundTrip();
   TestPersistentVerifierStreamingContract();
+  TestPersistentVerifierStreamsLongRollingWindow();
   std::cout << "All speculative verification tests passed.\n";
   return 0;
 }
