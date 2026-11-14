@@ -4,6 +4,13 @@
 
 ## 2026-11-14
 
+### После final3: доказан механизм host-overlap, подготовлен streaming fix
+
+- Независимый полный review подтвердил RSS FAIL: 806 monitor samples, оба partial prefixes неизменны, first/last по240 samples. Whole-window RSS peak9296003072 байта сохранён отдельно от last20 peak9136889856. Все1610 actual input SHA проверены,1500 общих входов/ответов совпадают с final2,110 дополнительных строк сохранены. Все2360 уникальных timing flags остаются diagnostic-only при runtime mismatch.
+- В диагностическом ledger исправлен только источник token counters подтверждённых отмен: v1 смешивал report default0 с native prompt/prefill. Versioned v2,9 CPU-тестов и независимое ревью; исходные файлы v1 и все2360 timing flags неизменны. Это не изменение результата модели или acceptance gate.
+- Существующий cache3 trace напрямую показывает serialize+restore buffers5724710484 байта на1,480035с и последующее освобождение; cache4/5 overlap не содержат. Для ordinary final3 это подтверждение механизма, а не точная атрибуция его пика. Нового GPU-окна для поиска причины не понадобилось.
+- Подготовлен план byte-exact Qwen streaming: один scratch16MiB, borrowed MTP host spans, прежние format/identity/checksum/cache policy. Два review без архитектурных блокеров; memory regression усилена aggregate peak-live ledger и actualMTP payload>cap. До реального RED пишется только общая внутренняя фабрика и тест; streaming implementation ещё не начата. Main915853 READY, перевода/push нет.
+
 ### 04:08 MSK: final3 завершился отказом по RSS, рабочий сервер возвращён
 
 - Полный час обычного `b641fe3e`/`ef7e3040`: 3610,648 с после warmup, 1610 запросов, 768 длинных продолжений, 192 полных C4, 192 отмены и четыре правильных post-refill истории. Восемь независимых gates PASS; memory FAIL из-за роста максимума RSS на2508189696 байт (2,34 GiB). Порог1GiB не менялся, медиана+68253696 не отменяет превышение максимума. GTT/GPU maxima снизились примерно на1,75GiB, VRAM проходит.
