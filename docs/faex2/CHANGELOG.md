@@ -4,6 +4,13 @@
 
 ## 2026-11-14
 
+### 06:41 MSK: исправлена проверка Btrfs identity, повторное окно A2 начато
+
+- Helper `7b6b35ff` сохраняет stat identity и связывает её с `/proc/PID/maps` через приватное self-mmap того же файла и ядра, точные namespace/root/mountinfo, pathname/inode и открытый fd. Character devices не читаются; исключение anonymous `/dev/zero (deleted)` ограничено точной проверенной формой. CPU:16 новых и16 прежних проверок PASS; независимое source review без blocker.
+- Live read-only validation на main951824 прошла:65 ELF,4 nonELF,468 явно классифицированных исключений; identities стабильны до/после. First-hook probe/full-ELF-hash bytes0, classification276B, package-log92266B; затраты19,611мс сохранены. API/модели/остановки в этой проверке отсутствовали. Main-specific `GUFO_MTP_VOCAB=0` добавлен только в отдельную диагностическую expected-копию, canonical A/B runtime не менялся. АрхивSHA `035c16bf3f61d51341770c9b9a81f6964f8cb11df927b9c31dff54a733790dc3`.
+- Wrapper `45be397c` передаёт nonELF proofs первому response hook:2 новых+35 прежних CPU PASS. Новый comparator `07fd218c` поверх неизменного V2 `c4e1e84a`:11 CPU PASS, два reviewer замечания RED→GREEN; обязательны стабильность nonELF proofs и отсутствие первого mmap probe. Все прежние cells,5% AND3ms и flags сохранены. Freeze `73211f70`, независимое review выполнено; анализатор сохранён на стенде до A2.
+- Пакет v3 manifest `325232d5`, binding `d5f49c3e`; оба плана побайтно равны v2, входы/работа/пороги прежние. Независимое concrete delta review PASS; полный локальный archiveSHA `4d2037cfc612d5e85328142922e4ebba287ca0416d5a3693ca3fede0dbc9b36f`. Старый пакет/A1FAIL не переписаны. A2 запущен06:41:16 вtmux, общий deadline900с и finally возвратmain; preflight06:41:31PASS, измерения идут. Это ещё не timing/часовой PASS.
+
 ### 06:13 MSK: ordinary кандидат собран, первый A остановлен на Btrfs identity preflight
 
 - Ordinary `ffc8580a6edb0eae5e26c2a99c0712084faa948d`, binary `8acf34daf647512159ca29c331f380d4472a7fc3d310968fa4cafc4098bb67a1`, manifest `4f13939e97eb2a34008e95b444fc741b83befea723783e141ba92d9883985347`. Тот же toolchain/flags,16 изменённых source/test SHA равны GREEN3, diagnostic patch отсутствует; сборка299steps сохранила mainPID945631. Все84 functional SHA control/candidate совпали. Prepared runtime61ELF, package/Python/env pins;9inputs offlinePASS, concreteconfigreview без blocker.
