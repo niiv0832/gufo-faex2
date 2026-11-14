@@ -262,6 +262,61 @@ void TestRopeV2() {
               layout.images[0].height == 2 && layout.images[0].width == 2,
           "independent rope fixture preserves offset and grid dimensions");
 }
+
+// Two images of different grids: the second entry of the rope table must keep
+// its own offset and dimensions through restore, save and streaming.
+void TestRopeV2TwoImages() {
+  Fixture f(true, false, 7, false);
+  auto synthetic = gufo::models::qwen::build_synthetic_qwen_weights(f.config);
+  std::vector<std::string> vocabulary(f.config.vocab_size, "token");
+  for (std::size_t i = 0; i < vocabulary.size(); ++i)
+    vocabulary[i] += std::to_string(i);
+  std::string error;
+  auto tokenizer = gufo::tokenization::QwenTokenizer::CreateFromVocabulary(
+      vocabulary, {}, {}, &error);
+  Require(tokenizer != nullptr, error);
+  auto model = std::make_shared<gufo::hip::QwenGpuModel>(
+      nullptr, std::move(synthetic.weights), std::move(tokenizer),
+      std::vector<gufo::hip::QwenGpuWeightRegion>{});
+  // Independent fixture: tokens 0..3 are a 2x2 image, token 4 is text,
+  // tokens 5..6 are a 1x2 image. Each entry is offset, height, width.
+  auto golden = f.golden;
+  const auto table = golden.size();
+  golden.resize(table + 24, 0);
+  Put(golden, 8, 2, 4);
+  Put(golden, 64, golden.size(), 8);
+  Put(golden, 72, 2, 4);
+  Put(golden, table, 0, 4);
+  Put(golden, table + 4, 2, 4);
+  Put(golden, table + 8, 2, 4);
+  Put(golden, table + 12, 5, 4);
+  Put(golden, table + 16, 1, 4);
+  Put(golden, table + 20, 2, 4);
+  gufo::hip::QwenGpuExecutor executor(model, f.context, f.policy);
+  executor.Reset();
+  executor.RestoreCompactSnapshot(golden, f.valid);
+  const auto snapshot = executor.SaveSnapshot(f.valid);
+  Require(snapshot->CompactPayloadBytes() == golden.size(),
+          "two-image snapshot is sized with both rope entries");
+  std::vector<std::uint8_t> direct(golden.size(), 0xA5);
+  Require(
+      snapshot->SerializeCompact(direct) == direct.size() && direct == golden,
+      "two-image snapshot serializes both rope entries byte exactly");
+  Require(Collect(*snapshot) == golden,
+          "two-image snapshot streams both rope entries byte exactly");
+  const auto layout = QwenGpuSnapshot::ReadRopeLayout(Collect(*snapshot));
+  Require(layout.images.size() == 2 && layout.images[0].offset == 0 &&
+              layout.images[0].height == 2 && layout.images[0].width == 2 &&
+              layout.images[1].offset == 5 && layout.images[1].height == 1 &&
+              layout.images[1].width == 2,
+          "streamed rope table keeps both images in order");
+  // A second executor restored from the streamed bytes reproduces them.
+  gufo::hip::QwenGpuExecutor second(model, f.context, f.policy);
+  second.Reset();
+  second.RestoreCompactSnapshot(Collect(*snapshot), f.valid);
+  Require(Collect(*second.SaveSnapshot(f.valid)) == golden,
+          "two-image snapshot survives a second restore and stream");
+}
 }  // namespace
 
 int main() {
@@ -278,6 +333,7 @@ int main() {
         TestArena(fp16, bf16, 4099, true);
       }
     TestRopeV2();
+    TestRopeV2TwoImages();
     std::cout << "Qwen compact streaming contracts passed\n";
     return 0;
   } catch (const std::exception& error) {
