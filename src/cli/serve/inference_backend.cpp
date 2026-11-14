@@ -1613,6 +1613,9 @@ public:
   void StreamPersistentSnapshot(const TextRunnerSnapshot& snapshot,
                                 const SnapshotSink& sink) const override {
     const auto expected_bytes = PersistentSnapshotPayloadBytes(snapshot);
+    // Defensive only: PersistentSnapshotPayloadBytes above already rejects a
+    // foreign snapshot with the same exception, so this branch is not reached
+    // today. It keeps the cast checked if that call ever changes.
     const auto* qwen_snapshot =
         dynamic_cast<const QwenTextRunnerSnapshot*>(&snapshot);
     if (qwen_snapshot == nullptr) {

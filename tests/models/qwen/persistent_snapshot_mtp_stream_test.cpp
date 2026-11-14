@@ -219,7 +219,8 @@ std::vector<std::uint8_t> SeededMtpPayload() {
 }
 
 // Measured peaks of live C++ heap on the streaming thread (gfx1151 stand,
-// 2026-11-14), each bounded with a 64 KiB margin for bookkeeping allocations.
+// 2026-11-14), each bounded with a margin for bookkeeping allocations: 4 KiB
+// where the measured peak is zero, 64 KiB otherwise.
 // A bound one byte under the measured peak was seen to fail first.
 //
 // The large MTP snapshot streams straight from host memory it already owns:
