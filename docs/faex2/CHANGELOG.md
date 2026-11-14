@@ -4,6 +4,13 @@
 
 ## 2026-11-14
 
+### 04:49 MSK: сохранён сбой подготовки RED, проверена атомарность при исключении
+
+- Целевой Linux HIP test собран без остановки main: source b641 + frozen factory/test patch `d059641a`, binary `3ab3eda9`, manifest `4820abd7`. В коротком GPU-окне actual Qwen fixture не дошла до проверяемого участка: rc−6, LLVM Buffer allocation failed. Это setup FAIL, не нужный RED и не принятие исправления. Полный архив53 файлов SHA `31ea4866daa0f5f926c8ed2bb4991d7eb06b983064d2eee313d0b9059cf27461` сохранён, вывод не отбрасывался.
+- Автоматический возврат main прошёл за25,962с: прежние request/identity/SHA и smoke health/text/tool/vision PASS, kernel CLEAN. Независимая проверка04:49:52: READY PID921684. Найден CPU-воспроизводимый дефект test allocator: aligned new с alignment1/2/4 передавался напрямую в posix_memalign. Runtime attribution пока не доказана; до повторного окна исправляется только тест.
+- Добавлен regression `TestThrowingStreamPreservesPublishedCheckpoint`: исключение после первой порции payload оставляет прежний файл побайтно целым, не публикует новый и удаляет временный; restart восстанавливает исходное значение/position. Полный Mac disk-store target strict compile/run PASS. Required format сохраняет36 diagnostics в прежних девяти файлах, изменённый файл проходит. Production disk store не менялся.
+- Перевода/push/pi нет, Q1 остаётся проектом. Полноразмерный host buffer production ещё не устранён; старые memory/timing/quality findings открыты.
+
 ### После final3: доказан механизм host-overlap, подготовлен streaming fix
 
 - Независимый полный review подтвердил RSS FAIL: 806 monitor samples, оба partial prefixes неизменны, first/last по240 samples. Whole-window RSS peak9296003072 байта сохранён отдельно от last20 peak9136889856. Все1610 actual input SHA проверены,1500 общих входов/ответов совпадают с final2,110 дополнительных строк сохранены. Все2360 уникальных timing flags остаются diagnostic-only при runtime mismatch.

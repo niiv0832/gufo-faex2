@@ -274,6 +274,7 @@ public:
   }
 
   std::function<void()> before_stream;
+  std::function<void()> after_first_chunk;
   void StreamPersistentSnapshot(const TextRunnerSnapshot& snapshot,
                                 const SnapshotSink& sink) const override {
     if (before_stream)
@@ -281,6 +282,8 @@ public:
     std::array<std::uint8_t, kFakePayloadBytes> bytes{};
     (void)SerializePersistentSnapshot(snapshot, bytes);
     sink(std::span(bytes).first(7));
+    if (after_first_chunk)
+      after_first_chunk();
     sink(std::span(bytes).subspan(7));
   }
 
@@ -757,6 +760,56 @@ void TestAtomicPublicationAndPrivatePermissions() {
              (status.st_mode & (S_IRWXG | S_IRWXO)) == 0 &&
              (status.st_mode & S_IRUSR) != 0 && (status.st_mode & S_IWUSR) != 0,
          "published cache file is private and owner read-write");
+}
+
+void TestThrowingStreamPreservesPublishedCheckpoint() {
+  TemporaryDirectory directory;
+  FakeRunner runner("throwing-stream");
+  const auto read_bytes = [](const std::filesystem::path& path) {
+    std::ifstream input(path, std::ios::binary);
+    std::vector<std::uint8_t> bytes(std::filesystem::file_size(path));
+    input.read(reinterpret_cast<char*>(bytes.data()),
+               static_cast<std::streamsize>(bytes.size()));
+    Expect(input.good(), "complete checkpoint file can be read");
+    return bytes;
+  };
+  {
+    ContinuationDiskStore store(StoreOptions(directory.path()));
+    auto original = MakeSnapshot(runner, 77, 2);
+    Expect(SaveTokens(store, runner, {7, 7}, *original).stored,
+           "original checkpoint is published before the failing stream");
+    const auto original_files = CacheFiles(directory.path());
+    Expect(original_files.size() == 1,
+           "one checkpoint exists before the failing stream");
+    const auto original_bytes = read_bytes(original_files.front());
+    bool partial_stream_observed = false;
+    runner.after_first_chunk = [&] {
+      partial_stream_observed = true;
+      throw std::runtime_error(
+          "injected failure after the first payload chunk");
+    };
+    auto next = MakeSnapshot(runner, 88, 3);
+    Expect(!SaveTokens(store, runner, {7, 7, 8}, *next).stored &&
+               partial_stream_observed,
+           "partially emitted payload reports a failed save");
+    Expect(store.entry_count() == 1 &&
+               CacheFiles(directory.path()) == original_files &&
+               read_bytes(original_files.front()) == original_bytes,
+           "failed stream preserves the published file byte for byte");
+    for (const auto& entry :
+         std::filesystem::directory_iterator(directory.path())) {
+      Expect(!entry.path().filename().string().starts_with(".tmp-"),
+             "failed stream removes its partial temporary file");
+    }
+    runner.after_first_chunk = {};
+  }
+  ContinuationDiskStore restarted(StoreOptions(directory.path()));
+  auto state = runner.CreateState();
+  const auto restored = RestoreTokens(restarted, runner, *state, {7, 7, 8, 9});
+  Expect(restored.restored && RequireFakeState(*state).value == 77 &&
+             RequireFakeState(*state).position == 2 &&
+             restarted.entry_count() == 1,
+         "restart restores only the original complete checkpoint");
 }
 
 void TestStartupRejectsUnsafeAndInvalidFiles() {
@@ -1545,6 +1598,7 @@ int main() {
   TestSmallerStagingPreservesExistingFiles();
   TestLruEvictionUsesActualFileBytes();
   TestAtomicPublicationAndPrivatePermissions();
+  TestThrowingStreamPreservesPublishedCheckpoint();
   TestStartupRejectsUnsafeAndInvalidFiles();
   TestRootSymlinkIsRejected();
   TestConcurrentCallersRemainBoundedAndExact();
