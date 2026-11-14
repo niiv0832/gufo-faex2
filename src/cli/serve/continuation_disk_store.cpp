@@ -737,8 +737,8 @@ struct ContinuationDiskStore::Impl {
   void Emit(ContinuationDiskEventAction action,
             ContinuationDiskEventReason reason, std::size_t file_bytes,
             std::size_t payload_bytes, std::size_t token_count,
-            double elapsed_ms = 0.0,
-            std::size_t staging_used_bytes = 0) const noexcept {
+            double elapsed_ms = 0.0, std::size_t staging_used_bytes = 0,
+            std::size_t prompt_tokens = 0) const noexcept {
     if (!event_sink) {
       return;
     }
@@ -749,6 +749,7 @@ struct ContinuationDiskStore::Impl {
           .file_bytes = file_bytes,
           .payload_bytes = payload_bytes,
           .token_count = token_count,
+          .prompt_tokens = prompt_tokens,
           .retained_bytes = retained,
           .capacity_bytes = options.capacity_bytes,
           .staging_capacity_bytes = options.staging_capacity_bytes,
@@ -758,6 +759,146 @@ struct ContinuationDiskStore::Impl {
     } catch (...) {
       return;
     }
+  }
+
+  /// A checkpoint the store no longer holds, kept only to name the reason of a
+  /// later miss. Hashes stand in for the tokens and identity: a collision can
+  /// mislabel a miss in the log and nothing else.
+  struct LostCheckpoint {
+    std::uint64_t key{0};
+    std::size_t token_count{0};
+    std::uint64_t token_hash{0};
+    ContinuationDiskEventReason reason{ContinuationDiskEventReason::kEvicted};
+  };
+  static constexpr std::size_t kMaxLostCheckpoints = 256;
+  static constexpr std::uint64_t kLostHashSeed = 0xcbf29ce484222325ULL;
+
+  [[nodiscard]] static std::uint64_t MixLostHash(std::uint64_t hash,
+                                                 std::uint64_t value) noexcept {
+    hash ^= value + 0x9e3779b97f4a7c15ULL + (hash << 6U) + (hash >> 2U);
+    return hash * 0x100000001b3ULL;
+  }
+
+  [[nodiscard]] static std::uint64_t LostKey(
+      const TextRunnerPersistenceDescriptor& persistence) noexcept {
+    std::uint64_t hash =
+        MixLostHash(kLostHashSeed, persistence.payload_version);
+    for (const auto byte : persistence.compatibility_identity)
+      hash = MixLostHash(hash, byte);
+    return hash;
+  }
+
+  [[nodiscard]] std::deque<LostCheckpoint>& LostQueue(
+      ContinuationDiskEventReason reason) noexcept {
+    return reason == ContinuationDiskEventReason::kMinStep ? lost_to_step
+                                                           : lost_to_eviction;
+  }
+
+  void RememberLost(const TextRunnerPersistenceDescriptor& persistence,
+                    std::span<const TextRunnerToken> tokens,
+                    ContinuationDiskEventReason reason) noexcept {
+    try {
+      LostCheckpoint lost{LostKey(persistence), tokens.size(), kLostHashSeed,
+                          reason};
+      for (const auto token : tokens)
+        lost.token_hash = MixLostHash(lost.token_hash, token);
+      const std::lock_guard lock(lost_mutex);
+      auto& queue = LostQueue(reason);
+      std::erase_if(queue, [&](const LostCheckpoint& other) {
+        return other.key == lost.key && other.token_count == lost.token_count &&
+               other.token_hash == lost.token_hash;
+      });
+      queue.push_back(lost);
+      if (queue.size() > kMaxLostCheckpoints)
+        queue.pop_front();
+    } catch (...) {
+      // Diagnostics must not affect cache operation.
+    }
+  }
+
+  void ForgetLost(const TextRunnerPersistenceDescriptor& persistence,
+                  std::span<const TextRunnerToken> tokens) noexcept {
+    const std::lock_guard lock(lost_mutex);
+    if (lost_to_step.empty() && lost_to_eviction.empty())
+      return;
+    const auto key = LostKey(persistence);
+    auto hash = kLostHashSeed;
+    for (const auto token : tokens)
+      hash = MixLostHash(hash, token);
+    const auto same = [&](const LostCheckpoint& other) {
+      return other.key == key && other.token_count == tokens.size() &&
+             other.token_hash == hash;
+    };
+    std::erase_if(lost_to_step, same);
+    std::erase_if(lost_to_eviction, same);
+  }
+
+  /// Longest lost checkpoint that was an exact prefix of prompt, under the
+  /// identity prompt has at that length, and longer than longer_than tokens.
+  [[nodiscard]] std::optional<LostCheckpoint> FindLost(
+      const TextModelRunner& runner, std::span<const TextRunnerToken> prompt,
+      std::span<const std::uint8_t> input_identity,
+      std::span<const ContinuationInputPrefix> input_prefixes,
+      std::size_t longer_than) noexcept {
+    try {
+      std::vector<LostCheckpoint> candidates;
+      {
+        const std::lock_guard lock(lost_mutex);
+        for (const auto* queue : {&lost_to_eviction, &lost_to_step}) {
+          for (const auto& lost : *queue) {
+            if (lost.token_count > longer_than &&
+                lost.token_count <= prompt.size())
+              candidates.push_back(lost);
+          }
+        }
+      }
+      if (candidates.empty())
+        return std::nullopt;
+      std::ranges::sort(candidates, {}, &LostCheckpoint::token_count);
+      std::optional<LostCheckpoint> best;
+      auto hash = kLostHashSeed;
+      std::size_t hashed = 0;
+      for (const auto& lost : candidates) {
+        for (; hashed < lost.token_count; ++hashed)
+          hash = MixLostHash(hash, prompt[hashed]);
+        if (lost.token_hash != hash)
+          continue;
+        const auto descriptor = DescriptorForInput(
+            runner, PrefixInputIdentity(input_identity, input_prefixes,
+                                        lost.token_count));
+        if (descriptor.persistence &&
+            LostKey(*descriptor.persistence) == lost.key)
+          best = lost;
+      }
+      return best;
+    } catch (...) {
+      return std::nullopt;
+    }
+  }
+
+  /// Length of the longest stored prefix of prompt that belongs to an identity
+  /// this request cannot use.
+  [[nodiscard]] std::size_t ForeignPrefixTokens(
+      const TextModelRunner& runner, std::span<const TextRunnerToken> prompt,
+      std::span<const std::uint8_t> input_identity,
+      std::span<const ContinuationInputPrefix> input_prefixes) {
+    std::vector<PersistenceKey> own;
+    VisitInputRanges(prompt.size(), input_identity, input_prefixes,
+                     [&](auto, auto, auto identity) {
+                       const auto descriptor =
+                           DescriptorForInput(runner, identity);
+                       if (descriptor.persistence)
+                         own.push_back(PrefixKey(*descriptor.persistence));
+                     });
+    std::size_t longest = 0;
+    for (auto& [key, root] : prefixes) {
+      if (std::ranges::find(own, key) != own.end())
+        continue;
+      const auto found = root.Find(prompt).longest;
+      if (found)
+        longest = std::max(longest, (*found)->tokens.size());
+    }
+    return longest;
   }
 
   /// Called with queue_mutex held. Report capacity rejection before allocation
@@ -1076,6 +1217,10 @@ struct ContinuationDiskStore::Impl {
     const std::size_t file_bytes = entry->file_bytes;
     const std::size_t payload_bytes = entry->payload_bytes;
     const std::size_t token_count = entry->tokens.size();
+    if (reason == ContinuationDiskEventReason::kLru) {
+      RememberLost(entry->persistence, entry->tokens,
+                   ContinuationDiskEventReason::kEvicted);
+    }
     EraseIndex(entry);
     retained -= file_bytes;
     entries.erase(entry);
@@ -1279,6 +1424,8 @@ struct ContinuationDiskStore::Impl {
     // construction.
     if (!shared_prefix &&
         WithinCheckpointStep(runner, checkpoint_tokens, input_identity)) {
+      RememberLost(*descriptor.persistence, checkpoint_tokens,
+                   ContinuationDiskEventReason::kMinStep);
       Emit(ContinuationDiskEventAction::kSkipped,
            ContinuationDiskEventReason::kMinStep, 0, 0,
            checkpoint_tokens.size());
@@ -1353,6 +1500,7 @@ struct ContinuationDiskStore::Impl {
     prefixes[PrefixKey(added->persistence)].Insert(added->tokens, added);
     retained += file_bytes;
     retained_entries.fetch_add(1, std::memory_order_relaxed);
+    ForgetLost(added->persistence, added->tokens);
     Emit(ContinuationDiskEventAction::kStored,
          ContinuationDiskEventReason::kSaved, file_bytes, payload_bytes,
          checkpoint_tokens.size(),
@@ -1401,9 +1549,14 @@ struct ContinuationDiskStore::Impl {
       std::size_t stable_prefix_tokens,
       std::span<const ContinuationInputPrefix> input_prefixes) {
     const auto descriptor = DescriptorForInput(runner, input_identity);
+    const auto miss = [&](ContinuationDiskEventReason reason,
+                          std::size_t file_bytes, std::size_t payload_bytes,
+                          std::size_t token_count) {
+      Emit(ContinuationDiskEventAction::kMiss, reason, file_bytes,
+           payload_bytes, token_count, 0.0, 0, prompt.size());
+    };
     if (!descriptor.persistence.has_value()) {
-      Emit(ContinuationDiskEventAction::kMiss,
-           ContinuationDiskEventReason::kUnsupported, 0, 0, 0);
+      miss(ContinuationDiskEventReason::kUnsupported, 0, 0, 0);
       return {};
     }
 
@@ -1411,8 +1564,15 @@ struct ContinuationDiskStore::Impl {
       const EntryIterator candidate = FindLongestInputCandidate(
           runner, prompt, input_identity, input_prefixes);
       if (candidate == entries.end()) {
-        Emit(ContinuationDiskEventAction::kMiss,
-             ContinuationDiskEventReason::kNotFound, 0, 0, 0);
+        if (const auto lost =
+                FindLost(runner, prompt, input_identity, input_prefixes, 0)) {
+          miss(lost->reason, 0, 0, lost->token_count);
+        } else if (const auto foreign = ForeignPrefixTokens(
+                       runner, prompt, input_identity, input_prefixes)) {
+          miss(ContinuationDiskEventReason::kIdentityMismatch, 0, 0, foreign);
+        } else {
+          miss(ContinuationDiskEventReason::kNotFound, 0, 0, 0);
+        }
         return {};
       }
       if (stable_prefix_tokens != 0 &&
@@ -1420,8 +1580,9 @@ struct ContinuationDiskStore::Impl {
           FindLongestInputCandidate(runner, prompt.first(stable_prefix_tokens),
                                     input_identity,
                                     input_prefixes) == entries.end()) {
-        Emit(ContinuationDiskEventAction::kMiss,
-             ContinuationDiskEventReason::kNotFound, 0, 0, 0);
+        miss(ContinuationDiskEventReason::kStableBoundary,
+             candidate->file_bytes, candidate->payload_bytes,
+             candidate->tokens.size());
         return {};
       }
 
@@ -1433,8 +1594,7 @@ struct ContinuationDiskStore::Impl {
         const std::size_t payload_bytes = candidate->payload_bytes;
         const std::size_t token_count = candidate->tokens.size();
         const bool removed = RemoveEntry(candidate, failure_reason);
-        Emit(ContinuationDiskEventAction::kMiss, failure_reason, file_bytes,
-             payload_bytes, token_count);
+        miss(failure_reason, file_bytes, payload_bytes, token_count);
         if (!removed)
           return {};
         continue;
@@ -1454,8 +1614,7 @@ struct ContinuationDiskStore::Impl {
         const std::size_t payload_bytes = candidate->payload_bytes;
         const std::size_t token_count = candidate->tokens.size();
         const bool removed = RemoveEntry(candidate, reason);
-        Emit(ContinuationDiskEventAction::kMiss, reason, file_bytes,
-             payload_bytes, token_count);
+        miss(reason, file_bytes, payload_bytes, token_count);
         if (!removed)
           return {};
         continue;
@@ -1472,13 +1631,17 @@ struct ContinuationDiskStore::Impl {
         const std::size_t token_count = candidate->tokens.size();
         (void)RemoveEntry(candidate,
                           ContinuationDiskEventReason::kRestoreFailure);
-        Emit(ContinuationDiskEventAction::kMiss,
-             ContinuationDiskEventReason::kRestoreFailure, file_bytes,
+        miss(ContinuationDiskEventReason::kRestoreFailure, file_bytes,
              payload_bytes, token_count);
         return {};
       }
 
       TouchEntry(candidate);
+      // A shorter hit hides the loss of a longer checkpoint: the request
+      // re-reads everything past this one. Name that loss too.
+      if (const auto lost = FindLost(runner, prompt, input_identity,
+                                     input_prefixes, candidate->tokens.size()))
+        miss(lost->reason, 0, 0, lost->token_count);
       Emit(ContinuationDiskEventAction::kRestored,
            ContinuationDiskEventReason::kHit, candidate->file_bytes,
            candidate->payload_bytes, candidate->tokens.size());
@@ -1575,6 +1738,9 @@ struct ContinuationDiskStore::Impl {
   std::map<PersistenceKey, PrefixNode> prefixes;
   std::atomic<std::size_t> retained{0};
   std::atomic<std::size_t> retained_entries{0};
+  std::mutex lost_mutex;
+  std::deque<LostCheckpoint> lost_to_eviction;
+  std::deque<LostCheckpoint> lost_to_step;
   std::random_device random_device;
   std::uint64_t unique_counter{0};
   mutable std::mutex queue_mutex;
@@ -1708,7 +1874,8 @@ ContinuationDiskStore::RestoreLongestPrefix(
   const ScopedOperationPermit permit(impl_->operation_gate, false);
   if (!permit) {
     impl_->Emit(ContinuationDiskEventAction::kMiss,
-                ContinuationDiskEventReason::kBusy, 0, 0, prompt.size());
+                ContinuationDiskEventReason::kBusy, 0, 0, prompt.size(), 0.0, 0,
+                prompt.size());
     return {};
   }
   return impl_->RestoreLongestPrefix(runner, state, prompt, input_identity,
@@ -1743,7 +1910,15 @@ bool ContinuationDiskStore::WithinCheckpointStep(
   const ScopedOperationPermit permit(impl_->operation_gate, false);
   if (!permit)
     return false;
-  return impl_->WithinCheckpointStep(runner, tokens, input_identity);
+  if (!impl_->WithinCheckpointStep(runner, tokens, input_identity))
+    return false;
+  // Callers drop the checkpoint on this answer, so a later miss can name it.
+  if (const auto descriptor = DescriptorForInput(runner, input_identity);
+      descriptor.persistence) {
+    impl_->RememberLost(*descriptor.persistence, tokens,
+                        ContinuationDiskEventReason::kMinStep);
+  }
+  return true;
 }
 
 std::size_t ContinuationDiskStore::entry_count() const noexcept {

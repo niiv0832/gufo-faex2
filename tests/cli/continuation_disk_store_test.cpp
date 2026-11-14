@@ -1575,7 +1575,165 @@ void TestAsyncExactDuplicateRefreshesLru() {
          "exact duplicate admission refreshes LRU without replacing state");
 }
 
+// A miss names what happened to the checkpoint the prompt could have used.
+// Sanitized: only counts and the reason, never tokens or identities.
+void TestMissEventsNameTheirReason() {
+  using Action = ContinuationDiskEventAction;
+  using Reason = ContinuationDiskEventReason;
+  const auto last_miss = [](const std::vector<ContinuationDiskEvent>& events)
+      -> std::optional<ContinuationDiskEvent> {
+    for (auto event = events.rbegin(); event != events.rend(); ++event) {
+      if (event->action == Action::kMiss)
+        return *event;
+    }
+    return std::nullopt;
+  };
+
+  {
+    TemporaryDirectory directory;
+    const FakeRunner runner("12345678");
+    std::vector<ContinuationDiskEvent> events;
+    ContinuationDiskStore store(
+        StoreOptions(directory.path()),
+        [&](const auto& event) { events.push_back(event); });
+    auto state = runner.CreateState();
+    Expect(!RestoreTokens(store, runner, *state, {1, 2, 3}).restored,
+           "an empty store misses");
+    const auto miss = last_miss(events);
+    Expect(miss && miss->reason == Reason::kNotFound &&
+               miss->prompt_tokens == 3 && miss->token_count == 0,
+           "a prompt no checkpoint ever covered reports not_found");
+
+    Expect(SaveTokens(store, runner, {1, 2, 3}, *MakeSnapshot(runner, 1, 3))
+               .stored,
+           "one identity stores the prefix");
+    const FakeRunner other("87654321");
+    auto other_state = other.CreateState();
+    events.clear();
+    Expect(!RestoreTokens(store, other, *other_state, {1, 2, 3, 4}).restored,
+           "another identity misses");
+    const auto identity = last_miss(events);
+    Expect(identity && identity->reason == Reason::kIdentityMismatch &&
+               identity->token_count == 3 && identity->prompt_tokens == 4,
+           "the same tokens under another identity report identity");
+
+    events.clear();
+    Expect(!store
+                .RestoreLongestPrefix(runner, *state,
+                                      std::vector<TextRunnerToken>{1, 2, 3, 4},
+                                      {}, /*stable_prefix_tokens=*/2)
+                .restored,
+           "a checkpoint past the stable boundary needs an earlier fallback");
+    const auto boundary = last_miss(events);
+    Expect(boundary && boundary->reason == Reason::kStableBoundary &&
+               boundary->token_count == 3 && boundary->prompt_tokens == 4,
+           "a checkpoint rejected for its missing fallback reports "
+           "stable_boundary");
+  }
+
+  {
+    TemporaryDirectory directory;
+    const FakeRunner runner("12345678");
+    const std::size_t entry_bytes = ExpectedFileBytes(8, 2);
+    std::vector<ContinuationDiskEvent> events;
+    ContinuationDiskStore store(
+        StoreOptions(directory.path(), entry_bytes * 2, 4096),
+        [&](const auto& event) { events.push_back(event); });
+    Expect(
+        SaveTokens(store, runner, {1, 1}, *MakeSnapshot(runner, 1, 2)).stored &&
+            SaveTokens(store, runner, {2, 2}, *MakeSnapshot(runner, 2, 2))
+                .stored &&
+            SaveTokens(store, runner, {3, 3}, *MakeSnapshot(runner, 3, 2))
+                .stored,
+        "the third entry evicts the first");
+    auto state = runner.CreateState();
+    events.clear();
+    Expect(!RestoreTokens(store, runner, *state, {1, 1, 9}).restored,
+           "the evicted prefix misses");
+    const auto evicted = last_miss(events);
+    Expect(evicted && evicted->reason == Reason::kEvicted &&
+               evicted->token_count == 2 && evicted->prompt_tokens == 3,
+           "a prefix removed by the byte budget reports evicted");
+
+    events.clear();
+    Expect(!RestoreTokens(store, runner, *state, {5, 5, 9}).restored &&
+               last_miss(events)->reason == Reason::kNotFound,
+           "an unrelated prompt still reports not_found");
+
+    Expect(
+        SaveTokens(store, runner, {1, 1}, *MakeSnapshot(runner, 4, 2)).stored,
+        "the evicted prefix is stored again");
+    events.clear();
+    Expect(RestoreTokens(store, runner, *state, {1, 1, 9}).restored &&
+               !last_miss(events),
+           "a stored prefix forgets its earlier eviction");
+  }
+
+  {
+    TemporaryDirectory directory;
+    const FakeRunner runner("12345678");
+    const std::size_t entry_bytes = ExpectedFileBytes(8, 2);
+    std::vector<ContinuationDiskEvent> events;
+    auto options = StoreOptions(directory.path(), entry_bytes * 2, 4096);
+    options.min_checkpoint_step_tokens = 3;
+    ContinuationDiskStore store(
+        options, [&](const auto& event) { events.push_back(event); });
+    Expect(
+        SaveTokens(store, runner, {1, 2}, *MakeSnapshot(runner, 1, 2)).stored &&
+            !SaveTokens(store, runner, {1, 2, 3, 4},
+                        *MakeSnapshot(runner, 2, 4))
+                 .stored &&
+            SaveTokens(store, runner, {7, 8}, *MakeSnapshot(runner, 3, 2))
+                .stored &&
+            SaveTokens(store, runner, {9, 9}, *MakeSnapshot(runner, 4, 2))
+                .stored,
+        "a covered checkpoint is skipped and its covering prefix is evicted");
+    auto state = runner.CreateState();
+    events.clear();
+    Expect(!RestoreTokens(store, runner, *state, {1, 2, 3, 4, 5}).restored,
+           "neither the skipped checkpoint nor its prefix remains");
+    const auto skipped = last_miss(events);
+    Expect(skipped && skipped->reason == Reason::kMinStep &&
+               skipped->token_count == 4 && skipped->prompt_tokens == 5,
+           "the longest lost checkpoint was rejected by the minimum step");
+  }
+
+  {
+    TemporaryDirectory directory;
+    const FakeRunner runner("12345678");
+    std::vector<ContinuationDiskEvent> events;
+    const std::size_t budget =
+        ExpectedFileBytes(8, 2) + ExpectedFileBytes(8, 6);
+    ContinuationDiskStore store(
+        StoreOptions(directory.path(), budget, 4096),
+        [&](const auto& event) { events.push_back(event); });
+    Expect(
+        SaveTokens(store, runner, {1, 2}, *MakeSnapshot(runner, 1, 2)).stored &&
+            SaveTokens(store, runner, {1, 2, 3, 4, 5, 6},
+                       *MakeSnapshot(runner, 2, 6))
+                .stored,
+        "a short and a long prefix of one conversation fill the budget");
+    auto state = runner.CreateState();
+    Expect(RestoreTokens(store, runner, *state, {1, 2, 9}).restored,
+           "the short prefix becomes the most recently used");
+    Expect(
+        SaveTokens(store, runner, {8, 8}, *MakeSnapshot(runner, 3, 2)).stored,
+        "another conversation evicts the long prefix");
+    events.clear();
+    const auto restored =
+        RestoreTokens(store, runner, *state, {1, 2, 3, 4, 5, 6, 7});
+    Expect(restored.restored && restored.token_count == 2,
+           "the conversation resumes from its short prefix");
+    const auto partial = last_miss(events);
+    Expect(partial && partial->reason == Reason::kEvicted &&
+               partial->token_count == 6 && partial->prompt_tokens == 7 &&
+               events.back().action == Action::kRestored,
+           "a shorter hit still reports the longer checkpoint it lost");
+  }
+}
+
 int main() {
+  TestMissEventsNameTheirReason();
   TestAsyncMinimumStepDoesNotRetainSnapshots();
   TestAsyncMinimumStepReleasesForeignReservation();
   TestAsyncMinimumStepExemptions();

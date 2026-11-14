@@ -41,6 +41,13 @@ enum class ContinuationDiskEventReason : std::uint8_t {
   kSerializationFailure,
   kRestoreFailure,
   kBusy,
+  /// The byte budget removed the checkpoint this prompt could have restored.
+  kEvicted,
+  /// The same tokens are stored only under another compatibility identity.
+  kIdentityMismatch,
+  /// A stored checkpoint lies past the stable boundary without an earlier
+  /// fallback.
+  kStableBoundary,
 };
 
 /// Sanitized disk-cache event. Prompt contents, token values, paths, model
@@ -50,7 +57,11 @@ struct ContinuationDiskEvent {
   ContinuationDiskEventReason reason{ContinuationDiskEventReason::kNotFound};
   std::size_t file_bytes{0};
   std::size_t payload_bytes{0};
+  /// For a miss: the length of the checkpoint the reason refers to, zero when
+  /// no checkpoint is involved.
   std::size_t token_count{0};
+  /// Prompt length of the lookup that missed; zero for other events.
+  std::size_t prompt_tokens{0};
   std::size_t retained_bytes{0};
   std::size_t capacity_bytes{0};
   std::size_t staging_capacity_bytes{0};

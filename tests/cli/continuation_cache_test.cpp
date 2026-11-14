@@ -1363,7 +1363,100 @@ void TestNewBranchPreservesSharedSourceUnderBytePressure() {
          "the oldest unrelated continuation yields to the shared branch point");
 }
 
+// RAM misses name the cause when the prompt's own checkpoint existed and was
+// lost to the byte budget, or exists and is unusable without its fallback.
+void TestMissReasonNamesEvictionAndStableBoundary() {
+  using Tokens = std::vector<gufo::server::ContinuationToken>;
+  std::vector<std::size_t> invalidations(2);
+  std::size_t next_id = 0;
+  const auto make_cache = [&](std::size_t capacity_bytes) {
+    next_id = 0;
+    return std::make_unique<gufo::server::ContinuationCache>(
+        2,
+        [&] { return std::make_unique<FakeState>(next_id++, &invalidations); },
+        gufo::server::ContinuationCache::SnapshotSupport{
+            .restore =
+                [](gufo::server::ContinuationState& state,
+                   const gufo::server::ContinuationSnapshot& snapshot) {
+                  dynamic_cast<FakeState&>(state).value =
+                      dynamic_cast<const FakeSnapshot&>(snapshot).value;
+                },
+            .capacity_bytes = [capacity_bytes] { return capacity_bytes; },
+            .on_event = {},
+        });
+  };
+
+  {
+    auto cache = make_cache(12);
+    {
+      auto first = cache->Acquire(Tokens{1, 2, 3});
+      Expect(first.TryReserveSnapshot(8, 3) &&
+                 first.Commit({1, 2, 3},
+                              std::make_unique<FakeSnapshot>(7, 8)) == 8,
+             "the first conversation is retained");
+    }
+    {
+      auto second = cache->Acquire(Tokens{9, 8, 7});
+      Expect(second.TryReserveSnapshot(12, 3) &&
+                 second.Commit({9, 8, 7},
+                               std::make_unique<FakeSnapshot>(9, 12)) == 12,
+             "the second conversation evicts the first by bytes");
+    }
+    {
+      auto returning = cache->Acquire(Tokens{1, 2, 3, 4});
+      Expect(!returning.cache_hit() &&
+                 returning.lookup().miss_reason == "evicted" &&
+                 returning.lookup().common_prefix_tokens == 3 &&
+                 returning.lookup().checkpoint_tokens == 3,
+             "a prompt whose checkpoint the byte budget removed reports "
+             "evicted");
+      returning.Invalidate();
+    }
+    {
+      auto unrelated = cache->Acquire(Tokens{5, 5});
+      Expect(!unrelated.cache_hit() &&
+                 unrelated.lookup().miss_reason == "prefix_changed",
+             "an unrelated prompt keeps its previous reason");
+      unrelated.Invalidate();
+    }
+    {
+      auto restored = cache->Acquire(Tokens{1, 2, 3});
+      Expect(restored.TryReserveSnapshot(12, 3) &&
+                 restored.Commit({1, 2, 3},
+                                 std::make_unique<FakeSnapshot>(7, 12)) == 12,
+             "the first conversation is retained again");
+    }
+    {
+      auto hit = cache->Acquire(Tokens{1, 2, 3, 4});
+      Expect(hit.cache_hit() && hit.lookup().miss_reason.empty(),
+             "a retained checkpoint forgets its earlier eviction");
+      hit.Invalidate();
+    }
+  }
+
+  {
+    auto cache = make_cache(64);
+    {
+      auto full = cache->Acquire(Tokens{1, 2, 3, 4});
+      Expect(full.TryReserveSnapshot(8, 4) &&
+                 full.Commit({1, 2, 3, 4},
+                             std::make_unique<FakeSnapshot>(7, 8)) == 8,
+             "a full-prompt checkpoint is retained without a fallback");
+    }
+    auto bounded = cache->Acquire(Tokens{1, 2, 3, 4, 5}, {}, {}, {}, true,
+                                  /*stable_prefix_tokens=*/2);
+    Expect(!bounded.cache_hit() &&
+               bounded.lookup().miss_reason == "stable_prefix_boundary" &&
+               bounded.lookup().common_prefix_tokens == 4 &&
+               bounded.lookup().checkpoint_tokens == 4,
+           "a checkpoint unusable without an earlier fallback reports the "
+           "stable boundary");
+    bounded.Invalidate();
+  }
+}
+
 int main() {
+  TestMissReasonNamesEvictionAndStableBoundary();
   TestAppendedImagesReuseOnlyCompatiblePrefixes();
   TestImageIdentityIsolation();
   TestColdMissThenExactExtensionHit();

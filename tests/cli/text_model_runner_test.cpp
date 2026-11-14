@@ -1065,10 +1065,25 @@ void TestPersistentSnapshotRestoresAcrossPools() {
   auto incompatible = std::make_shared<PersistentSnapshotRunner>(
       incompatible_stats, "artifact-B");
   TextRunnerPool incompatible_pool(incompatible, 1, disk_cache);
+  std::ostringstream miss_log;
+  auto* previous = std::clog.rdbuf(miss_log.rdbuf());
   auto miss = incompatible_pool.Acquire({1, 2, 3, 4});
+  auto unknown = restarted.Acquire({9, 9, 9});
+  std::clog.rdbuf(previous);
   Expect(!miss.cache_hit() && !miss.cache_disk_hit(),
          "changed compatibility identity is a cold miss");
+  Expect(miss_log.str().find("[INFO] [cache] event=disk_cache action=miss "
+                             "reason=identity ") != std::string::npos &&
+             miss_log.str().find(" tokens=3 prompt_tokens=4 ") !=
+                 std::string::npos,
+         "the server log names the reason of an identity miss");
+  Expect(miss_log.str().find("[INFO] [cache] event=disk_cache action=miss "
+                             "reason=not_found ") != std::string::npos &&
+             miss_log.str().find(" tokens=0 prompt_tokens=3 ") !=
+                 std::string::npos,
+         "the server log reports a prompt no checkpoint covers");
   miss.Invalidate();
+  unknown.Invalidate();
 }
 
 void TestPromptReuseCanBeDisabledPerRequest() {

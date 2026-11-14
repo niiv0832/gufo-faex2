@@ -460,17 +460,29 @@ std::string_view DiskEventReasonName(
       return "restore_failure";
     case ContinuationDiskEventReason::kBusy:
       return "busy";
+    case ContinuationDiskEventReason::kEvicted:
+      return "evicted";
+    case ContinuationDiskEventReason::kIdentityMismatch:
+      return "identity";
+    case ContinuationDiskEventReason::kStableBoundary:
+      return "stable_boundary";
   }
   return "unknown";
 }
 
 void EmitDiskEvent(const ContinuationDiskEvent& event) noexcept {
+  // Every miss is reported with its reason: a full re-read of a long history
+  // must be attributable from the log alone.
+  const bool miss = event.action == ContinuationDiskEventAction::kMiss;
   switch (event.reason) {
     case ContinuationDiskEventReason::kHit:
-    case ContinuationDiskEventReason::kNotFound:
     case ContinuationDiskEventReason::kExactReplacement:
-    case ContinuationDiskEventReason::kBusy:
       return;
+    case ContinuationDiskEventReason::kNotFound:
+    case ContinuationDiskEventReason::kBusy:
+      if (!miss)
+        return;
+      break;
     case ContinuationDiskEventReason::kByteCapacity:
       if (event.action == ContinuationDiskEventAction::kRemoved)
         return;
@@ -484,13 +496,25 @@ void EmitDiskEvent(const ContinuationDiskEvent& event) noexcept {
          << " reason=" << DiskEventReasonName(event.reason)
          << " file_bytes=" << event.file_bytes
          << " payload_bytes=" << event.payload_bytes
-         << " tokens=" << event.token_count
-         << " retained_bytes=" << event.retained_bytes
+         << " tokens=" << event.token_count;
+    if (miss)
+      line << " prompt_tokens=" << event.prompt_tokens;
+    line << " retained_bytes=" << event.retained_bytes
          << " capacity_bytes=" << event.capacity_bytes
          << " staging_capacity_bytes=" << event.staging_capacity_bytes
          << " staging_used_bytes=" << event.staging_used_bytes;
     if (event.reason == ContinuationDiskEventReason::kSaved) {
       line << " write_ms=" << event.elapsed_ms;
+      Logger::Info("cache", line.str());
+    } else if (miss &&
+               (event.reason == ContinuationDiskEventReason::kNotFound ||
+                event.reason == ContinuationDiskEventReason::kBusy ||
+                event.reason == ContinuationDiskEventReason::kEvicted ||
+                event.reason ==
+                    ContinuationDiskEventReason::kIdentityMismatch ||
+                event.reason == ContinuationDiskEventReason::kStableBoundary ||
+                event.reason == ContinuationDiskEventReason::kMinStep)) {
+      // The lookup worked as designed and found nothing it may use.
       Logger::Info("cache", line.str());
     } else if (event.reason == ContinuationDiskEventReason::kLru ||
                event.reason == ContinuationDiskEventReason::kMinStep) {

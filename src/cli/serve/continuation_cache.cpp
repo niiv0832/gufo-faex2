@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
+#include <deque>
 #include <limits>
 #include <mutex>
 #include <optional>
@@ -40,6 +41,31 @@ int MaxRemovalPriority(SnapshotPurpose purpose) {
       return 3;
   }
   return 0;
+}
+
+/// A checkpoint removed under capacity pressure, kept only to name the reason
+/// of a later miss. Hashes stand in for tokens and identity: a collision can
+/// mislabel a miss reason and nothing else.
+struct LostCheckpoint {
+  std::size_t token_count{0};
+  std::uint64_t token_hash{0};
+  std::uint64_t identity_hash{0};
+};
+
+constexpr std::size_t kMaxLostCheckpoints = 256;
+constexpr std::uint64_t kLostHashSeed = 0xcbf29ce484222325ULL;
+
+std::uint64_t MixLostHash(std::uint64_t hash, std::uint64_t value) noexcept {
+  hash ^= value + 0x9e3779b97f4a7c15ULL + (hash << 6U) + (hash >> 2U);
+  return hash * 0x100000001b3ULL;
+}
+
+template<typename Range>
+std::uint64_t LostHash(const Range& values) noexcept {
+  auto hash = kLostHashSeed;
+  for (const auto value : values)
+    hash = MixLostHash(hash, value);
+  return hash;
 }
 
 void EmitSnapshotEvents(const ContinuationCache::SnapshotEventSink& sink,
@@ -89,6 +115,32 @@ struct ContinuationCache::Impl {
   std::size_t snapshot_capacity_bytes{0};
   std::size_t retained_snapshot_bytes{0};
   std::size_t reserved_snapshot_bytes{0};
+  std::deque<LostCheckpoint> lost;
+
+  /// Called with mutex held, before the entry's tokens are cleared.
+  void RememberLost(const Entry& entry) noexcept {
+    try {
+      lost.push_back({entry.tokens.size(), LostHash(entry.tokens),
+                      LostHash(entry.input_identity)});
+      if (lost.size() > kMaxLostCheckpoints)
+        lost.pop_front();
+    } catch (...) {
+      // Diagnostics must not affect cache operation.
+    }
+  }
+
+  /// Called with mutex held when tokens are retained again.
+  void ForgetLost(const Entry& entry) noexcept {
+    if (lost.empty())
+      return;
+    const LostCheckpoint retained{entry.tokens.size(), LostHash(entry.tokens),
+                                  LostHash(entry.input_identity)};
+    std::erase_if(lost, [&](const LostCheckpoint& other) {
+      return other.token_count == retained.token_count &&
+             other.token_hash == retained.token_hash &&
+             other.identity_hash == retained.identity_hash;
+    });
+  }
 
   [[nodiscard]] bool snapshot_mode() const noexcept {
     return static_cast<bool>(snapshot_support.restore);
@@ -559,6 +611,42 @@ ContinuationCache::Lease ContinuationCache::Acquire(
             inspect(entry->tokens, entry->input_identity);
           inspect(entry->live_tokens, entry->live_identity);
         }
+        // A retained exact prefix that only the stable boundary rejects is
+        // neither a changed prompt nor a changed input.
+        for (const auto& entry : impl_->entries) {
+          if (entry->valid && (impl_->snapshot_mode() || entry->available) &&
+              entry->tokens.size() >= lookup.common_prefix_tokens &&
+              !can_reuse(entry->tokens.size()) &&
+              matches_input(entry->input_identity, entry->tokens.size()) &&
+              IsPrefix(entry->tokens, prompt)) {
+            lookup = {"stable_prefix_boundary", entry->tokens.size(),
+                      entry->tokens.size()};
+          }
+        }
+        // The prompt's own checkpoint existed and capacity pressure removed
+        // it: report that when it covered more than anything still retained.
+        if (lookup.miss_reason != "stable_prefix_boundary" &&
+            !impl_->lost.empty()) {
+          std::vector<LostCheckpoint> candidates;
+          for (const auto& lost : impl_->lost) {
+            if (lost.token_count > lookup.common_prefix_tokens &&
+                lost.token_count <= prompt.size())
+              candidates.push_back(lost);
+          }
+          std::ranges::sort(candidates, {}, &LostCheckpoint::token_count);
+          auto hash = kLostHashSeed;
+          std::size_t hashed = 0;
+          for (const auto& lost : candidates) {
+            for (; hashed < lost.token_count; ++hashed)
+              hash = MixLostHash(hash, prompt[hashed]);
+            if (lost.token_hash == hash &&
+                lost.identity_hash ==
+                    LostHash(PrefixInputIdentity(input_identity, input_prefixes,
+                                                 lost.token_count))) {
+              lookup = {"evicted", lost.token_count, lost.token_count};
+            }
+          }
+        }
       }
     }
     std::size_t selected = live_hit ? live_source : source;
@@ -897,6 +985,8 @@ bool ContinuationCache::ReserveSnapshot(
         auto& entry = *impl_->entries[target];
         const std::size_t removed_bytes = entry.snapshot_bytes;
         const std::size_t removed_tokens = entry.tokens.size();
+        if (reason == SnapshotEventReason::kByteCapacity)
+          impl_->RememberLost(entry);
         removed_snapshots.push_back(std::move(entry.snapshot));
         entry.tokens.clear();
         entry.snapshot_bytes = 0;
@@ -1135,6 +1225,8 @@ std::size_t ContinuationCache::Commit(
           if (snapshot_entry.snapshot != nullptr) {
             const std::size_t removed_bytes = snapshot_entry.snapshot_bytes;
             const std::size_t removed_tokens = snapshot_entry.tokens.size();
+            if (!exact_replacement)
+              impl_->RememberLost(snapshot_entry);
             removed_snapshots.push_back(std::move(snapshot_entry.snapshot));
             impl_->retained_snapshot_bytes -= removed_bytes;
             snapshot_entry.tokens.clear();
@@ -1161,6 +1253,7 @@ std::size_t ContinuationCache::Commit(
             snapshot_entry.purpose =
                 learned ? SnapshotPurpose::kBranchPoint : purpose;
             snapshot_entry.valid = !snapshot_entry.tokens.empty();
+            impl_->ForgetLost(snapshot_entry);
             snapshot_entry.snapshot_last_used = ++impl_->clock;
             impl_->retained_snapshot_bytes += snapshot_bytes;
             retained_bytes = snapshot_bytes;
