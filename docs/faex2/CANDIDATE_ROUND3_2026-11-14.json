@@ -1,17 +1,20 @@
 {
   "schema": "gufo-faex2.candidate.v1",
   "date": "2026-11-14",
-  "prepared_at": "2026-11-14T21:40:00+03:00",
-  "status": "PREPARED_NOT_ACCEPTED",
-  "document_status": "ROUND3_MEASURED_NOT_QUALIFIED_PENDING_OWNER_DECISIONS",
-  "ready_for_deployment": false,
+  "prepared_at": "2026-11-14T21:09:00+03:00",
+  "status": "APPROVED_BY_OWNER_NOT_DEPLOYED",
+  "document_status": "ROUND3_MEASURED_OWNER_APPROVED_CUTOVER_PENDING_WINDOW",
+  "ready_for_deployment": true,
   "deployment_performed": false,
-  "ready_for_deployment_note": "По формальному условию плана третьего круга этапы 2–7 закрыты. Значение false оставлено исполнителем, потому что остаются перечисленные blocking_reasons: решения владельца (правило раннего отказа, контракт качества), неготовый комплект launcher и отсутствие разрешения на перевод. Менять значение — решение владельца.",
+  "ready_for_deployment_note": "Решение владельца от 2026-11-14 (около 21:30 MSK): кандидат abbfb006/e760a663 одобрен к переводу в рабочие. Значение true выставлено по этому решению, а не по выводу исполнителя: общая приёмка качества не объявлена. Перевод не выполнен; выполняется только в согласованное с владельцем окно.",
   "authorization": {
-    "scope": "Доработки, сборки и приёмочные проверки с возвратом прежнего main; без назначения кандидата рабочим и публикации.",
+    "scope": "Перевод кандидата abbfb006/e760a663 в рабочие в согласованное окно с сохранением 1195d154/e319b5f5 для возврата; публикация ветки faex2.",
     "owner_quality_acceptance": false,
-    "owner_deployment_approval": false,
-    "historical_approvals_apply": false
+    "owner_deployment_approval": true,
+    "owner_deployment_approval_applies_to_binary_sha256": "e760a663f8dd75ea3d89b46ac8edab9ec4a56ba50829df22ed53e1bb57e3e3b6",
+    "owner_push_approval": true,
+    "historical_approvals_apply": false,
+    "decided_at": "2026-11-14"
   },
   "candidate": {
     "source_sha": "abbfb006db834e67ec8b6ebfeb95fd690b5f91e7",
@@ -171,8 +174,8 @@
       "candidate": "4 pass / 0 fail, 15 цепочек",
       "control": "4 pass / 0 fail, 14 цепочек",
       "sessions": [
-        "/Users/vlad/gufo-agent-runs/round3-candidate",
-        "/Users/vlad/gufo-agent-runs/round3-control"
+        "~/gufo-agent-runs/round3-candidate",
+        "~/gufo-agent-runs/round3-control"
       ],
       "pi": "NOT_EXERCISED — по решению владельца от 2026-11-14 заменён OpenCode",
       "ref": ".local/remed-20261113/round3/stage6/README.md",
@@ -200,49 +203,9 @@
   },
   "blocking_reasons": [
     {
-      "id": "QUALITY_CONTRACT",
-      "status": "DRAFT_NOT_APPROVED",
-      "reason": "Контракт точности чтения запроса не утверждён; проверка зрения «continued image cache differs from cold prefill» падает. Нужен выбор владельца (варианты A–C, stage8/README.md §5)."
-    },
-    {
-      "id": "EARLY_SKIP_RULE",
-      "status": "OWNER_DECISION_PENDING",
-      "reason": "Варианты B и C меняют код и требуют новой сборки и повторения тестов, скорости и памяти; вариант A оставляет кандидата как есть."
-    },
-    {
-      "id": "CONTINUATION_CACHE",
-      "status": "OPEN_OBSERVATION",
-      "reason": "Причина двух полных перечитываний final2 не установлена; явление повторилось у рабочего бинарника (2 из 736), у кандидата за два часа — нет, но разница статистически неразличима (p=0,23)."
-    },
-    {
-      "id": "SPEED_NOISE",
-      "status": "NO_CONFIRMED_REGRESSION_19_CELLS_NOISE",
-      "reason": "Подтверждённых замедлений нет; 19 ячеек остались шумом, ячейки записи кэша по букве правила UNMATCHED_WORK."
-    },
-    {
-      "id": "AGENT_SCOPE",
-      "status": "SHORT_SCENARIO_SINGLE_RUN",
-      "reason": "OpenCode: по одному короткому прогону на бинарник; pi не исполнялся по решению владельца."
-    },
-    {
-      "id": "MEMORY_SCOPE",
-      "status": "THREE_HOURS_NOT_24_7",
-      "reason": "Память проверена тремя часовыми прогонами одной нагрузки; длительная работа (сутки и более) не проверялась."
-    },
-    {
-      "id": "CACHE_COLD_AFTER_SWITCH",
-      "status": "EXPECTED_NOT_MEASURED",
-      "reason": "Численная идентичность кэша кандидата отличается от рабочего бинарника: после перевода дисковый кэш начнёт заполняться заново, первые запросы длинных историй будут прочитаны целиком. Не измерялось."
-    },
-    {
       "id": "CUTOVER",
-      "status": "NOT_AUTHORIZED",
-      "reason": "Комплект launcher/recovery для этого кандидата не сгенерирован и не проверен; нужно отдельное одобрение владельца именно этого кандидата."
-    },
-    {
-      "id": "INDEPENDENT_REVIEW",
-      "status": "DONE_WITH_OPEN_NOTES",
-      "reason": "Независимая проверка выполнена 2026-11-14: блокирующих дефектов кода нет, числа этапов 4–7 сошлись, критерии не менялись; замечания к документам исправлены. Открытые замечания к коду без правки (правка изменила бы исходники кандидата и потребовала бы новой сборки): недостижимая проверка в 767c6018; строка miss при итоговом попадании в fb816341; неточный комментарий о запасе в persistent_snapshot_mtp_stream_test.cpp. Не проверялось рецензентом: сырые отсчёты памяти, summary этапов 2–3, содержимое сессий OpenCode (их проверял отдельный помощник), документы LLM_FAEX2."
+      "status": "APPROVED_KIT_NOT_PREPARED_WINDOW_NOT_AGREED",
+      "reason": "Перевод одобрен владельцем. Осталось: подготовить и проверить комплект launcher/recovery; согласовать с владельцем дату и длительность окна."
     }
   ],
   "cache_compatibility": {
@@ -269,7 +232,7 @@
     "without_rebuild": true
   },
   "procedure_ref": "docs/faex2/CANDIDATE_SWITCH_ROUND3_2026-11-14.md",
-  "procedure_status": "DRAFT_NOT_GENERATED_NOT_INSTALLED_NOT_AUTHORIZED",
+  "procedure_status": "APPROVED_BY_OWNER_KIT_NOT_GENERATED_NOT_INSTALLED",
   "legacy_manifest": {
     "path": "docs/faex2/CANDIDATE_2026-11-14.json",
     "sha256_at_preparation": "9801b9e3dd742b5629842c1883f486c727aa124323d418e19577bc4abda51971",
@@ -362,5 +325,84 @@
     "mode": "read-only",
     "blocking_findings": 0,
     "ref": ".local/remed-20261113/round3/stage10/REVIEW.md"
+  },
+  "updated_at": "2026-11-14T21:40:00+03:00",
+  "owner_decisions_2026_11_14": [
+    {
+      "id": "EARLY_SKIP_RULE",
+      "decision": "Оставить как есть",
+      "known_limit": "15-минутные срезы, один прогон на ячейку; длительное измерение не заказывалось"
+    },
+    {
+      "id": "QUALITY_CONTRACT",
+      "decision": "Остаётся черновиком; качество приближённого чтения осознанно «не принято»; не блокирует перевод; падающая проверка зрения — известное состояние"
+    },
+    {
+      "id": "CUTOVER",
+      "decision": "Кандидат одобрен к переводу; комплект launcher по проекту переключения; окно согласуется заранее; при расхождении немедленный возврат без пересборки"
+    },
+    {
+      "id": "CONTINUATION_CACHE",
+      "decision": "Причину длительным прогоном не искать; стендовые прогоны без плана доработки прекращаются; наблюдение в работе"
+    },
+    {
+      "id": "REVIEW_CODE_NOTES",
+      "decision": "Три замечания к коду — в следующую сборку: сначала перевод abbfb006 как есть, затем правки, новая сборка, повтор затронутых измерений, второй перевод"
+    },
+    {
+      "id": "PUSH",
+      "decision": "Публикация ветки faex2 и документации разрешена"
+    }
+  ],
+  "known_limits_accepted_by_owner": [
+    {
+      "id": "QUALITY_CONTRACT",
+      "status": "ACCEPTED_AS_NOT_ACCEPTED_BY_OWNER",
+      "reason": "Контракт точности чтения запроса не утверждён; проверка зрения «continued image cache differs from cold prefill» падает. Нужен выбор владельца (варианты A–C, stage8/README.md §5)."
+    },
+    {
+      "id": "EARLY_SKIP_RULE",
+      "status": "DECIDED_KEEP",
+      "reason": "Варианты B и C меняют код и требуют новой сборки и повторения тестов, скорости и памяти; вариант A оставляет кандидата как есть."
+    },
+    {
+      "id": "CONTINUATION_CACHE",
+      "status": "OPEN_OBSERVATION_ACCEPTED_BY_OWNER",
+      "reason": "Причина двух полных перечитываний final2 не установлена; явление повторилось у рабочего бинарника (2 из 736), у кандидата за два часа — нет, но разница статистически неразличима (p=0,23)."
+    },
+    {
+      "id": "SPEED_NOISE",
+      "status": "NO_CONFIRMED_REGRESSION_19_CELLS_NOISE__KNOWN_LIMIT_NOT_BLOCKING_BY_OWNER_DECISION",
+      "reason": "Подтверждённых замедлений нет; 19 ячеек остались шумом, ячейки записи кэша по букве правила UNMATCHED_WORK."
+    },
+    {
+      "id": "AGENT_SCOPE",
+      "status": "SHORT_SCENARIO_SINGLE_RUN__KNOWN_LIMIT_NOT_BLOCKING_BY_OWNER_DECISION",
+      "reason": "OpenCode: по одному короткому прогону на бинарник; pi не исполнялся по решению владельца."
+    },
+    {
+      "id": "MEMORY_SCOPE",
+      "status": "THREE_HOURS_NOT_24_7__KNOWN_LIMIT_NOT_BLOCKING_BY_OWNER_DECISION",
+      "reason": "Память проверена тремя часовыми прогонами одной нагрузки; длительная работа (сутки и более) не проверялась."
+    },
+    {
+      "id": "CACHE_COLD_AFTER_SWITCH",
+      "status": "EXPECTED_NOT_MEASURED__KNOWN_LIMIT_NOT_BLOCKING_BY_OWNER_DECISION",
+      "reason": "Численная идентичность кэша кандидата отличается от рабочего бинарника: после перевода дисковый кэш начнёт заполняться заново, первые запросы длинных историй будут прочитаны целиком. Не измерялось."
+    },
+    {
+      "id": "INDEPENDENT_REVIEW",
+      "status": "DONE_NOTES_GO_TO_NEXT_BUILD",
+      "reason": "Независимая проверка выполнена 2026-11-14: блокирующих дефектов кода нет, числа этапов 4–7 сошлись, критерии не менялись; замечания к документам исправлены. Открытые замечания к коду без правки (правка изменила бы исходники кандидата и потребовала бы новой сборки): недостижимая проверка в 767c6018; строка miss при итоговом попадании в fb816341; неточный комментарий о запасе в persistent_snapshot_mtp_stream_test.cpp. Не проверялось рецензентом: сырые отсчёты памяти, summary этапов 2–3, содержимое сессий OpenCode (их проверял отдельный помощник), документы LLM_FAEX2."
+    }
+  ],
+  "next_build_plan": {
+    "after_cutover_of": "abbfb006",
+    "changes": [
+      "убрать недостижимую проверку из 767c6018 или оформить её как защитную",
+      "строка disk_cache miss при итоговом попадании (fb816341)",
+      "комментарий о запасе в persistent_snapshot_mtp_stream_test.cpp"
+    ],
+    "requires": "новая сборка, повтор затронутых измерений, отдельное подтверждение владельца для нового бинарника"
   }
 }
