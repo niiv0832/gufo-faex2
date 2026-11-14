@@ -1724,9 +1724,14 @@ void TestMissEventsNameTheirReason() {
         RestoreTokens(store, runner, *state, {1, 2, 3, 4, 5, 6, 7});
     Expect(restored.restored && restored.token_count == 2,
            "the conversation resumes from its short prefix");
-    const auto partial = last_miss(events);
-    Expect(partial && partial->reason == Reason::kEvicted &&
-               partial->token_count == 6 && partial->prompt_tokens == 7 &&
+    // The request is a hit, so the lost longer checkpoint is reported as
+    // shadowed: counting miss events must count requests that found nothing.
+    Expect(!last_miss(events), "a shorter hit is not reported as a miss");
+    const auto shadowed = std::find_if(
+        events.begin(), events.end(),
+        [](const auto& event) { return event.action == Action::kShadowed; });
+    Expect(shadowed != events.end() && shadowed->reason == Reason::kEvicted &&
+               shadowed->token_count == 6 && shadowed->prompt_tokens == 7 &&
                events.back().action == Action::kRestored,
            "a shorter hit still reports the longer checkpoint it lost");
   }

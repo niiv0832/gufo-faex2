@@ -21,6 +21,9 @@ enum class ContinuationDiskEventAction : std::uint8_t {
   kMiss,
   kRemoved,
   kSkipped,
+  // A lookup restored a shorter checkpoint while a longer one for the same
+  // prompt had been lost. The request is a hit; the reason names that loss.
+  kShadowed,
 };
 
 enum class ContinuationDiskEventReason : std::uint8_t {

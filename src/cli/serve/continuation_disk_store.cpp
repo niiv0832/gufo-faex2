@@ -1638,10 +1638,12 @@ struct ContinuationDiskStore::Impl {
 
       TouchEntry(candidate);
       // A shorter hit hides the loss of a longer checkpoint: the request
-      // re-reads everything past this one. Name that loss too.
+      // re-reads everything past this one. Name that loss too, but not as a
+      // miss: this request is a hit.
       if (const auto lost = FindLost(runner, prompt, input_identity,
                                      input_prefixes, candidate->tokens.size()))
-        miss(lost->reason, 0, 0, lost->token_count);
+        Emit(ContinuationDiskEventAction::kShadowed, lost->reason, 0, 0,
+             lost->token_count, 0.0, 0, prompt.size());
       Emit(ContinuationDiskEventAction::kRestored,
            ContinuationDiskEventReason::kHit, candidate->file_bytes,
            candidate->payload_bytes, candidate->tokens.size());

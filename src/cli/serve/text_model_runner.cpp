@@ -421,6 +421,8 @@ std::string_view DiskEventActionName(
       return "removed";
     case ContinuationDiskEventAction::kSkipped:
       return "skipped";
+    case ContinuationDiskEventAction::kShadowed:
+      return "shadowed";
   }
   return "unknown";
 }
@@ -473,7 +475,10 @@ std::string_view DiskEventReasonName(
 void EmitDiskEvent(const ContinuationDiskEvent& event) noexcept {
   // Every miss is reported with its reason: a full re-read of a long history
   // must be attributable from the log alone.
-  const bool miss = event.action == ContinuationDiskEventAction::kMiss;
+  // A shadowed event is the same lookup report for a request that still hit
+  // a shorter checkpoint; it is formatted and levelled like a miss.
+  const bool miss = event.action == ContinuationDiskEventAction::kMiss ||
+                    event.action == ContinuationDiskEventAction::kShadowed;
   switch (event.reason) {
     case ContinuationDiskEventReason::kHit:
     case ContinuationDiskEventReason::kExactReplacement:
