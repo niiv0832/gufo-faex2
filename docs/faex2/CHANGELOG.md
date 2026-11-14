@@ -4,6 +4,14 @@
 
 ## 2026-11-14
 
+### 03:01 MSK: начата часовая проверка обычной сборки b641
+
+- После независимого разбора cache5 новых correctness/ownership дефектов не обнаружено. Доказано раннее освобождение PINE после RAM eviction без очереди; общий эффект остаётся INCONCLUSIVE_MONITOR из-за target gap310,258ms и другого admission order. Рост restore на377,479ms и все24 timing flags сохранены, сравнительная скорость не принята.
+- Подготовлен и независимо проверен новый двухшаговый план `server-compose` + `compose` для ordinary `b641fe3e`/`ef7e3040`. SHA плана `1a320db88d7acfcfe482b451eaf9b98099c2c00ef15020b98028e5b4bb149001`, config `a1592a4df69e337f1b03d965b82fc18acb7308f4d502821e356aee89b846053a`. Nonce `6af771b5`, обе calibration и четыре fill совпали с final2; дальнейшие истории сравниваются по actual input SHA.
+- Новый `final3-review.py` сохраняет49 прежних guards и raw/memory алгоритмы, дополнительно отвергает чужой binary/source и неверные первые шесть входов. Пять CPU-тестов и независимое ревью прошли. Полный ledger сохраняет cold misses, partial C4 и отсутствующие поля; он не объявляет timing PASS.
+- Окно `codex-final3-b641` устойчиво запущено в tmux, ordinary PID906737, отдельный fresh cache. Час отсчитывается после fill и одного warmup, критерии памяти и5s cadence прежние. Результата пока нет. Finally возвращает прежний main; это не перевод кандидата.
+
+
 ### 02:53 MSK: cache5 завершён, main восстановлен; эффект пока INCONCLUSIVE
 
 - `b641fe3e` с диагностическим binary `5b804165` исполнил 14/14 запросов, job rc0. Независимо подтверждены main READY PID 903758, прежний `1195d154`/`e319b5f5`, exact request/identity/SHA и отсутствие тестовых моделей. Простой 752,171 с. Полные 162 файла сохранены, archive SHA `64d6f39caab51744a7c3f416a2a49cb7dbe97eecbd21373328ef23ba1c17c5c0`.
