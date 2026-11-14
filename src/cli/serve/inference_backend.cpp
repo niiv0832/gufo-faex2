@@ -925,6 +925,45 @@ public:
   std::unique_ptr<speculative::SpeculativeVerifierSnapshot> verifier_snapshot;
 };
 
+std::array<std::uint8_t, kQwenPersistentSnapshotHeaderBytes>
+MakeQwenPersistentSnapshotHeader(const QwenTextRunnerSnapshot& snapshot,
+                                 std::size_t gpu_payload_bytes,
+                                 std::size_t verifier_payload_bytes,
+                                 std::size_t expected_bytes) {
+  std::array<std::uint8_t, kQwenPersistentSnapshotHeaderBytes> header{};
+  std::fill_n(header.begin(), kQwenPersistentSnapshotHeaderBytes,
+              std::uint8_t{0});
+  std::copy(kQwenPersistentSnapshotMagic.begin(),
+            kQwenPersistentSnapshotMagic.end(), header.begin());
+  PutLittleEndian<std::uint32_t>(header, 8, kQwenPersistentPayloadVersion);
+  PutLittleEndian<std::uint32_t>(
+      header, 12,
+      static_cast<std::uint32_t>(kQwenPersistentSnapshotHeaderBytes));
+  PutLittleEndian<std::uint64_t>(header, 16,
+                                 static_cast<std::uint64_t>(snapshot.position));
+  PutLittleEndian<std::uint32_t>(header, 24, *snapshot.frontier);
+  PutLittleEndian<std::uint32_t>(
+      header, 28,
+      (snapshot.verifier_snapshot != nullptr ? kQwenPersistentSpeculativeFlag
+                                             : 0U) |
+          (!snapshot.pending_tokens.empty() ? kQwenPersistentPendingTokenFlag
+                                            : 0U));
+  PutLittleEndian<std::uint64_t>(
+      header, 32, static_cast<std::uint64_t>(snapshot.frontier_logits.size()));
+  PutLittleEndian<std::uint64_t>(header, 40,
+                                 static_cast<std::uint64_t>(gpu_payload_bytes));
+  PutLittleEndian<std::uint64_t>(header, 48,
+                                 static_cast<std::uint64_t>(expected_bytes));
+  PutLittleEndian<std::uint64_t>(
+      header, 56, static_cast<std::uint64_t>(verifier_payload_bytes));
+  PutLittleEndian<std::uint32_t>(
+      header, 64, static_cast<std::uint32_t>(snapshot.pending_tokens.size()));
+  for (std::size_t i = 0; i < snapshot.pending_tokens.size(); ++i)
+    PutLittleEndian<std::uint32_t>(header, 72 + i * sizeof(std::uint32_t),
+                                   snapshot.pending_tokens[i]);
+  return header;
+}
+
 QwenTextRunnerState& RequireQwenState(TextRunnerState& state) {
   auto* qwen = dynamic_cast<QwenTextRunnerState*>(&state);
   if (qwen == nullptr) {
@@ -1542,43 +1581,10 @@ public:
         qwen_snapshot->verifier_snapshot != nullptr
             ? qwen_snapshot->verifier_snapshot->PersistentPayloadBytes()
             : 0;
-    // Preserve zeroed reserved fields and unused pending-token slots without
-    // clearing the large payload that the serializers below overwrite.
-    std::fill_n(destination.begin(), kQwenPersistentSnapshotHeaderBytes,
-                std::uint8_t{0});
-    std::copy(kQwenPersistentSnapshotMagic.begin(),
-              kQwenPersistentSnapshotMagic.end(), destination.begin());
-    PutLittleEndian<std::uint32_t>(destination, 8,
-                                   kQwenPersistentPayloadVersion);
-    PutLittleEndian<std::uint32_t>(
-        destination, 12,
-        static_cast<std::uint32_t>(kQwenPersistentSnapshotHeaderBytes));
-    PutLittleEndian<std::uint64_t>(
-        destination, 16, static_cast<std::uint64_t>(qwen_snapshot->position));
-    PutLittleEndian<std::uint32_t>(destination, 24, *qwen_snapshot->frontier);
-    PutLittleEndian<std::uint32_t>(destination, 28,
-                                   (qwen_snapshot->verifier_snapshot != nullptr
-                                        ? kQwenPersistentSpeculativeFlag
-                                        : 0U) |
-                                       (!qwen_snapshot->pending_tokens.empty()
-                                            ? kQwenPersistentPendingTokenFlag
-                                            : 0U));
-    PutLittleEndian<std::uint64_t>(
-        destination, 32,
-        static_cast<std::uint64_t>(qwen_snapshot->frontier_logits.size()));
-    PutLittleEndian<std::uint64_t>(
-        destination, 40, static_cast<std::uint64_t>(gpu_payload_bytes));
-    PutLittleEndian<std::uint64_t>(destination, 48,
-                                   static_cast<std::uint64_t>(expected_bytes));
-    PutLittleEndian<std::uint64_t>(
-        destination, 56, static_cast<std::uint64_t>(verifier_payload_bytes));
-    PutLittleEndian<std::uint32_t>(
-        destination, 64,
-        static_cast<std::uint32_t>(qwen_snapshot->pending_tokens.size()));
-    for (std::size_t i = 0; i < qwen_snapshot->pending_tokens.size(); ++i)
-      PutLittleEndian<std::uint32_t>(destination,
-                                     72 + i * sizeof(std::uint32_t),
-                                     qwen_snapshot->pending_tokens[i]);
+    const auto header = MakeQwenPersistentSnapshotHeader(
+        *qwen_snapshot, gpu_payload_bytes, verifier_payload_bytes,
+        expected_bytes);
+    std::copy(header.begin(), header.end(), destination.begin());
     const std::size_t gpu_offset = kQwenPersistentSnapshotHeaderBytes;
     const std::size_t logits_offset =
         CheckedPersistentAdd(gpu_offset, gpu_payload_bytes);
@@ -1602,6 +1608,36 @@ public:
       }
     }
     return destination.size();
+  }
+
+  void StreamPersistentSnapshot(const TextRunnerSnapshot& snapshot,
+                                const SnapshotSink& sink) const override {
+    const auto expected_bytes = PersistentSnapshotPayloadBytes(snapshot);
+    const auto& qwen = static_cast<const QwenTextRunnerSnapshot&>(snapshot);
+    const auto target_bytes = qwen.snapshot->CompactPayloadBytes();
+    const auto verifier_bytes =
+        qwen.verifier_snapshot != nullptr
+            ? qwen.verifier_snapshot->PersistentPayloadBytes()
+            : 0;
+    const auto header = MakeQwenPersistentSnapshotHeader(
+        qwen, target_bytes, verifier_bytes, expected_bytes);
+    std::size_t written = 0;
+    const SnapshotSink checked = [&](auto bytes) {
+      if (bytes.size() > expected_bytes - written)
+        throw std::runtime_error(
+            "Qwen persistent stream exceeds its byte count");
+      core::StreamSnapshotBytes(bytes, sink);
+      written += bytes.size();
+    };
+    checked(header);
+    qwen.snapshot->StreamCompact(checked);
+    checked(std::span<const std::uint8_t>(
+        reinterpret_cast<const std::uint8_t*>(qwen.frontier_logits.data()),
+        qwen.frontier_logits.size() * sizeof(float)));
+    if (qwen.verifier_snapshot != nullptr)
+      qwen.verifier_snapshot->StreamPersistent(checked);
+    if (written != expected_bytes)
+      throw std::runtime_error("Qwen persistent stream byte count mismatch");
   }
 
   void RestorePersistentSnapshot(

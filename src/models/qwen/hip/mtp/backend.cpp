@@ -479,6 +479,10 @@ public:
   [[nodiscard]] std::span<const std::uint8_t> Payload() const noexcept {
     return payload_;
   }
+  void StreamPersistent(
+      const core::PersistentSnapshotSink& sink) const override {
+    core::StreamSnapshotBytes(payload_, sink);
+  }
 
 private:
   std::vector<std::uint8_t> payload_;

@@ -196,6 +196,37 @@ CompactSnapshotLayout MakeCompactSnapshotLayout(
   return layout;
 }
 
+std::array<std::uint8_t, kCompactSnapshotHeaderBytes> MakeCompactSnapshotHeader(
+    const CompactSnapshotLayout& layout, std::size_t image_count) {
+  std::array<std::uint8_t, kCompactSnapshotHeaderBytes> header{};
+  std::fill_n(header.begin(), kCompactSnapshotHeaderBytes, std::uint8_t{0});
+  std::copy(kCompactSnapshotMagic.begin(), kCompactSnapshotMagic.end(),
+            header.begin());
+  PutLittleEndian<std::uint32_t>(header, 8, (image_count == 0) ? 1U : 2U);
+  PutLittleEndian<std::uint32_t>(header, 72, image_count);
+  PutLittleEndian<std::uint32_t>(
+      header, 12, static_cast<std::uint32_t>(kCompactSnapshotHeaderBytes));
+  PutLittleEndian<std::uint32_t>(header, 16, layout.attention_layers);
+  PutLittleEndian<std::uint32_t>(header, 20, layout.kv_width);
+  PutLittleEndian<std::uint32_t>(header, 24, layout.max_context);
+  PutLittleEndian<std::uint32_t>(header, 28, layout.valid_context);
+  PutLittleEndian<std::uint32_t>(header, 32,
+                                 static_cast<std::uint32_t>(layout.kv_storage));
+  PutLittleEndian<std::uint32_t>(
+      header, 36, static_cast<std::uint32_t>(layout.recurrent_state_storage));
+  PutLittleEndian<std::uint64_t>(
+      header, 40,
+      static_cast<std::uint64_t>(layout.live_kv_elements_per_plane));
+  PutLittleEndian<std::uint64_t>(
+      header, 48, static_cast<std::uint64_t>(layout.conv_elements));
+  PutLittleEndian<std::uint64_t>(
+      header, 56, static_cast<std::uint64_t>(layout.deltanet_elements));
+  PutLittleEndian<std::uint64_t>(
+      header, 64, static_cast<std::uint64_t>(layout.total_bytes));
+
+  return header;
+}
+
 CompactSnapshotLayout ParseCompactSnapshotLayout(
     std::span<const std::uint8_t> payload) {
   if (payload.size() < kCompactSnapshotHeaderBytes ||
@@ -305,34 +336,9 @@ std::size_t QwenGpuSnapshot::SerializeCompact(
     throw std::invalid_argument(
         "Qwen compact snapshot destination size is invalid");
   }
-  // Only the header has reserved bytes. Every payload byte is overwritten
-  // below; clearing it first needlessly competes with inference for bandwidth.
-  std::fill_n(destination.begin(), kCompactSnapshotHeaderBytes,
-              std::uint8_t{0});
-  std::copy(kCompactSnapshotMagic.begin(), kCompactSnapshotMagic.end(),
-            destination.begin());
-  PutLittleEndian<std::uint32_t>(destination, 8,
-                                 vision_layout_.images.empty() ? 1U : 2U);
-  PutLittleEndian<std::uint32_t>(destination, 72, vision_layout_.images.size());
-  PutLittleEndian<std::uint32_t>(
-      destination, 12, static_cast<std::uint32_t>(kCompactSnapshotHeaderBytes));
-  PutLittleEndian<std::uint32_t>(destination, 16, attention_layers_);
-  PutLittleEndian<std::uint32_t>(destination, 20, kv_width_);
-  PutLittleEndian<std::uint32_t>(destination, 24, max_context_);
-  PutLittleEndian<std::uint32_t>(destination, 28, valid_context_);
-  PutLittleEndian<std::uint32_t>(destination, 32,
-                                 static_cast<std::uint32_t>(kv_storage_));
-  PutLittleEndian<std::uint32_t>(
-      destination, 36, static_cast<std::uint32_t>(recurrent_state_storage_));
-  PutLittleEndian<std::uint64_t>(
-      destination, 40,
-      static_cast<std::uint64_t>(layout.live_kv_elements_per_plane));
-  PutLittleEndian<std::uint64_t>(
-      destination, 48, static_cast<std::uint64_t>(layout.conv_elements));
-  PutLittleEndian<std::uint64_t>(
-      destination, 56, static_cast<std::uint64_t>(layout.deltanet_elements));
-  PutLittleEndian<std::uint64_t>(
-      destination, 64, static_cast<std::uint64_t>(layout.total_bytes));
+  const auto header =
+      MakeCompactSnapshotHeader(layout, vision_layout_.images.size());
+  std::copy(header.begin(), header.end(), destination.begin());
 
   SnapshotTransfer transfer;
   if (layout.live_kv_bytes_per_plane != 0) {
@@ -377,6 +383,87 @@ std::size_t QwenGpuSnapshot::SerializeCompact(
     PutLittleEndian<std::uint32_t>(destination, offset + 8, grid.width);
   }
   return destination.size();
+}
+
+void QwenGpuSnapshot::StreamCompact(
+    const core::PersistentSnapshotSink& sink) const {
+  if (full_attention_interval_ == 0 || attention_layers_ > num_layers_ ||
+      conv_elements_ != CheckedMultiply(num_layers_ - attention_layers_,
+                                        conv_elements_per_layer_) ||
+      deltanet_elements_ != CheckedMultiply(num_layers_ - attention_layers_,
+                                            deltanet_elements_per_layer_)) {
+    throw std::logic_error("Qwen compact snapshot metadata is invalid");
+  }
+  const auto layout = MakeCompactSnapshotLayout(
+      attention_layers_, kv_width_, max_context_, valid_context_, kv_storage_,
+      recurrent_state_storage_, conv_elements_, deltanet_elements_,
+      vision_layout_.images.size());
+  vision_layout_.Validate(max_context_);
+  std::size_t written = 0;
+  const auto emit = [&](std::span<const std::uint8_t> bytes) {
+    if (bytes.size() > layout.total_bytes - written)
+      throw std::runtime_error("Qwen compact stream exceeds its byte count");
+    sink(bytes);
+    written += bytes.size();
+  };
+  const auto header =
+      MakeCompactSnapshotHeader(layout, vision_layout_.images.size());
+  emit(header);
+
+  const auto largest_region =
+      std::max({layout.live_kv_bytes_per_plane, layout.conv_bytes,
+                layout.deltanet_bytes});
+  if (largest_region != 0) {
+    // HIP stream creation/copy also uses host heap. Leave headroom instead of
+    // assigning the entire callback ceiling to the device-transfer buffer.
+    constexpr std::size_t kDeviceScratchBytes = 8U * 1024U * 1024U;
+    static_assert(kDeviceScratchBytes <= core::kSnapshotStreamChunkBytes);
+    const auto scratch_bytes = std::min(largest_region, kDeviceScratchBytes);
+    // On any Copy/Finish exception, transfer drains before scratch is freed.
+    auto scratch =
+        std::make_unique_for_overwrite<std::uint8_t[]>(scratch_bytes);
+    SnapshotTransfer transfer;
+    const auto emit_device = [&](const void* source, std::size_t bytes) {
+      if (bytes == 0)
+        return;
+      if (source == nullptr)
+        throw std::logic_error("Qwen compact snapshot has no device storage");
+      const auto* cursor = static_cast<const std::uint8_t*>(source);
+      while (bytes != 0) {
+        const auto count = std::min(bytes, scratch_bytes);
+        transfer.Copy(scratch.get(), cursor, count);
+        emit(std::span<const std::uint8_t>(scratch.get(), count));
+        cursor += count;
+        bytes -= count;
+      }
+    };
+    if (layout.live_kv_bytes_per_plane != 0) {
+      const auto element_bytes = kv_storage_ == QwenKvCacheStorage::kFp16
+                                     ? sizeof(std::uint16_t)
+                                     : sizeof(float);
+      const auto* source = static_cast<const std::uint8_t*>(
+          kv_storage_ == QwenKvCacheStorage::kFp16 ? d_kv_f16_ : d_kv_f32_);
+      if (source == nullptr)
+        throw std::logic_error("Qwen compact snapshot has no KV storage");
+      // SaveSnapshot already packs both FP16 token-major and FP32 head-major
+      // planes. Streaming preserves those bytes without a transpose.
+      emit_device(source, layout.live_kv_bytes_per_plane);
+      emit_device(
+          source + CheckedMultiply(kv_elements_per_plane_, element_bytes),
+          layout.live_kv_bytes_per_plane);
+    }
+    emit_device(d_ssm_conv_, layout.conv_bytes);
+    emit_device(d_ssm_deltanet_, layout.deltanet_bytes);
+  }
+  for (const auto& grid : vision_layout_.images) {
+    std::array<std::uint8_t, 12> bytes{};
+    PutLittleEndian<std::uint32_t>(bytes, 0, grid.offset);
+    PutLittleEndian<std::uint32_t>(bytes, 4, grid.height);
+    PutLittleEndian<std::uint32_t>(bytes, 8, grid.width);
+    emit(bytes);
+  }
+  if (written != layout.total_bytes)
+    throw std::runtime_error("Qwen compact stream byte count mismatch");
 }
 
 QwenGpuMemoryUsage QwenGpuArena::EstimateMemoryUsage(

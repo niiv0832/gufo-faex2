@@ -4,6 +4,20 @@
 
 ## 2026-11-14
 
+### 05:59 MSK: потоковая запись Qwen/MTP прошла настоящий GREEN
+
+- Frozen source36e46+patch1e492388, manifestec040ff8. Plain binarya94ebe7a: payload19542208bytes/direct equality,9callbacks, largest chunk/allocation8388608,292observedallocations, peak-live8409971, remaining0. Два sink throws и byte-exact retry прошли с прежним16MiB+4096 guard.
+- Actual MTPbinary4a7b0ea0: payload17302021, legacy qualified base fallback намеренно rejected17302021; streaming/afterthrow callbacks2, largest chunk16MiB, heappeak0. Отдельный настоящий runner DecodeStep выдал draft1, pending_count1; restore/consume/resume draft1 и exact final state PASS. Large seededstorage case не объявляет numerical quality. Compactbinaryc04fe884 прошёл12 storage/prefix/tail combinations иropev2.
+- Linux CPU4/4 PASS (cache/store/runner/verifier,1,60с), общий format727 PASS, source reviews production/plain/core/MTP/compact/scratch8 без blocker. Прежние setup/RED/GREEN1/2 FAIL сохранены. GREEN3 полный архив60файлов SHA `c60f66098e3731f0901d10ff46e754ed9785b771cbcd51808d85b07812d6e6d1`.
+- Main возвращён за27,198с, health/text/tool/vision PASS, kernel CLEAN; независимо05:59:24 READY PID945631/exact request/identity/SHAe319. Это завершение локального исправления, а не RSS/speed/quality acceptance: ordinary matched pair и исходный час остаются обязательными. Перевода/push/pi/Q1 acceptance нет.
+
+### 05:51 MSK: OOM локализован ограничителем aggregate-live, scratch уменьшен
+
+- Diagnosticplain c9ccacaa с теми же production libraries воспроизвёл FAIL. Guard: aggregate-live-bytes/rejected56/peak16781269/largest16777216/25allocations; после headers192байт, до payload. Это подтверждает совместное превышение лимита scratch+служебными C++ allocations HIP, а не исчерпание памяти всей машины. Остаток38байт внутри catch не трактуется как leak. Границы16MiB single/callback и16MiB+4096 live не увеличены.
+- Выбран scratch8MiB: header/Copy→emit порядок, байты и destructor transfer→scratch не менялись. Это оставляет место служебным выделениям внутри прежнего guard. Цена большего числа Copy/sync должна быть измерена ordinary A/B; source review не заменяет GPU GREEN. Новый пакет36e46+patch1e492388 строится в snapshot-stream-green3, исходные green1/2 сохранены.
+- Green2 архив55файлов SHA `85fe532a212aa4cf02521f89a8d9e61650a566102864e00b3718a660a0b35dd1`; main восстановлен за25,764с, health/text/tool/vision PASS/kernel CLEAN, независимо05:51:48 PID939565/exact SHAe319.
+- Отдельный CPU prefixprobe v2 actualGGUF PASS: все шесть пар имеют6 общих токенов (<128), полные128316/117756×3 и stable128309/117749×3 совпали. Hash каждого stable token-prefix сохранён; это prerequisite планового bound, не memory/quality acceptance. Бинарник5820ba71, result50095e4b, полный архивSHA `d6377a2c780f426bf04a97f643169cfb15917ee945cf6e1e59a3915d1be11a47`. Main не останавливался.
+
 ### 05:45 MSK: первый streaming GREEN остановлен на OOM, main возвращён
 
 - Frozen source36e46+patch5c5a58e4 собран в семь targets; четыре CPU targets прошли за1,63с. CTest4.5 печатает новый summary `100% tests passed out of 4`, поэтому старое сравнение строки остановило оформление manifest (исходный job rc1 сохранён). Отдельная проверка четырёх Passed и нового summary оформила manifest70147af2; пересборки/повтора CPU не было. Общий clang-format PASS727.

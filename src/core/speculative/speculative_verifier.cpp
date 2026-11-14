@@ -59,6 +59,38 @@ template<typename T>
   return left + right;
 }
 
+std::array<std::uint8_t, kVerifierPersistentHeaderBytes>
+MakeVerifierPersistentHeader(const SpeculativeStats& stats,
+                             std::uint32_t current_draft_length,
+                             std::size_t rolling_count,
+                             std::size_t draft_payload_bytes,
+                             std::size_t expected_bytes) {
+  std::array<std::uint8_t, kVerifierPersistentHeaderBytes> header{};
+  std::fill(header.begin(), header.end(), std::uint8_t{0});
+  std::copy(kVerifierPersistentMagic.begin(), kVerifierPersistentMagic.end(),
+            header.begin());
+  PutLittleEndian<std::uint32_t>(header, 8, kVerifierPersistentVersion);
+  PutLittleEndian<std::uint32_t>(
+      header, 12, static_cast<std::uint32_t>(kVerifierPersistentHeaderBytes));
+  PutLittleEndian<std::uint64_t>(
+      header, 16, static_cast<std::uint64_t>(draft_payload_bytes));
+  PutLittleEndian<std::uint64_t>(header, 24,
+                                 static_cast<std::uint64_t>(rolling_count));
+  PutLittleEndian<std::uint64_t>(
+      header, 32, static_cast<std::uint64_t>(stats.total_draft_tokens));
+  PutLittleEndian<std::uint64_t>(
+      header, 40, static_cast<std::uint64_t>(stats.total_accepted_tokens));
+  PutLittleEndian<std::uint64_t>(
+      header, 48, static_cast<std::uint64_t>(stats.total_verification_steps));
+  PutLittleEndian<std::uint64_t>(
+      header, 56, static_cast<std::uint64_t>(stats.total_emitted_tokens));
+  PutLittleEndian<std::uint32_t>(header, 64, current_draft_length);
+  PutLittleEndian<std::uint64_t>(header, 72,
+                                 static_cast<std::uint64_t>(expected_bytes));
+
+  return header;
+}
+
 [[nodiscard]] std::size_t PersistentSizeFromU64(std::uint64_t value) {
   if (value > std::numeric_limits<std::size_t>::max()) {
     throw std::overflow_error("speculative verifier persistent size overflows");
@@ -1153,29 +1185,10 @@ std::size_t SpeculativeVerifierSnapshot::SerializePersistent(
       CheckedPersistentAdd(kVerifierPersistentHeaderBytes, rolling_bytes);
 
   std::fill(destination.begin(), destination.end(), std::uint8_t{0});
-  std::copy(kVerifierPersistentMagic.begin(), kVerifierPersistentMagic.end(),
-            destination.begin());
-  PutLittleEndian<std::uint32_t>(destination, 8, kVerifierPersistentVersion);
-  PutLittleEndian<std::uint32_t>(
-      destination, 12,
-      static_cast<std::uint32_t>(kVerifierPersistentHeaderBytes));
-  PutLittleEndian<std::uint64_t>(
-      destination, 16, static_cast<std::uint64_t>(draft_payload_bytes));
-  PutLittleEndian<std::uint64_t>(
-      destination, 24, static_cast<std::uint64_t>(rolling_acceptance_.size()));
-  PutLittleEndian<std::uint64_t>(
-      destination, 32, static_cast<std::uint64_t>(stats_.total_draft_tokens));
-  PutLittleEndian<std::uint64_t>(
-      destination, 40,
-      static_cast<std::uint64_t>(stats_.total_accepted_tokens));
-  PutLittleEndian<std::uint64_t>(
-      destination, 48,
-      static_cast<std::uint64_t>(stats_.total_verification_steps));
-  PutLittleEndian<std::uint64_t>(
-      destination, 56, static_cast<std::uint64_t>(stats_.total_emitted_tokens));
-  PutLittleEndian<std::uint32_t>(destination, 64, current_draft_length_);
-  PutLittleEndian<std::uint64_t>(destination, 72,
-                                 static_cast<std::uint64_t>(expected_bytes));
+  const auto header = MakeVerifierPersistentHeader(
+      stats_, current_draft_length_, rolling_acceptance_.size(),
+      draft_payload_bytes, expected_bytes);
+  std::copy(header.begin(), header.end(), destination.begin());
 
   std::size_t rolling_offset = kVerifierPersistentHeaderBytes;
   for (const float rate : rolling_acceptance_) {
@@ -1190,6 +1203,41 @@ std::size_t SpeculativeVerifierSnapshot::SerializePersistent(
         "draft persistent serializer returned the wrong byte count");
   }
   return destination.size();
+}
+
+void SpeculativeVerifierSnapshot::StreamPersistent(
+    const core::PersistentSnapshotSink& sink) const {
+  const auto expected_bytes = PersistentPayloadBytes();
+  const auto draft_bytes = draft_snapshot_->PersistentPayloadBytes();
+  const auto header = MakeVerifierPersistentHeader(
+      stats_, current_draft_length_, rolling_acceptance_.size(), draft_bytes,
+      expected_bytes);
+  sink(header);
+  // A fixed stack block also handles an arbitrarily configured rolling window.
+  std::array<std::uint8_t, 1024> rolling{};
+  std::size_t used = 0;
+  for (const float rate : rolling_acceptance_) {
+    PutLittleEndian<std::uint32_t>(rolling, used,
+                                   std::bit_cast<std::uint32_t>(rate));
+    used += sizeof(std::uint32_t);
+    if (used == rolling.size()) {
+      sink(rolling);
+      used = 0;
+    }
+  }
+  if (used != 0)
+    sink(std::span<const std::uint8_t>(rolling).first(used));
+  std::size_t written = 0;
+  const core::PersistentSnapshotSink checked = [&](auto bytes) {
+    if (bytes.size() > draft_bytes - written)
+      throw std::runtime_error(
+          "draft persistent stream exceeds its byte count");
+    core::StreamSnapshotBytes(bytes, sink);
+    written += bytes.size();
+  };
+  draft_snapshot_->StreamPersistent(checked);
+  if (written != draft_bytes)
+    throw std::runtime_error("draft persistent stream byte count mismatch");
 }
 
 std::size_t SpeculativeVerifier::SnapshotPayloadBytes() const {

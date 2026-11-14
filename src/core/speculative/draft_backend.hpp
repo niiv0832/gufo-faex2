@@ -11,6 +11,7 @@
 #include <utility>
 #include <vector>
 
+#include "src/core/snapshot_stream.hpp"
 #include "src/models/qwen/tokenizer.hpp"
 
 namespace gufo::speculative {
@@ -68,6 +69,17 @@ public:
     (void)destination;
     throw std::logic_error(
         "draft backend snapshot does not support persistence");
+  }
+
+  /// Compatibility fallback: bounds sink spans but still allocates the full
+  /// payload. Host-backed providers should override this to stream in place.
+  virtual void StreamPersistent(
+      const core::PersistentSnapshotSink& sink) const {
+    std::vector<std::uint8_t> payload(PersistentPayloadBytes());
+    if (SerializePersistent(payload) != payload.size()) {
+      throw std::runtime_error("draft persistent snapshot byte count mismatch");
+    }
+    core::StreamSnapshotBytes(payload, sink);
   }
 };
 

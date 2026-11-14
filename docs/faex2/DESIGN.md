@@ -39,6 +39,12 @@ API/планировщик готовит запрос; Qwen target executor в�
 
 Планировщик обслуживает все сеансы одним потоком процессора, у каждого сеанса свой поток GPU, а функции prefill возвращаются, не дожидаясь поставленных в очередь ядер. Поэтому рабочая память таких ядер не должна быть общей. С `d891354f` три набора буферов выдаются по ключу «поток GPU»: Q8-активации обёртки `LaunchBatchedQuantGEMM`, рабочий набор `Qwen35MoePrefill` и буфер запасного одиночного MoE FFN. Цена — около 160 МиБ на сеанс сверх первого. Буферы живут до конца процесса и не освобождаются при уничтожении потока GPU; вызов с двух потоков процессора на одном потоке GPU не поддержан. Арифметика не менялась: логиты и ответы побайтно совпали со сборкой до правки.
 
+## 2б. Потоковое сохранение Qwen snapshot — кандидат 2026-11-14
+
+Qwen выдаёт persistent snapshot через sink без полного временного host vector. Порядок outer112B → compact80B/K/V/conv/DeltaNet/rope → logits → verifier96B/rolling/draft и file/payload versions сохранены. GPU данные проходят через один scratch8MiB; host payload MTP выдаётся borrowed spans не больше16MiB без повторного копирования. При исключении transfer синхронизируется раньше освобождения scratch, writer сохраняет прежний atomic checkpoint. Restore по-прежнему читает полный файл; cache policy, budgets и арифметика не менялись.
+
+Три настоящих synthetic GPU tests подтвердили byte equality, bounded allocations, storage formats, throwing sink/retry, actual MTP и pending/reload. Plain19,5MB snapshot имел peak дополнительной C++ heap8409971bytes при лимите16MiB+4096; это не полный RSS, malloc/device/OS и другие потоки observer не охватывает. Legacy fallback неизвестного draft provider сохраняет полную allocation; DFlash не получает обещания bounded memory. Ordinary latency и часовой RSS gate ещё обязательны, кандидат рабочим не назначен. [План и доказательства](SNAPSHOT_STREAMING_PLAN.md).
+
 ## 3. DFlash2: калиброванный, но экспериментальный путь
 
 MoE-профиль выбирается по `IsMoe()` цели. Таблицы получены для 35B-A3B UD-Q4_K_XL + DFlash2 Q8_0, gfx1151, ECO 100 Вт; это не общая модель стоимости любого MoE.

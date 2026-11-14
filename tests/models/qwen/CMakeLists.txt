@@ -83,6 +83,12 @@ if (ENGINE_ENABLE_HIP)
     tests/models/qwen/hip/device_gate_test.cpp
     "hip;qwen;test-support;device-gate")
 
+  add_qwen_hip_test(qwen_snapshot_streaming_test
+    tests/models/qwen/hip/snapshot_streaming_test.cpp
+    "hip;gpu;qwen;snapshot;streaming;synthetic")
+  set_tests_properties(qwen_snapshot_streaming_test PROPERTIES
+    RUN_SERIAL TRUE TIMEOUT 120)
+
   add_qwen_hip_test(qwen_gpu_ops_test
     tests/models/qwen/hip/basic/blas_ops_test.cpp
     "hip;gpu;kernels;qwen;qwen-kernel-oracle;slow;basic;blas")

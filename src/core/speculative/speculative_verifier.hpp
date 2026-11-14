@@ -249,6 +249,7 @@ public:
   [[nodiscard]] std::size_t PersistentPayloadBytes() const;
   [[nodiscard]] std::size_t SerializePersistent(
       std::span<std::uint8_t> destination) const;
+  void StreamPersistent(const core::PersistentSnapshotSink& sink) const;
 
 private:
   SpeculativeVerifierSnapshot() = default;

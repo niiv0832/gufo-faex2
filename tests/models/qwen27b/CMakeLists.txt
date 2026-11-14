@@ -53,6 +53,15 @@ if (ENGINE_ENABLE_HIP)
   set_tests_properties(qwen_persistent_snapshot_stream_test PROPERTIES
     LABELS "qwen;hip;gpu;server;snapshot;synthetic"
     RUN_SERIAL TRUE TIMEOUT 120)
+  add_executable(qwen_persistent_snapshot_mtp_stream_test
+    ../qwen/persistent_snapshot_mtp_stream_test.cpp)
+  target_link_libraries(qwen_persistent_snapshot_mtp_stream_test
+    PRIVATE qwen_serving_test_support)
+  add_test(NAME qwen_persistent_snapshot_mtp_stream_test
+    COMMAND qwen_persistent_snapshot_mtp_stream_test)
+  set_tests_properties(qwen_persistent_snapshot_mtp_stream_test PROPERTIES
+    LABELS "qwen;hip;gpu;server;snapshot;mtp;synthetic"
+    RUN_SERIAL TRUE TIMEOUT 180)
   add_executable(inference_backend_gpu_test serving_test.cpp)
   target_link_libraries(inference_backend_gpu_test PRIVATE qwen_serving_test_support)
   add_executable(qwen_vision_serving_test ../qwen/vision_serving_test.cpp)

@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "src/core/model_config.hpp"
+#include "src/core/snapshot_stream.hpp"
 #include "src/models/qwen/forward.hpp"
 #include "src/models/qwen/generator.hpp"
 #include "src/models/qwen/state.hpp"
@@ -194,6 +195,7 @@ public:
   [[nodiscard]] std::size_t CompactPayloadBytes() const;
   [[nodiscard]] std::size_t SerializeCompact(
       std::span<std::uint8_t> destination) const;
+  void StreamCompact(const core::PersistentSnapshotSink& sink) const;
   [[nodiscard]] static models::qwen::vision::RopeLayout ReadRopeLayout(
       std::span<const std::uint8_t> payload);
 

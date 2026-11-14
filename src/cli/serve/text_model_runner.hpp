@@ -18,6 +18,7 @@
 #include "src/cli/serve/continuation_cache.hpp"
 #include "src/cli/serve/text_generation_backend.hpp"
 #include "src/core/sampling.hpp"
+#include "src/core/snapshot_stream.hpp"
 
 namespace gufo::server {
 
@@ -493,7 +494,7 @@ public:
       const TextRunnerSnapshot& snapshot,
       std::span<std::uint8_t> destination) const;
 
-  using SnapshotSink = std::function<void(std::span<const std::uint8_t>)>;
+  using SnapshotSink = core::PersistentSnapshotSink;
   /// Reads only immutable snapshot storage. May run on the persistence worker.
   /// Host-backed providers stream directly without another payload allocation.
   virtual void StreamPersistentSnapshot(const TextRunnerSnapshot& snapshot,

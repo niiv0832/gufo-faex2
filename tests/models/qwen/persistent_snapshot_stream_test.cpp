@@ -1,16 +1,18 @@
 // A real Qwen runner must stream without materializing a complete host payload.
 // Synthetic weights and a short prompt keep this independent of model files.
 // The deliberately large recurrent state makes the old full-vector stream fail
-// a thread-local C++ heap bound. HIP/driver allocations are outside that bound.
+// a thread-local C++ heap bound. This does not measure HIP allocations or RSS.
 #include <unistd.h>
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <new>
 #include <span>
@@ -26,116 +28,16 @@
 #include "src/models/qwen/hip/executor.hpp"
 #include "src/models/qwen/tokenizer.hpp"
 #include "tests/models/qwen/hip/support/device.hpp"
+#define GUFO_TEST_DEFINE_SNAPSHOT_ALLOCATION_OPERATORS
+#include "tests/models/qwen/support/snapshot_allocation_guard.hpp"
 #include "tests/models/qwen/support/synthetic_weights.hpp"
 
 namespace {
-constexpr std::size_t kChunkLimit = 16U * 1024U * 1024U;
-constexpr std::size_t kLiveLimit = kChunkLimit + 4096U;
+using namespace gufo::test::snapshot_alloc;
 // SHA-256 of "gufo-qwen-persistent-snapshot-stream-fixture-v1" (no newline).
 // Names this fixed synthetic fixture; it is not an external GGUF content hash.
 constexpr char kSyntheticArtifactFingerprint[] =
     "69016631b4ed99b9b570b31c65ff665c3e9894b6d276c38e81b21415092506a4";
-
-struct AllocationLedger {
-  struct Entry {
-    void* pointer{nullptr};
-    std::size_t bytes{0};
-  };
-  std::array<Entry, 4096> entries{};
-  std::size_t live_bytes{0};
-  std::size_t peak_bytes{0};
-  std::size_t largest_bytes{0};
-  std::size_t allocations{0};
-  std::size_t rejected_bytes{0};
-  const char* rejection{nullptr};
-
-  void Check(std::size_t bytes) {
-    if (bytes > kChunkLimit) {
-      Reject(bytes, "single-allocation");
-    }
-    if (bytes > kLiveLimit - live_bytes) {
-      Reject(bytes, "aggregate-live-bytes");
-    }
-  }
-
-  void Add(void* pointer, std::size_t bytes) {
-    for (auto& entry : entries) {
-      if (entry.pointer == nullptr) {
-        entry = {pointer, bytes};
-        live_bytes += bytes;
-        peak_bytes = std::max(peak_bytes, live_bytes);
-        largest_bytes = std::max(largest_bytes, bytes);
-        ++allocations;
-        return;
-      }
-    }
-    Reject(bytes, "observer-capacity");
-  }
-
-  void Remove(void* pointer) noexcept {
-    for (auto& entry : entries) {
-      if (entry.pointer == pointer) {
-        live_bytes -= entry.bytes;
-        entry = {};
-        return;
-      }
-    }
-  }
-
-  [[noreturn]] void Reject(std::size_t bytes, const char* reason) {
-    rejected_bytes = bytes;
-    rejection = reason;
-    throw std::bad_alloc();
-  }
-};
-
-thread_local AllocationLedger* active_ledger = nullptr;
-
-class AllocationScope {
-public:
-  explicit AllocationScope(AllocationLedger& ledger) {
-    if (active_ledger != nullptr)
-      throw std::logic_error("allocation observer is already armed");
-    active_ledger = &ledger;
-  }
-  ~AllocationScope() { active_ledger = nullptr; }
-  AllocationScope(const AllocationScope&) = delete;
-  AllocationScope& operator=(const AllocationScope&) = delete;
-};
-
-void* Allocate(std::size_t bytes, std::size_t alignment = 0) {
-  if (active_ledger != nullptr)
-    active_ledger->Check(bytes);
-  void* pointer = nullptr;
-  if (alignment == 0) {
-    pointer = std::malloc(std::max(bytes, std::size_t{1}));
-  } else {
-    if ((alignment & (alignment - 1)) != 0)
-      throw std::bad_alloc();
-    // C++ callers (including LLVM during HIP startup) may request alignment
-    // 1, 2 or 4. POSIX additionally requires a multiple of sizeof(void*).
-    const auto posix_alignment = std::max(alignment, sizeof(void*));
-    if (::posix_memalign(&pointer, posix_alignment,
-                         std::max(bytes, std::size_t{1})) != 0)
-      pointer = nullptr;
-  }
-  if (pointer == nullptr)
-    throw std::bad_alloc();
-  try {
-    if (active_ledger != nullptr)
-      active_ledger->Add(pointer, bytes);
-  } catch (...) {
-    std::free(pointer);
-    throw;
-  }
-  return pointer;
-}
-
-void Deallocate(void* pointer) noexcept {
-  if (pointer != nullptr && active_ledger != nullptr)
-    active_ledger->Remove(pointer);
-  std::free(pointer);
-}
 
 void Require(bool condition, std::string_view message) {
   if (!condition)
@@ -148,57 +50,26 @@ void Stage(std::string_view stage) noexcept {
   (void)::write(STDOUT_FILENO, stage.data(), stage.size());
   (void)::write(STDOUT_FILENO, "\n", 1);
 }
-}  // namespace
 
-void* operator new(std::size_t bytes) {
-  return Allocate(bytes);
+void ReportStreamFailure(const char* stage, const AllocationLedger& ledger,
+                         std::size_t delivered, std::size_t callbacks,
+                         const std::exception& error) {
+  // Called only after AllocationScope has unwound. Preserve the exception;
+  // HIP may translate a rejected C++ allocation into hipErrorOutOfMemory.
+  std::cerr << "stream_failure stage=" << stage << " rejection="
+            << (ledger.rejection != nullptr ? ledger.rejection : "none")
+            << " rejected_bytes=" << ledger.rejected_bytes
+            << " peak_live_bytes=" << ledger.peak_bytes
+            << " remaining_live_bytes=" << ledger.live_bytes
+            << " allocations=" << ledger.allocations
+            << " largest_allocation=" << ledger.largest_bytes
+            << " delivered_bytes=" << delivered << " callbacks=" << callbacks
+            << " error=" << error.what() << '\n';
 }
-void* operator new[](std::size_t bytes) {
-  return Allocate(bytes);
-}
-void* operator new(std::size_t bytes, std::align_val_t alignment) {
-  return Allocate(bytes, static_cast<std::size_t>(alignment));
-}
-void* operator new[](std::size_t bytes, std::align_val_t alignment) {
-  return Allocate(bytes, static_cast<std::size_t>(alignment));
-}
-void operator delete(void* pointer) noexcept {
-  Deallocate(pointer);
-}
-void operator delete[](void* pointer) noexcept {
-  Deallocate(pointer);
-}
-void operator delete(void* pointer, std::size_t) noexcept {
-  Deallocate(pointer);
-}
-void operator delete[](void* pointer, std::size_t) noexcept {
-  Deallocate(pointer);
-}
-void operator delete(void* pointer, std::align_val_t) noexcept {
-  Deallocate(pointer);
-}
-void operator delete[](void* pointer, std::align_val_t) noexcept {
-  Deallocate(pointer);
-}
-void operator delete(void* pointer, std::size_t, std::align_val_t) noexcept {
-  Deallocate(pointer);
-}
-void operator delete[](void* pointer, std::size_t, std::align_val_t) noexcept {
-  Deallocate(pointer);
-}
+}  // namespace
 
 namespace {
 using namespace gufo;
-
-void CheckAllocatorAlignment() {
-  for (const std::size_t alignment : {1U, 2U, 4U, 8U, 16U, 64U, 128U}) {
-    void* pointer = ::operator new(32, std::align_val_t(alignment));
-    const bool aligned =
-        reinterpret_cast<std::uintptr_t>(pointer) % alignment == 0;
-    ::operator delete(pointer, std::align_val_t(alignment));
-    Require(aligned, "test allocator violated a valid C++ alignment");
-  }
-}
 
 // The model owns its device copy; synthetic host storage only supplies offsets
 // during construction. All dense tensor references point into that one copy.
@@ -318,6 +189,40 @@ void TestActualQwenStreamDoesNotAllocateFullPayload() {
   Require(runner->SerializePersistentSnapshot(*snapshot, expected) ==
               expected.size(),
           "legacy Qwen serializer byte count");
+  // Independent fixture fields: a shared production header builder must not
+  // make the direct-vs-stream comparison its own format oracle.
+  std::array<std::uint8_t, 112> expected_header{};
+  const std::array<std::uint8_t, 8> magic{'G', 'Q', 'W', 'R',
+                                          'U', 'N', '0', '1'};
+  std::copy(magic.begin(), magic.end(), expected_header.begin());
+  const auto put = [&](std::size_t offset, std::uint64_t value,
+                       std::size_t width) {
+    for (std::size_t i = 0; i < width; ++i)
+      expected_header[offset + i] = static_cast<std::uint8_t>(value >> (8 * i));
+  };
+  std::uint32_t frontier = 0;
+  float best_logit = -std::numeric_limits<float>::infinity();
+  for (std::uint32_t token = 0; token < 256; ++token) {
+    float logit = 0;
+    // Independent fixture offset; do not read the frontier/header sizes.
+    std::memcpy(&logit, expected.data() + 19541184 + token * sizeof(float),
+                sizeof(logit));
+    Require(std::isfinite(logit), "synthetic frontier logits must be finite");
+    if (logit > best_logit) {
+      best_logit = logit;
+      frontier = token;
+    }
+  }
+  put(8, 5, 4);
+  put(12, 112, 4);
+  put(16, 2, 8);
+  put(24, frontier, 4);
+  put(32, 256, 8);
+  put(40, 19541072, 8);
+  put(48, 19542208, 8);
+  Require(std::equal(expected_header.begin(), expected_header.end(),
+                     expected.begin()),
+          "Qwen persistent header differs from independent plain fixture");
   Stage("reference_serialize_complete");
   std::vector<std::uint8_t> actual(payload_bytes, 0x5A);
   std::size_t written = 0;
@@ -336,10 +241,12 @@ void TestActualQwenStreamDoesNotAllocateFullPayload() {
             << " chunk_limit=" << kChunkLimit << " live_limit=" << kLiveLimit
             << " scope=plain-qwen mtp=not-exercised\n"
             << std::flush;
+  Stage("stream_first_begin");
   try {
     const AllocationScope measured(ledger);
     runner->StreamPersistentSnapshot(*snapshot, sink);
-  } catch (const std::bad_alloc&) {
+  } catch (const std::bad_alloc& error) {
+    ReportStreamFailure("first", ledger, written, callbacks, error);
     if (ledger.rejection != nullptr) {
       const bool expected_full_payload =
           std::strcmp(ledger.rejection, "single-allocation") == 0 &&
@@ -353,6 +260,9 @@ void TestActualQwenStreamDoesNotAllocateFullPayload() {
               "stream allocation failure was not the expected full payload");
     }
     throw;
+  } catch (const std::exception& error) {
+    ReportStreamFailure("first", ledger, written, callbacks, error);
+    throw;
   }
   Require(ledger.rejection == nullptr,
           "Qwen stream caught and concealed an allocation bound failure");
@@ -362,6 +272,62 @@ void TestActualQwenStreamDoesNotAllocateFullPayload() {
           "streamed Qwen bytes differ from the direct serializer");
   Require(callbacks > 1 && largest_chunk <= kChunkLimit,
           "Qwen stream callback is not bounded");
+  // Throw after copied K, and after 16 MiB of DeltaNet bytes (two 8 MiB
+  // transfers). The frozen snapshot must survive both partial writes and
+  // remain reusable. These byte boundaries do not depend on production sizing.
+  struct SinkFailure {};
+  for (const auto stop_after :
+       {std::size_t{1728}, std::size_t{666816} + kChunkLimit}) {
+    std::size_t delivered = 0;
+    std::size_t throwing_callbacks = 0;
+    const server::TextModelRunner::SnapshotSink throwing = [&](auto bytes) {
+      Require(bytes.size() <= kChunkLimit,
+              "throwing stream exceeded chunk cap");
+      delivered += bytes.size();
+      ++throwing_callbacks;
+      if (delivered >= stop_after)
+        throw SinkFailure{};
+    };
+    AllocationLedger failure_ledger;
+    bool threw = false;
+    try {
+      const AllocationScope measured(failure_ledger);
+      runner->StreamPersistentSnapshot(*snapshot, throwing);
+    } catch (const SinkFailure&) {
+      threw = true;
+    } catch (const std::exception& error) {
+      ReportStreamFailure("throwing_sink", failure_ledger, delivered,
+                          throwing_callbacks, error);
+      throw;
+    }
+    Require(threw && delivered >= stop_after && delivered < payload_bytes,
+            "Qwen stream did not propagate the partial sink failure");
+    Require(
+        failure_ledger.rejection == nullptr && failure_ledger.live_bytes == 0,
+        "failed Qwen stream leaked or concealed allocation failure");
+    std::fill(actual.begin(), actual.end(), 0x5A);
+    Require(runner->SerializePersistentSnapshot(*snapshot, actual) ==
+                    actual.size() &&
+                actual == expected,
+            "sink failure mutated the frozen Qwen snapshot");
+    std::fill(actual.begin(), actual.end(), 0x5A);
+    written = 0;
+    callbacks = 0;
+    largest_chunk = 0;
+    AllocationLedger retry_ledger;
+    try {
+      const AllocationScope measured(retry_ledger);
+      runner->StreamPersistentSnapshot(*snapshot, sink);
+    } catch (const std::exception& error) {
+      ReportStreamFailure("retry", retry_ledger, written, callbacks, error);
+      throw;
+    }
+    Require(
+        retry_ledger.rejection == nullptr && retry_ledger.live_bytes == 0 &&
+            written == expected.size() && actual == expected && callbacks > 1 &&
+            largest_chunk <= kChunkLimit,
+        "Qwen stream retry after sink failure was not byte-exact and bounded");
+  }
   std::cout << "stream_pass bytes=" << written << " callbacks=" << callbacks
             << " largest_chunk=" << largest_chunk
             << " allocations=" << ledger.allocations

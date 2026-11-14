@@ -2,7 +2,9 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <functional>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <span>
 #include <stdexcept>
@@ -410,6 +412,8 @@ private:
 
 class PersistentDraftBackend final : public gufo::speculative::IDraftBackend {
 public:
+  std::function<std::unique_ptr<gufo::speculative::IDraftBackendSnapshot>()>
+      snapshot_factory;
   PersistentDraftBackend(std::vector<TokenId> target_tokens,
                          std::size_t prompt_size)
       : target_tokens_(std::move(target_tokens)), prompt_size_(prompt_size) {}
@@ -462,6 +466,8 @@ public:
 
   [[nodiscard]] std::unique_ptr<gufo::speculative::IDraftBackendSnapshot>
   Snapshot() const override {
+    if (snapshot_factory)
+      return snapshot_factory();
     return std::make_unique<PersistentDraftSnapshot>(marker_);
   }
 
@@ -1421,6 +1427,12 @@ void TestPersistentVerifierSnapshotRoundTrip() {
   std::vector<std::uint8_t> payload(snapshot->PersistentPayloadBytes());
   Expect(snapshot->SerializePersistent(payload) == payload.size(),
          "persistent verifier byte count");
+  std::vector<std::uint8_t> streamed;
+  snapshot->StreamPersistent([&](auto bytes) {
+    streamed.insert(streamed.end(), bytes.begin(), bytes.end());
+  });
+  Expect(streamed == payload,
+         "stream preserves nonempty rolling acceptance and provider state");
 
   ScriptedTargetExecutor restored_target(generated, eos_id);
   auto restored_backend =
@@ -1468,6 +1480,182 @@ void TestPersistentVerifierSnapshotRoundTrip() {
          "persistent verifier round trip is byte exact");
 }
 
+// This provider has no legacy serializer. A verifier that quietly falls back
+// to SerializePersistent cannot satisfy this contract.
+class StreamOnlyDraftSnapshot final
+    : public gufo::speculative::IDraftBackendSnapshot {
+public:
+  StreamOnlyDraftSnapshot(std::shared_ptr<const std::vector<std::uint8_t>> data,
+                          std::size_t declared)
+      : data_(std::move(data)), declared_(declared) {}
+  std::size_t PayloadBytes() const noexcept override { return data_->size(); }
+  std::size_t PersistentPayloadBytes() const override { return declared_; }
+  std::size_t SerializePersistent(std::span<std::uint8_t>) const override {
+    throw std::logic_error("stream-only provider rejects legacy serialization");
+  }
+  void StreamPersistent(
+      const gufo::core::PersistentSnapshotSink& sink) const override {
+    // Deliberately one oversized provider span: the verifier must enforce its
+    // public callback bound without copying the complete provider payload.
+    sink(*data_);
+  }
+
+private:
+  std::shared_ptr<const std::vector<std::uint8_t>> data_;
+  std::size_t declared_;
+};
+
+class BadLegacySnapshot final
+    : public gufo::speculative::IDraftBackendSnapshot {
+public:
+  std::size_t PayloadBytes() const noexcept override { return 4; }
+  std::size_t PersistentPayloadBytes() const override { return 4; }
+  std::size_t SerializePersistent(
+      std::span<std::uint8_t> bytes) const override {
+    std::fill(bytes.begin(), bytes.end(), 0x5A);
+    return 3;
+  }
+};
+
+void TestPersistentVerifierStreamingContract() {
+  ScriptedTargetExecutor target({10, 11}, 900);
+  auto backend =
+      std::make_unique<PersistentDraftBackend>(std::vector<TokenId>{10, 11}, 1);
+  auto* provider = backend.get();
+  gufo::speculative::SpeculativeOptions options;
+  options.initial_draft_tokens = 2;
+  gufo::speculative::SpeculativeVerifier verifier(target, std::move(backend),
+                                                  options);
+  auto data = std::make_shared<std::vector<std::uint8_t>>(
+      gufo::core::kSnapshotStreamChunkBytes + 17);
+  for (std::size_t i = 0; i < data->size(); ++i)
+    (*data)[i] = static_cast<std::uint8_t>(i * 29U + 7U);
+  const auto snapshot_for = [&](std::size_t declared) {
+    provider->snapshot_factory = [data, declared] {
+      return std::make_unique<StreamOnlyDraftSnapshot>(data, declared);
+    };
+    return verifier.Snapshot();
+  };
+  const auto snapshot = snapshot_for(data->size());
+  std::vector<std::uint8_t> streamed;
+  std::size_t callbacks = 0;
+  snapshot->StreamPersistent([&](auto bytes) {
+    Expect(bytes.size() <= gufo::core::kSnapshotStreamChunkBytes,
+           "verifier stream forwards no oversized span");
+    streamed.insert(streamed.end(), bytes.begin(), bytes.end());
+    ++callbacks;
+  });
+  // Independent disk-layout fixture: no production header builder or legacy
+  // serializer participates in the expected bytes.
+  std::vector<std::uint8_t> expected(96, 0);
+  const std::array<std::uint8_t, 8> magic = {'G', 'S', 'P', 'V',
+                                             'E', 'R', '0', '1'};
+  std::copy(magic.begin(), magic.end(), expected.begin());
+  const auto put = [&](std::size_t offset, std::uint64_t value,
+                       std::size_t bytes) {
+    for (std::size_t i = 0; i < bytes; ++i)
+      expected[offset + i] = static_cast<std::uint8_t>(value >> (8U * i));
+  };
+  put(8, 2, 4);
+  put(12, 96, 4);
+  put(16, data->size(), 8);
+  put(64, 2, 4);
+  put(72, 96 + data->size(), 8);
+  expected.insert(expected.end(), data->begin(), data->end());
+  Expect(streamed == expected && callbacks == 3,
+         "stream-only provider emits exact header/reserved bytes and tail");
+
+  for (const auto declared : {data->size() - 1, data->size() + 1}) {
+    const auto invalid = snapshot_for(declared);
+    std::size_t received = 0;
+    bool rejected = false;
+    try {
+      invalid->StreamPersistent([&](auto bytes) { received += bytes.size(); });
+    } catch (const std::runtime_error&) {
+      rejected = true;
+    }
+    Expect(rejected, "verifier rejects long and short provider streams");
+    if (declared < data->size())
+      Expect(received == 96, "oversized provider bytes never reach the sink");
+  }
+  const auto overflow = snapshot_for(std::numeric_limits<std::size_t>::max());
+  bool overflowed = false;
+  std::size_t overflow_callbacks = 0;
+  try {
+    overflow->StreamPersistent([&](auto) { ++overflow_callbacks; });
+  } catch (const std::overflow_error&) {
+    overflowed = true;
+  }
+  Expect(overflowed && overflow_callbacks == 0,
+         "persistent size overflow fails before publishing any bytes");
+
+  bool threw = false;
+  std::size_t seen = 0;
+  try {
+    snapshot->StreamPersistent([&](auto) {
+      if (++seen == 2)
+        throw std::runtime_error("injected sink failure after header");
+    });
+  } catch (const std::runtime_error& error) {
+    threw =
+        std::string_view(error.what()) == "injected sink failure after header";
+  }
+  Expect(threw && seen == 2,
+         "sink exception propagates without more callbacks");
+  streamed.clear();
+  snapshot->StreamPersistent([&](auto bytes) {
+    streamed.insert(streamed.end(), bytes.begin(), bytes.end());
+  });
+  Expect(streamed == expected, "throwing sink leaves snapshot reusable");
+
+  PersistentDraftSnapshot legacy(0x12345678U);
+  std::vector<std::uint8_t> legacy_bytes;
+  legacy.StreamPersistent([&](auto bytes) {
+    legacy_bytes.insert(legacy_bytes.end(), bytes.begin(), bytes.end());
+  });
+  Expect(legacy_bytes == std::vector<std::uint8_t>({0x78, 0x56, 0x34, 0x12}),
+         "legacy provider default preserves independent little-endian bytes");
+  BadLegacySnapshot bad_legacy;
+  std::size_t bad_callbacks = 0;
+  bool bad_rejected = false;
+  try {
+    bad_legacy.StreamPersistent([&](auto) { ++bad_callbacks; });
+  } catch (const std::runtime_error&) {
+    bad_rejected = true;
+  }
+  Expect(bad_rejected && bad_callbacks == 0,
+         "legacy fallback verifies byte count before invoking sink");
+
+  // Seed all nonzero fields independently, including three distinct IEEE754
+  // acceptance values. Comparing two serializers sharing a header builder
+  // alone would miss a common field-order or rolling-state omission.
+  provider->snapshot_factory = {};
+  expected.assign(112, 0);
+  std::copy(magic.begin(), magic.end(), expected.begin());
+  put(8, 2, 4);
+  put(12, 96, 4);
+  put(16, 4, 8);
+  put(24, 3, 8);
+  put(32, 17, 8);
+  put(40, 11, 8);
+  put(48, 3, 8);
+  put(56, 14, 8);
+  put(64, 3, 4);
+  put(72, 112, 8);
+  put(96, 0x3e800000U, 4);   // 0.25F
+  put(100, 0x3f000000U, 4);  // 0.5F
+  put(104, 0x3f400000U, 4);  // 0.75F
+  put(108, 0x12345678U, 4);
+  verifier.RestorePersistentSnapshot(expected);
+  const auto seeded = verifier.Snapshot();
+  streamed.clear();
+  seeded->StreamPersistent([&](auto bytes) {
+    streamed.insert(streamed.end(), bytes.begin(), bytes.end());
+  });
+  Expect(streamed == expected,
+         "stream preserves independent nonzero counters and rolling bytes");
+}
+
 }  // namespace
 
 int main() {
@@ -1493,6 +1681,7 @@ int main() {
   TestConstrainedGreedyVerification();
   TestConcurrentVerificationChunks();
   TestPersistentVerifierSnapshotRoundTrip();
+  TestPersistentVerifierStreamingContract();
   std::cout << "All speculative verification tests passed.\n";
   return 0;
 }
