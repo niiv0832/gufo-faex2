@@ -39,6 +39,15 @@ using namespace gufo::test::snapshot_alloc;
 constexpr char kSyntheticArtifactFingerprint[] =
     "69016631b4ed99b9b570b31c65ff665c3e9894b6d276c38e81b21415092506a4";
 
+// Measured peak of live C++ heap on the streaming thread (gfx1151 stand,
+// 2026-11-14): 8,409,971 bytes. It is one 8 MiB scratch buffer that device
+// rows are copied through (8,388,608) plus 21,363 bytes of headers, the
+// frontier-logits span bookkeeping and std::function state. The bound keeps a
+// 64 KiB margin for those small allocations and fails if a second scratch
+// buffer or a payload-sized copy (19.5 MB here) ever becomes live. A bound one
+// byte under the measured peak was seen to fail first.
+constexpr std::size_t kPeakLiveLimit = 8U * 1024U * 1024U + 65536U;
+
 void Require(bool condition, std::string_view message) {
   if (!condition)
     throw std::runtime_error(std::string(message));
@@ -272,6 +281,30 @@ void TestActualQwenStreamDoesNotAllocateFullPayload() {
           "streamed Qwen bytes differ from the direct serializer");
   Require(callbacks > 1 && largest_chunk <= kChunkLimit,
           "Qwen stream callback is not bounded");
+  if (ledger.peak_bytes > kPeakLiveLimit) {
+    throw std::runtime_error(
+        "Qwen stream peak of live heap " + std::to_string(ledger.peak_bytes) +
+        " exceeds the measured bound " + std::to_string(kPeakLiveLimit));
+  }
+  // A snapshot of another runner type is refused before any byte is emitted.
+  struct ForeignSnapshot final : server::TextRunnerSnapshot {
+    [[nodiscard]] std::size_t PayloadBytes() const noexcept override {
+      return 16;
+    }
+  };
+  {
+    const ForeignSnapshot foreign;
+    std::size_t foreign_callbacks = 0;
+    bool refused = false;
+    try {
+      runner->StreamPersistentSnapshot(foreign,
+                                       [&](auto) { ++foreign_callbacks; });
+    } catch (const std::invalid_argument&) {
+      refused = true;
+    }
+    Require(refused && foreign_callbacks == 0,
+            "Qwen stream accepted a snapshot of another runner type");
+  }
   // Throw after copied K, and after 16 MiB of DeltaNet bytes (two 8 MiB
   // transfers). The frozen snapshot must survive both partial writes and
   // remain reusable. These byte boundaries do not depend on production sizing.

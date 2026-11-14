@@ -218,6 +218,19 @@ std::vector<std::uint8_t> SeededMtpPayload() {
   return bytes;
 }
 
+// Measured peaks of live C++ heap on the streaming thread (gfx1151 stand,
+// 2026-11-14), each bounded with a 64 KiB margin for bookkeeping allocations.
+// A bound one byte under the measured peak was seen to fail first.
+//
+// The large MTP snapshot streams straight from host memory it already owns:
+// its 17,302,021 payload bytes cost no heap at all (measured 0).
+//
+// The pending runner snapshot copies device rows through one scratch buffer
+// sized to the largest device piece of this fixture (196,608 bytes) and adds
+// 21,363 bytes of headers and std::function state (measured 217,971).
+constexpr std::size_t kLargeMtpPeakLimit = 4096;
+constexpr std::size_t kPendingRunnerPeakLimit = 196608 + 65536;
+
 void CheckLedger(const AllocationLedger& ledger) {
   Require(ledger.rejection == nullptr && ledger.live_bytes == 0 &&
               ledger.peak_bytes <= kLiveLimit &&
@@ -228,7 +241,7 @@ void CheckLedger(const AllocationLedger& ledger) {
 template<typename Stream>
 std::vector<std::uint8_t> CheckBoundedStream(
     const Stream& stream, std::span<const std::uint8_t> expected,
-    std::string_view label) {
+    std::string_view label, std::size_t peak_limit) {
   std::vector<std::uint8_t> actual(expected.size(), 0xA5);
   std::size_t written = 0;
   std::size_t callbacks = 0;
@@ -258,6 +271,12 @@ std::vector<std::uint8_t> CheckBoundedStream(
               std::equal(actual.begin(), actual.end(), expected.begin()),
           "stream bytes differ from the independent/reference payload");
   Require(callbacks > 1, "fixture did not exercise multiple stream chunks");
+  if (ledger.peak_bytes > peak_limit) {
+    throw std::runtime_error(
+        "stream peak of live heap " + std::to_string(ledger.peak_bytes) +
+        " exceeds the measured bound " + std::to_string(peak_limit) +
+        " in case " + std::string(label));
+  }
   std::cout << "bounded_stream case=" << label << " bytes=" << written
             << " callbacks=" << callbacks << " largest_chunk=" << largest
             << " largest_allocation=" << ledger.largest_bytes
@@ -357,9 +376,11 @@ void TestLargeActualMtpSnapshot(
   const auto stream = [&](const core::PersistentSnapshotSink& sink) {
     snapshot->StreamPersistent(sink);
   };
-  const auto streamed = CheckBoundedStream(stream, expected, "large-mtp");
+  const auto streamed =
+      CheckBoundedStream(stream, expected, "large-mtp", kLargeMtpPeakLimit);
   CheckThrowingSink(stream, expected);
-  (void)CheckBoundedStream(stream, expected, "large-mtp-after-throw");
+  (void)CheckBoundedStream(stream, expected, "large-mtp-after-throw",
+                           kLargeMtpPeakLimit);
 
   auto reloaded = hip::QwenMtpGpuDraftBackend::Create(
       mtp, {.max_context = kModelContext, .max_draft_tokens = 1}, &error);
@@ -480,9 +501,11 @@ void TestPendingActualMtpContinuation(
   const auto stream = [&](const core::PersistentSnapshotSink& sink) {
     runner->StreamPersistentSnapshot(*snapshot, sink);
   };
-  const auto streamed = CheckBoundedStream(stream, reference, "pending-runner");
+  const auto streamed = CheckBoundedStream(stream, reference, "pending-runner",
+                                           kPendingRunnerPeakLimit);
   CheckThrowingSink(stream, reference);
-  (void)CheckBoundedStream(stream, reference, "pending-runner-after-throw");
+  (void)CheckBoundedStream(stream, reference, "pending-runner-after-throw",
+                           kPendingRunnerPeakLimit);
 
   auto restored = runner->CreateState();
   restored->SetStopAtEos(false);
