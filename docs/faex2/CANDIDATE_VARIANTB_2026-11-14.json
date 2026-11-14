@@ -2,16 +2,17 @@
   "schema": "gufo-faex2.candidate.v1",
   "date": "2026-11-14",
   "prepared_at": "2026-11-14T23:58:00+03:00",
-  "status": "PREPARED_NOT_DEPLOYED",
-  "document_status": "VARIANT_B_MEASURED_MINIMUM_SCOPE_PENDING_OWNER_CONFIRMATION",
-  "ready_for_deployment": false,
-  "deployment_performed": false,
-  "ready_for_deployment_note": "Измерения в объёме «минимум» выполнены и критерии соблюдены; подтверждённых замедлений нет. Значение false до отдельного подтверждения владельца именно для этого бинарника (решение владельца от 2026-11-14, пункт 5) и согласованного окна.",
+  "status": "DEPLOYED_AS_MAIN_BY_OWNER_DECISION",
+  "document_status": "VARIANT_B_MEASURED_MINIMUM_SCOPE_OWNER_APPROVED_DEPLOYED",
+  "ready_for_deployment": true,
+  "deployment_performed": true,
+  "ready_for_deployment_note": "Решение владельца от 2026-11-14 около 23:58 MSK («Переключай сейчас») после отчёта о результатах измерений в объёме «минимум». Значение true выставлено по этому решению; общая приёмка качества не объявлена, память за час для этой сборки не измерялась.",
   "authorization": {
     "scope": "Сборка, измерения в объёме «минимум», подготовка комплекта launcher; перевод — только после подтверждения владельца для бинарника 94a09930.",
     "owner_quality_acceptance": false,
-    "owner_deployment_approval": false,
-    "historical_approvals_apply": false
+    "owner_deployment_approval": true,
+    "historical_approvals_apply": false,
+    "owner_deployment_approval_applies_to_binary_sha256": "94a09930418b677352139356881c1eba5dbcae4f1a0c856feb9916fd4be924f8"
   },
   "candidate": {
     "source_sha": "004d8fa1fa3570c7d829510d3018a8b6684cd4c6",
@@ -21,7 +22,7 @@
     "expected_version": "gufo version development (004d8fa1fa3570c7d829510d3018a8b6684cd4c6)",
     "built_at": "2026-11-14T22:31:00+03:00",
     "build_status": "COMPLETED",
-    "deployed_as_main": false,
+    "deployed_as_main": true,
     "stand_path": "~/gufo-remed-20261113/cand/004d8fa1fa3570c7d829510d3018a8b6684cd4c6/gufo",
     "release_copy_prepared": "/home/truezero/gufo-release/004d8fa1-94a09930/bin/gufo",
     "change_kind": "ABBFB006_PLUS_SHADOWED_LOG_ACTION_AND_COMMENTS",
@@ -153,33 +154,7 @@
     "stand_downtime_s": 4436,
     "ref": ".local/remed-20261113/round3/stageB/README.md"
   },
-  "blocking_reasons": [
-    {
-      "id": "OWNER_CONFIRMATION",
-      "status": "PENDING",
-      "reason": "Нужно подтверждение владельца для бинарника 94a09930 и согласованное окно перевода."
-    },
-    {
-      "id": "C4_QUEUE_BIMODAL",
-      "status": "OPEN_OBSERVATION_NOT_CONFIRMED",
-      "reason": "Флаг замедления очереди при четырёх пользователях повтором не подтверждён; медленный режим встречался у кандидата чаще (3 из 6 против 1 из 6), различие не доказано."
-    },
-    {
-      "id": "MEMORY_SCOPE",
-      "status": "NOT_MEASURED_FOR_THIS_BINARY",
-      "reason": "Час памяти для этой сборки не выполнялся по решению владельца."
-    },
-    {
-      "id": "KERNEL_7_3_4",
-      "status": "NEW_ENVIRONMENT",
-      "reason": "Машина с 22:18 работает на ядре 7.3.4; три часа памяти третьего круга сняты на 7.3.3."
-    },
-    {
-      "id": "INDEPENDENT_REVIEW",
-      "status": "NOT_DONE_FOR_VARIANT_B",
-      "reason": "Правки варианта Б и документы о нём независимый рецензент не проверял."
-    }
-  ],
+  "blocking_reasons": [],
   "known_limits_accepted_by_owner": [
     {
       "id": "QUALITY_CONTRACT",
@@ -242,12 +217,89 @@
     "launcher_version": 15,
     "generated": true,
     "prepared_on_stand": "2026-11-14 23:55 MSK, PREPARE_OK без остановки сервера",
-    "installed": false,
+    "installed": true,
     "ref": "LLM_FAEX2/results/2026-11-15-gufo-cutover-v15/",
     "procedure_ref": "docs/faex2/CANDIDATE_SWITCH_ROUND3_2026-11-14.md (тот же порядок, идентичности из этого manifest)"
   },
   "legacy_manifest": {
     "path": "docs/faex2/CANDIDATE_ROUND3_2026-11-14.json",
     "preserve_unchanged": true
+  },
+  "updated_at": "2026-11-15T00:05:00+03:00",
+  "known_limits_at_deployment": [
+    {
+      "id": "C4_QUEUE_BIMODAL",
+      "status": "OPEN_OBSERVATION_NOT_CONFIRMED",
+      "reason": "Флаг замедления очереди при четырёх пользователях повтором не подтверждён; медленный режим встречался у кандидата чаще (3 из 6 против 1 из 6), различие не доказано."
+    },
+    {
+      "id": "MEMORY_SCOPE",
+      "status": "NOT_MEASURED_FOR_THIS_BINARY",
+      "reason": "Час памяти для этой сборки не выполнялся по решению владельца."
+    },
+    {
+      "id": "KERNEL_7_3_4",
+      "status": "NEW_ENVIRONMENT",
+      "reason": "Машина с 22:18 работает на ядре 7.3.4; три часа памяти третьего круга сняты на 7.3.3."
+    },
+    {
+      "id": "INDEPENDENT_REVIEW",
+      "status": "NOT_DONE_FOR_VARIANT_B",
+      "reason": "Правки варианта Б и документы о нём независимый рецензент не проверял."
+    }
+  ],
+  "deployment": {
+    "window_named_by_owner": "Переключай сейчас (2026-11-14, около 23:58 MSK)",
+    "launcher_version": 15,
+    "launcher_sha256": {
+      "faex2_owner.py": "a87bfa572e8ce7107e5de35b750fe763c42d66970268f1005aa4c8dcb1088418",
+      "faex2-launch.json": "77c961d96e03a3601210966df06d3ad044e6e249851147563ea3a4cdd8484f19",
+      "fork_restart.sh": "9450608e20ae88c272159ccfde47e110258144ed469cf453ff02900c6ff206a9"
+    },
+    "cutover": {
+      "stopped": "2026-11-14 23:58:47",
+      "ready": "2026-11-14 23:59:11",
+      "automatic_rollback_used": false
+    },
+    "recovery_check": {
+      "time_msk": "23:59:24–00:00:12",
+      "recovery_binary": "abbfb006/e760a663",
+      "recovery_answer_ok": true,
+      "dropped_path_rejected": "1195d154"
+    },
+    "disk_snapshot_restart_check": {
+      "before_prefill_tokens": 7796,
+      "after_prefill_tokens": 7,
+      "after_cached_tokens": 7789,
+      "disk_hit": true,
+      "restore_ms": 163.1,
+      "same_text": true
+    },
+    "final_check": {
+      "time_msk": "2026-11-15 00:00:24",
+      "status": "READY",
+      "pid": 54375,
+      "identities_match": true,
+      "proc_exe_sha256_matches": true,
+      "health": true,
+      "text": true,
+      "tool": true,
+      "vision": true,
+      "kernel_clean": true,
+      "server_log_errors": 0,
+      "kernel": "7.3.4-1-cachyos"
+    },
+    "api_downtime_s": [
+      24,
+      48
+    ],
+    "namespace": "main-004d8fa1-94a09930",
+    "not_verified": [
+      "память за час для этой сборки",
+      "длительная работа на рабочем порту",
+      "автоперезапуск после настоящей аварии",
+      "нагрузочный сценарий «сосед»"
+    ],
+    "evidence_ref": "LLM_FAEX2/results/2026-11-15-gufo-cutover-v15/"
   }
 }
