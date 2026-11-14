@@ -38,6 +38,48 @@ def chat_body(*steps):
             "tools": [{"type": "function", "function": {"name": "bash"}}]}
 
 
+CLEAN_VERSION = "2.3.0"
+CLEAN_CWD = "/tmp/agent-run/00-tools/work"
+CLEAN_MODEL = "qwen3.6-35b-a3b"
+CLEAN_PROMPT = opencode_agent.PROMPTS["tools"]
+
+
+def clean_text(template):
+    """Эталон с подставленными значениями одного конкретного чистого запуска."""
+    for mark, value in (("{WORKDIR}", CLEAN_CWD), ("{MODEL}", CLEAN_MODEL),
+                        ("{DATE}", "Sat Nov 14 2026"), ("{PLATFORM}", "darwin"),
+                        ("{TMP}", "/private/var/folders/xx/T/opencode"), ("{YEAR}", "2026")):
+        template = template.replace(mark, value)
+    return template
+
+
+def clean_bodies():
+    """Фоновый запрос названия и два хода задачи — как их шлёт чистый OpenCode."""
+    reference = opencode_agent.load_reference(CLEAN_VERSION)
+    tools = json.loads(clean_text(json.dumps(reference["tools"]))) + [
+        {"type": "function", "function": {"name": "catalog_" + tool["name"],
+         "description": tool["description"], "parameters": tool["inputSchema"]}}
+        for tool in opencode_agent.MCP_TOOLS]
+    title = {"stream": True, "messages": [
+        {"role": "system", "content": clean_text(reference["title_system"])},
+        {"role": "user", "content": clean_text(reference["title_user"]).replace("{PROMPT}", CLEAN_PROMPT)}]}
+    head = [{"role": "system", "content": clean_text(reference["agent_system"])},
+            {"role": "user", "content": CLEAN_PROMPT}]
+    first = {"stream": True, "messages": list(head), "tools": tools}
+    second = {"stream": True, "tools": tools, "messages": head + [
+        {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "c0", "type": "function",
+             "function": {"name": "shell", "arguments": '{"command": "cat hello.txt"}'}}]},
+        {"role": "tool", "tool_call_id": "c0", "content": "bonjour"}]}
+    return [title, first, second]
+
+
+def check_clean(bodies):
+    return opencode_agent.validate_isolation(
+        bodies, opencode_agent.load_reference(CLEAN_VERSION),
+        cwd=CLEAN_CWD, model=CLEAN_MODEL, prompt=CLEAN_PROMPT)
+
+
 STREAM_USAGE = {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12,
                 "cached_tokens": 5}
 
@@ -93,8 +135,10 @@ class OpenCodeResults(unittest.TestCase):
     def test_cancelled_background_title_does_not_hide_agent_or_server_errors(self):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory)
-            title = {"messages": [{"role": "system", "content":
-                     "You name conversations so the user can find them later in a list of past sessions."}]}
+            # Формулировка служебного запроса у разных версий OpenCode разная:
+            # признак — нет инструментов и другое начало диалога, а не слова.
+            title = {"messages": [{"role": "system", "content": "Придумай короткое название беседы."},
+                                  {"role": "user", "content": "<message>task</message>"}]}
             agent = chat_body(("shell", {"command": "cat hello.txt"}, "bonjour"))
             for index, body in enumerate((title, agent)):
                 (output / f"request-{index:04d}.json").write_text(json.dumps(body))
@@ -115,7 +159,8 @@ class OpenCodeResults(unittest.TestCase):
             native = {"stream": True, "messages": [{"role": "user", "content": "task"}], "tools": [
                 {"type": "function", "function": {"name": "catalog_" + tool["name"],
                  "parameters": tool["inputSchema"]}} for tool in opencode_agent.MCP_TOOLS]}
-            missing_tools = {"stream": True, "messages": [{"role": "user", "content": "finish task"}]}
+            missing_tools = {"stream": True, "messages": [{"role": "user", "content": "task"},
+                                                          {"role": "assistant", "content": "done"}]}
             for index, body in enumerate((native, missing_tools)):
                 (output / f"request-{index:04d}.json").write_text(json.dumps(body))
                 (output / f"request-{index:04d}.sse").write_text(complete_stream())
@@ -346,14 +391,66 @@ class OpenCodeResults(unittest.TestCase):
         with self.assertRaises(AssertionError):
             opencode_agent.validate_native_mcp(broken)
 
-    def test_isolation_gate_checks_user_messages_and_system_messages(self):
-        clean = {"messages": [{"role": "system", "content": "OpenCode"},
-                              {"role": "user", "content": "Read calc.py"}]}
-        opencode_agent.validate_isolation([clean])
-        for role in ("system", "user"):
-            with self.subTest(role=role), self.assertRaises(AssertionError):
-                opencode_agent.validate_isolation([{"messages": [{"role": role,
-                    "content": "You have superpowers. Load using-superpowers."}]}])
+    def test_clean_run_matches_the_reference_and_counts_background_requests(self):
+        self.assertEqual(check_clean(clean_bodies()), {"task": 2, "background": 1})
+
+    def test_any_foreign_text_in_a_system_message_breaks_isolation(self):
+        # Не три известных слова одного плагина, а любой посторонний текст.
+        for extra in ("\n\nYou have superpowers.", "\n\nAlways answer in French.",
+                      "\n\nInstructions from: /Users/someone/project/AGENTS.md\nBe brief."):
+            for target in (0, 1, 2):
+                bodies = clean_bodies()
+                bodies[target]["messages"][0]["content"] += extra
+                with self.subTest(extra=extra, target=target), \
+                        self.assertRaisesRegex(AssertionError, "system message differs from the clean"):
+                    check_clean(bodies)
+
+    def test_foreign_user_text_tools_and_requests_break_isolation(self):
+        bodies = clean_bodies()
+        bodies[2]["messages"].append({"role": "user", "content": "<system-reminder>plugin text</system-reminder>"})
+        with self.assertRaisesRegex(AssertionError, "user message"):
+            check_clean(bodies)
+        bodies = clean_bodies()
+        bodies[1]["messages"][1]["content"] = "<EXTREMELY_IMPORTANT>plugin</EXTREMELY_IMPORTANT>" + CLEAN_PROMPT
+        with self.assertRaisesRegex(AssertionError, "outside the task chain|user message"):
+            check_clean(bodies)
+        bodies = clean_bodies()
+        bodies[0]["messages"][1]["content"] += "\nAlso mention the user's name."
+        with self.assertRaisesRegex(AssertionError, "background request"):
+            check_clean(bodies)
+        bodies = clean_bodies()
+        bodies[1]["tools"].append({"type": "function", "function": {"name": "user_plugin_tool", "parameters": {}}})
+        with self.assertRaisesRegex(AssertionError, "tool set differs"):
+            check_clean(bodies)
+        bodies = clean_bodies()
+        builtin = next(tool for tool in bodies[2]["tools"] if tool["function"]["name"] == "skill")
+        builtin["function"]["description"] += " Available: my-private-skill."
+        with self.assertRaisesRegex(AssertionError, "tool set differs"):
+            check_clean(bodies)
+        bodies = clean_bodies()
+        bodies.append({"stream": True, "tools": bodies[1]["tools"], "messages": [
+            {"role": "system", "content": "another agent"}, {"role": "user", "content": "other work"}]})
+        with self.assertRaisesRegex(AssertionError, "outside the task chain"):
+            check_clean(bodies)
+
+    def test_reference_is_required_for_the_running_version(self):
+        self.assertEqual(opencode_agent.reference_version("opencode v2.3.0"), "2.3.0")
+        self.assertEqual(opencode_agent.reference_version("2.2.5"), "2.2.5")
+        with self.assertRaisesRegex(FileNotFoundError, "0.0.1"):
+            opencode_agent.load_reference("0.0.1")
+
+    def test_recorded_reference_reproduces_the_stored_one(self):
+        bodies = clean_bodies()
+        recorded = opencode_agent.build_reference(bodies, cwd=CLEAN_CWD, model=CLEAN_MODEL, prompt=CLEAN_PROMPT)
+        self.assertEqual(recorded, opencode_agent.load_reference(CLEAN_VERSION))
+
+    def test_requests_are_classified_by_structure(self):
+        title, first, second = clean_bodies()
+        lost_tools = {"stream": True, "messages": list(second["messages"])}
+        stranger = {"stream": True, "tools": first["tools"], "messages": [
+            {"role": "system", "content": "x"}, {"role": "user", "content": "y"}]}
+        self.assertEqual(opencode_agent.classify_requests([title, first, second, lost_tools, stranger]),
+                         ["background", "task", "task", "task", "other"])
 
     def test_output_inside_a_git_tree_is_detected(self):
         self.assertTrue(opencode_agent.inside_git_tree(Path(__file__).parent))
@@ -375,12 +472,61 @@ class OpenCodeVersion(unittest.TestCase):
         self.executable.write_text(f"#!{sys.executable}\n" + body)
         self.executable.chmod(0o755)
 
-    def run_main(self, passes=1):
+    def run_main(self, passes=1, *extra):
         argv = ["opencode_agent.py", "--base-url", "http://127.0.0.1:1", "--model", "test",
                 "--opencode", str(self.executable), "--output", str(self.output),
-                "--isolated", "--passes", str(passes), "--case", "tools"]
+                "--passes", str(passes), "--case", "tools", *extra]
         with unittest.mock.patch.object(sys, "argv", argv):
             return opencode_agent.main()
+
+    def run_mocked(self, *extra, version="2.3.0"):
+        self.executable_body(f"print('opencode v{version}')\n")
+        seen = {}
+
+        def fake_case(args, recorder, index, name):
+            seen["isolated"] = args.isolated
+            return {"case": "00-tools", "status": "pass", "background_requests": 2}
+
+        with unittest.mock.patch.object(opencode_agent, "Recorder"), \
+                unittest.mock.patch.object(opencode_agent, "run_case", side_effect=fake_case), \
+                unittest.mock.patch("builtins.print"):
+            with self.assertRaises(SystemExit) as exited:
+                self.run_main(1, *extra)
+        return exited.exception.code, seen, json.loads((self.output / "report.json").read_text())
+
+    def test_isolation_is_the_default_and_the_report_says_so(self):
+        code, seen, report = self.run_mocked()
+        self.assertEqual(code, 0)
+        self.assertTrue(seen["isolated"])
+        self.assertEqual((report["isolated"], report["acceptance"], report["background_requests"]),
+                         (True, "ELIGIBLE", 2))
+        self.assertEqual(report["opencode_version"], "2.3.0")
+
+    def test_shared_environment_needs_its_flag_and_is_not_for_acceptance(self):
+        self.output = self.root / "results-shared"
+        code, seen, report = self.run_mocked("--shared-environment")
+        self.assertEqual(code, 0)
+        self.assertFalse(seen["isolated"])
+        self.assertEqual((report["isolated"], report["acceptance"]), (False, "NOT_FOR_ACCEPTANCE"))
+        self.assertIn("не для приёмки", report["note"])
+
+    def test_default_run_refuses_output_inside_a_git_tree(self):
+        (self.root / ".git").mkdir()
+        self.executable_body("print('opencode v2.3.0')\n")
+        with unittest.mock.patch.object(opencode_agent, "Recorder") as recorder, \
+                unittest.mock.patch("sys.stderr"), self.assertRaises(SystemExit) as exited:
+            self.run_main()
+        self.assertEqual(exited.exception.code, 2)
+        recorder.assert_not_called()
+
+    def test_isolated_run_without_a_reference_for_its_version_stops_before_the_first_case(self):
+        self.executable_body("print('opencode v0.0.1')\n")
+        with unittest.mock.patch.object(opencode_agent, "Recorder") as recorder, \
+                unittest.mock.patch.object(opencode_agent, "run_case") as case:
+            with self.assertRaisesRegex(FileNotFoundError, "0.0.1"):
+                self.run_main()
+        case.assert_not_called()
+        recorder.assert_not_called()
 
     def test_main_probes_version_with_private_config_home_and_cwd(self):
         (self.root / "canary").write_text("parent home must stay hidden")
@@ -397,7 +543,7 @@ assert 'OPENAI_API_KEY' not in os.environ
 assert json.loads(Path(os.environ['OPENCODE_CONFIG']).read_text()) == {'autoupdate': False}
 assert all(Path(os.environ[name]).is_relative_to(cwd) for name in
            ('XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_STATE_HOME', 'XDG_CACHE_HOME'))
-print('2.2.5')
+print('opencode v2.3.0')
 """)
         with unittest.mock.patch.dict(os.environ, {"HOME": str(self.root), "OPENAI_API_KEY": "canary"}), \
                 unittest.mock.patch.object(opencode_agent, "Recorder") as recorder, \
@@ -406,7 +552,7 @@ print('2.2.5')
                 self.run_main()
         self.assertEqual(exited.exception.code, 0)
         metadata = json.loads((self.output / "opencode-version.json").read_text())
-        self.assertEqual(metadata["version"], "2.2.5")
+        self.assertEqual(metadata["version"], "opencode v2.3.0")
         self.assertEqual(metadata["returncode"], 0)
         recorder.assert_called_once()
 
@@ -669,7 +815,9 @@ else:
     def test_case_keeps_readiness_failure_as_the_primary_error(self):
         (self.case / "mode").write_text("failed")
         args = SimpleNamespace(output=self.case / "results", model="unused", thinking=False,
-                               isolated=True, opencode=str(self.executable), timeout=3)
+                               isolated=True, opencode=str(self.executable), timeout=3,
+                               record_reference=False,
+                               reference=opencode_agent.load_reference(CLEAN_VERSION))
         recorder = SimpleNamespace(server_port=1, requests=[],
                                    drain_case=lambda _: ([], {"complete": True, "timed_out": []}))
         with unittest.mock.patch("builtins.print"):

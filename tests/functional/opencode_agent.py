@@ -169,36 +169,162 @@ def validate_native_mcp(body):
         assert contains(declared[name], tool["inputSchema"]), ("MCP schema was weakened", name)
 
 
-def validate_isolation(bodies):
-    """Catch the external plugin instructions observed in the contaminated run."""
+REFERENCES = Path(__file__).resolve().parent / "fixtures" / "opencode_clean"
+
+
+def reference_version(reported):
+    """`opencode --version` prints "opencode v2.3.0" or the bare number."""
+    match = re.search(r"\d+\.\d+\.\d+", reported)
+    return match.group(0) if match else reported.strip()
+
+
+def load_reference(version):
+    """What a clean OpenCode of this version sends before anything of the user is added."""
+    path = REFERENCES / f"{version}.json"
+    if not path.exists():
+        raise FileNotFoundError(
+            f"no clean-run reference for OpenCode {version} at {path}; record one with "
+            "--record-reference in an isolated run, review it and add it to the repository")
+    return json.loads(path.read_text())
+
+
+def normalize_run_text(text, cwd, model):
+    """Replace what legitimately differs between two clean runs with fixed marks."""
+    text = text.replace(str(cwd), "{WORKDIR}")
+    text = re.sub(r"(?m)^(- (?:Name|Model ID): )" + re.escape(model) + "$", r"\1{MODEL}", text)
+    text = re.sub(r"(?m)^(Today's date: ).*$", r"\1{DATE}", text)
+    text = re.sub(r"(?m)^(  Platform: ).*$", r"\1{PLATFORM}", text)
+    text = re.sub(r"(?m)^(  Prefer )\S+( over generic system temporary directories)", r"\1{TMP}\2", text)
+    return re.sub(r"(The current year is )\d{4}", r"\1{YEAR}", text)
+
+
+def message_text(message):
+    content = message.get("content")
+    if isinstance(content, list):
+        return "".join(part.get("text", "") for part in content if isinstance(part, dict))
+    return content if isinstance(content, str) else ""
+
+
+def leading_messages(body):
+    """The system messages and the first user message: what a continued dialogue keeps."""
+    lead = []
+    for message in body.get("messages", []):
+        lead.append((message.get("role"), message_text(message)))
+        if message.get("role") == "user":
+            break
+    return lead
+
+
+def classify_requests(bodies):
+    """`task`, `background` or `other` for each request body of one case.
+
+    The task chain is the first request with tools and every request that
+    starts with the same system and first user message. A request with no
+    tools outside that chain is a background service request, such as the
+    conversation title; its wording differs between OpenCode versions.
+    """
+    head = next((leading_messages(body) for body in bodies if body.get("tools")), None)
+    kinds = []
+    for body in bodies:
+        if head is not None and leading_messages(body) == head:
+            kinds.append("task")
+        else:
+            kinds.append("other" if body.get("tools") else "background")
+    return kinds
+
+
+def builtin_tools(body, cwd, model):
+    """Tool definitions that are not the test's own MCP catalog, in a stable form."""
+    tools = [tool for tool in body.get("tools", [])
+             if not tool.get("function", {}).get("name", "").startswith("catalog_")]
+    return json.loads(normalize_run_text(json.dumps(tools, sort_keys=True, ensure_ascii=False), cwd, model))
+
+
+def build_reference(bodies, *, cwd, model, prompt):
+    """Reference of a clean run, from its recorded title and first task request."""
+    kinds = classify_requests(bodies)
+    task = next(body for body, kind in zip(bodies, kinds) if kind == "task")
+    title = next(body for body, kind in zip(bodies, kinds) if kind == "background")
+    title_user = next(message_text(m) for m in title["messages"] if m.get("role") == "user")
+    assert prompt in title_user, "the background request does not carry the task prompt"
+    return {
+        "agent_system": normalize_run_text(message_text(task["messages"][0]), cwd, model),
+        "title_system": normalize_run_text(message_text(title["messages"][0]), cwd, model),
+        "title_user": normalize_run_text(title_user.replace(prompt, "{PROMPT}"), cwd, model),
+        "tools": builtin_tools(task, cwd, model),
+    }
+
+
+def first_difference(actual, expected):
+    index = next((i for i, (a, b) in enumerate(zip(actual, expected)) if a != b),
+                 min(len(actual), len(expected)))
+    return {"offset": index, "sent": actual[max(0, index - 80):index + 200],
+            "clean": expected[max(0, index - 80):index + 200]}
+
+
+def validate_isolation(bodies, reference, *, cwd, model, prompt):
+    """Nothing but what a clean OpenCode sends may reach the model.
+
+    Instructions from the user's directories arrive as extra system text,
+    extra user messages or extra tools, in any wording. So every system
+    message, every user message and every built-in tool definition must equal
+    the clean-run reference of this OpenCode version; only the working
+    directory, model name, date, platform and temporary directory may differ.
+    """
     require_assertions()
-    for index, body in enumerate(bodies):
-        messages = json.dumps(body.get("messages", body.get("input", [])), ensure_ascii=False)
-        for marker in ("You have superpowers", "using-superpowers", "superpowers:brainstorming"):
-            assert marker not in messages, ("external instructions in isolated request", index, marker)
+    kinds = classify_requests(bodies)
+    for index, (body, kind) in enumerate(zip(bodies, kinds)):
+        assert kind != "other", ("request with tools outside the task chain", index,
+                                 [text[:200] for _, text in leading_messages(body)])
+        messages = body.get("messages", [])
+        systems = [normalize_run_text(message_text(m), cwd, model) for m in messages if m.get("role") == "system"]
+        users = [message_text(m) for m in messages if m.get("role") == "user"]
+        expected_system = reference["agent_system" if kind == "task" else "title_system"]
+        assert systems == [expected_system], (
+            "system message differs from the clean reference", index, kind, len(systems),
+            first_difference("\n".join(systems), expected_system))
+        if kind == "task":
+            assert users == [prompt], ("user message is not exactly the task prompt", index, len(users),
+                                       [text[:200] for text in users])
+            sent = builtin_tools(body, cwd, model)
+            if sent != reference["tools"]:
+                names = lambda tools: sorted(tool["function"]["name"] for tool in tools)
+                changed = [a["function"]["name"] for a in sent for b in reference["tools"]
+                           if a["function"]["name"] == b["function"]["name"] and a != b]
+                raise AssertionError(("tool set differs from the clean reference", index,
+                                      {"sent": names(sent), "clean": names(reference["tools"]),
+                                       "changed": changed}))
+            catalog = {"catalog_" + tool["name"] for tool in MCP_TOOLS}
+            extra = {tool["function"]["name"] for tool in body.get("tools", [])
+                     if tool["function"]["name"].startswith("catalog_")} - catalog
+            assert not extra, ("tool set differs from the clean reference", index, sorted(extra))
+        else:
+            expected_user = reference["title_user"].replace("{PROMPT}", prompt)
+            assert [normalize_run_text(text, cwd, model) for text in users] == [expected_user], (
+                "background request differs from the clean reference", index,
+                [text[:300] for text in users])
+            assert not body.get("tools"), ("background request carries tools", index)
+    return {"task": kinds.count("task"), "background": kinds.count("background")}
 
 
 def validate_requests(rows, output, *, native_mcp=False):
     """Every agent turn stays native and reuses the previous one."""
     require_assertions()
     agent = []
-    for row in rows:
+    bodies = [json.loads((output / f"request-{row['index']:04d}.json").read_text()) for row in rows]
+    for row, body, kind in zip(rows, bodies, classify_requests(bodies)):
         assert row.get("finalized") is True, ("HTTP request not finalized", row)
         assert not row.get("drain_timeout"), ("HTTP request exceeded recorder drain timeout", row)
-        body = json.loads((output / f"request-{row['index']:04d}.json").read_text())
         # OpenCode cancels its background conversation-title request when the
         # foreground task finishes. Keep its raw failure, but do not mistake
         # that client cancellation for an agent/tool failure. Server errors,
         # timeouts and disconnected foreground requests remain failures.
-        title = not body.get("tools") and any(
-            message.get("role") == "system" and isinstance(message.get("content"), str)
-            and message["content"].startswith("You name conversations so the user can find them later")
-            for message in body.get("messages", []))
+        title = kind == "background"
         cancelled_title = title and str(row.get("error", "")).startswith(
             ("BrokenPipeError(", "ConnectionResetError("))
         assert row.get("status") == 200 and (not row.get("error") or cancelled_title), row
         if title:
-            continue  # opencode's title request has its own prompt
+            continue  # counted by the caller; it has its own prompt and no tools
         usage = validate_stream_completion(row.get("path", "/v1/chat/completions"), body,
                                            (output / f"request-{row['index']:04d}.sse").read_bytes())
         assert usage and row.get("usage") == usage, ("missing/inconsistent recorded terminal usage", row)
@@ -411,7 +537,8 @@ def probe_version(opencode, output, isolated, timeout=10):
 def private_opencode(opencode, case, cwd, env, deadline):
     """Own one V2 server and wait for its MCP catalog before the first prompt.
 
-    A cold `run --standalone` races asynchronous MCP startup in OpenCode 2.2.5.
+    A cold `run --standalone` races asynchronous MCP startup (seen in OpenCode
+    2.2.5; the same private-server sequence is used with 2.3.0).
     Readiness and the run must use this same server and canonical directory.
     The random loopback password is passed through env only, never saved.
     """
@@ -562,8 +689,14 @@ def run_case(args, recorder, index, name):
     try:
         bodies = [json.loads((args.output / f"request-{item['index']:04d}.json").read_text())
                   for item in row["requests"]]
-        if args.isolated:
-            validate_isolation(bodies)
+        row["background_requests"] = classify_requests(bodies).count("background")
+        if getattr(args, "record_reference", False):
+            if not (args.output / "opencode-clean-reference.json").exists():
+                save(args.output / "opencode-clean-reference.json",
+                     build_reference(bodies, cwd=cwd.resolve(), model=args.model, prompt=PROMPTS[name]))
+        elif args.isolated:
+            row["isolation"] = validate_isolation(bodies, args.reference, cwd=cwd.resolve(),
+                                                  model=args.model, prompt=PROMPTS[name])
         row["tool_results"] = validate_tool_results(name, tool_history(bodies), fixture)
     except Exception as error:
         if row["status"] == "pass":
@@ -591,18 +724,28 @@ def main():
     parser.add_argument("--timeout", type=float, default=600)
     parser.add_argument("--thinking", action="store_true",
                         help="Declare the model as reasoning, as opencode users do")
-    parser.add_argument("--isolated", action="store_true",
-                        help="Private opencode server, per-case HOME and a minimal environment; "
-                             "requires --output outside any git work tree")
+    parser.add_argument("--shared-environment", action="store_true",
+                        help="Run in the caller's HOME, configuration and variables instead of the "
+                             "default isolated per-case environment. The report is marked "
+                             "NOT_FOR_ACCEPTANCE: the user's instructions and plugins reach the model")
+    parser.add_argument("--record-reference", action="store_true",
+                        help="Write <output>/opencode-clean-reference.json from this isolated run "
+                             "instead of checking it against the stored reference. For review "
+                             "before adding a new OpenCode version; NOT_FOR_ACCEPTANCE")
     args = parser.parse_args()
     require_assertions()
+    args.isolated = not args.shared_environment
     if args.passes <= 0:
         parser.error("--passes must be positive: an empty acceptance run cannot pass")
+    if args.record_reference and not args.isolated:
+        parser.error("--record-reference needs the isolated environment")
     if args.isolated and inside_git_tree(args.output.resolve().parent):
-        parser.error("--isolated needs --output outside a git work tree: opencode would load "
+        parser.error("the isolated run needs --output outside a git work tree: opencode would load "
                      "that repository's instructions and configuration")
     args.output.mkdir(parents=True, exist_ok=False)
-    probe_version(args.opencode, args.output, args.isolated, timeout=min(10, args.timeout))
+    version = reference_version(
+        probe_version(args.opencode, args.output, args.isolated, timeout=min(10, args.timeout))["version"])
+    args.reference = load_reference(version) if args.isolated and not args.record_reference else None
     recorder = Recorder(args.base_url, args.output)
     import threading
     threading.Thread(target=recorder.serve_forever, daemon=True).start()
@@ -613,9 +756,19 @@ def main():
                 rows.append(run_case(args, recorder, len(rows), name))
     finally:
         recorder.shutdown()
-        save(args.output / "report.json", {"cases": rows})
+        report = {"opencode_version": version, "isolated": args.isolated,
+                  "acceptance": "ELIGIBLE" if args.reference is not None else "NOT_FOR_ACCEPTANCE",
+                  "background_requests": sum(row.get("background_requests", 0) for row in rows),
+                  "cases": rows}
+        if args.reference is None:
+            report["note"] = ("не для приёмки: " + (
+                "записан эталон чистого запуска, сверка с эталоном не выполнялась" if args.record_reference
+                else "запуск в общем окружении пользователя, его инструкции и плагины могли попасть в запросы"))
+        save(args.output / "report.json", report)
     failed = [row["case"] for row in rows if row["status"] != "pass"]
-    print(json.dumps({"passed": len(rows) - len(failed), "failed": failed}))
+    print(json.dumps({"passed": len(rows) - len(failed), "failed": failed,
+                      "acceptance": report["acceptance"],
+                      "background_requests": report["background_requests"]}, ensure_ascii=False))
     sys.exit(1 if failed else 0)
 
 
