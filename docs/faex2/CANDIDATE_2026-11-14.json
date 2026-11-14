@@ -1,9 +1,9 @@
 {
   "schema": "gufo-faex2.candidate.v1",
   "date": "2026-11-14",
-  "prepared_at": "2026-11-14T00:05:40.061752+00:00",
+  "prepared_at": "2026-11-14T07:03:01+03:00",
   "status": "PREPARED_NOT_ACCEPTED",
-  "document_status": "DRAFT_FOR_REVIEW",
+  "document_status": "DRAFT_FFC_PAIR_REVIEWED_HOUR_RUNNING",
   "ready_for_deployment": false,
   "deployment_performed": false,
   "authorization": {
@@ -13,30 +13,34 @@
     "historical_approvals_apply": false
   },
   "candidate": {
-    "source_sha": "b641fe3eb4d6a91352a007587b4f17a440fc4aff",
-    "binary_sha256": "ef7e3040138761614641311e12efe6e335dfbd5e5b244b578a0e4b4833310cb1",
+    "source_sha": "ffc8580a6edb0eae5e26c2a99c0712084faa948d",
+    "binary_sha256": "8acf34daf647512159ca29c331f380d4472a7fc3d310968fa4cafc4098bb67a1",
     "binary_kind": "ordinary",
     "diagnostic": false,
-    "expected_version": "gufo version development (b641fe3eb4d6a91352a007587b4f17a440fc4aff)",
-    "built_at": "2026-11-14T02:30:26.942865+03:00",
+    "expected_version": "gufo version development (ffc8580a6edb0eae5e26c2a99c0712084faa948d)",
+    "built_at": "2026-11-14T06:06:18.055341+03:00",
     "build_status": "COMPLETED",
     "deployed_as_main": false,
-    "change_kind": "EARLY_ADVISORY_MIN_STEP_BEFORE_QUEUE_RETENTION",
+    "change_kind": "EXACT_QWEN_MTP_SNAPSHOT_STREAMING_WITH_BOUNDED_SCRATCH",
     "writer_final_recheck_preserved": true,
     "ram_freeze_and_publication_unchanged": true,
     "numerical_arithmetic_unchanged": true,
     "identical_future_cache_hits_guaranteed": false,
-    "full_private_manifest_ref": ".local/remed-20261113/codex-closeout/remote-evidence/build-minstep1/cand/b641fe3eb4d6a91352a007587b4f17a440fc4aff/MANIFEST.json",
-    "full_private_manifest_sha256": "c225ca732721e4e344cdd64ec38b48d808667f2c2ccb52549d1e2c67c502ea1f"
+    "full_private_manifest_ref": ".local/remed-20261113/codex-closeout/snapshot-stream-step2/staged-remote-v2/cand/ffc8580a6edb0eae5e26c2a99c0712084faa948d/MANIFEST.json",
+    "full_private_manifest_sha256": "4f13939e97eb2a34008e95b444fc741b83befea723783e141ba92d9883985347",
+    "inherited_min_step_policy": "b641 early advisory min_step сохранён; одинаковые будущие cache hits не гарантированы.",
+    "serialization_format_and_numerical_identity_unchanged": true,
+    "device_transfer_scratch_bytes": 8388608,
+    "sink_callback_cap_bytes": 16777216
   },
   "build_environment": {
     "target": "Linux x86-64 gfx1151",
     "c_and_cxx_compiler": "c++ (GCC) 16.2.1 20260810",
     "hip_compiler": "AMD clang version 24.0.0git (https://github.com/ROCm/llvm-project.git d6f6cb691863e9258034ab48c1dfce21689d5606)",
     "matched_control_build_settings": true,
-    "provenance_ref": ".local/remed-20261113/codex-closeout/remote-evidence/build-minstep1/cand/b641fe3eb4d6a91352a007587b4f17a440fc4aff/MANIFEST.json",
-    "python_on_stand": "3.14.10 (main, Nov 11 2026, 08:10:30) [GCC 16.2.1 20260810]",
-    "python_provenance_scope": "Фактический Python клиента из partial state final3, не историческое значение final2 и не итог модельной приёмки.",
+    "provenance_ref": ".local/remed-20261113/codex-closeout/snapshot-stream-step2/staged-remote-v2/cand/ffc8580a6edb0eae5e26c2a99c0712084faa948d/MANIFEST.json",
+    "python_on_stand": "3.14.10",
+    "python_provenance_scope": "Фактический Python3.14.10 проверен в обоих A2/B2 и перед compose final4; это не квалификация сравнительной скорости.",
     "matched_control_build_settings_scope": "Поле build manifest относится к настройкам сборки. Совпадение версий cc/HIP не доказывает идентичный runtime или набор загруженных библиотек."
   },
   "runtime_provenance": {
@@ -101,7 +105,21 @@
     "change_cause": "PACKAGE_TRANSACTION_OBSERVED: /var/log/pacman.log фиксирует обновления Python/OpenSSL/curl и других пакетов 2026-11-14 01:34:46–54 MSK. Кто запустил обновление, не установлено; причина конкретных timing pauses из этого не следует.",
     "package_history_ref": ".local/remed-20261113/codex-closeout/runtime-package-history.json",
     "package_history_sha256": "4b74b828c519085eedf667d3397d6b5844eb34f5c9ceaa83efba50c5d30ee11f",
-    "acceptance_scope": "Ownership-наблюдение cache5 и его INCONCLUSIVE_MONITOR сохранены. Собственные gates final3 завершены: RSS FAIL, остальные восемь PASS; runtime mismatch не отменяет отказ."
+    "acceptance_scope": "A2/B2 correctness/storage PASS в узком scope, strict timing INCONCLUSIVE. Final4 RUNNING; historical failures не изменены.",
+    "pending_ordinary_pair": {
+      "status": "ACTUAL_PAIR_REVIEWED_INCONCLUSIVE",
+      "canonical_runtime_expected_sha256": "bbfc01d2ae1fab6ead5273fef81e068c74370326f72e0fa7241bd47e26c9d6c9",
+      "required_elf_files": 61,
+      "initial_A1": "FAIL_BEFORE_ANY_MODEL_REQUEST_B_NOT_RUN",
+      "helper_fix": "Btrfs maps/stat device representation linked through exact self-mmap/path/inode/namespace/mountinfo proof; no ignored identity mismatch.",
+      "helper_sha256": "7b6b35ff39977a7ce01f743497e69d83c927a332e960cae67e4ad3b49ad7f192",
+      "no_request_main_validation_ref": ".local/remed-20261113/codex-closeout/snapshot-stream-step2/runtime-btrfs-v1/live-validation-independent-review.json",
+      "no_request_main_validation_scope": "PASS только проверки helper на historical main; не actual A2/B2 loaded-module equivalence и не timing PASS.",
+      "comparison_ref": ".local/remed-20261113/codex-closeout/snapshot-stream-step2/timing-a2-b2-comparison-v3.json",
+      "comparison_sha256": "0242bca23a16f3c85804e3585e6fcbd9b7fcd46f84bae90ae199d1d1edd837ec",
+      "late_mapping_observation": "Каждый lifetime63ELF/3nonELF→64/4; поздние hipBLASLt hsaco и metadata, first probes8192B/ELF hash3623704B. Все исходные strict issues сохранены.",
+      "main_vocab_environment_note": "GUFO_MTP_VOCAB=0 у main vs absent isolated; source1195/ffc подтверждает инертность для actual Qwen3.6 embedded MTP, не effective draft-profile difference."
+    }
   },
   "assets": {
     "model": {
@@ -115,8 +133,8 @@
       "sha256": "da63cb47a76763c712393f8a017070188a304fa39f8aeea6edc629ed7b975cfa"
     },
     "provenance_ref": ".local/remed-20261113/codex-closeout/remote-evidence/accept-out/final1/state.json",
-    "provenance_scope": "Ожидаемые SHA модели и mmproj перенесены из сохранённого final1; здесь не заявлена новая проверка файлов для final3. Перед переводом их требуется сверить с фактически загруженными артефактами.",
-    "freshly_reverified_for_final3": false
+    "provenance_scope": "Ожидаемые SHA модели/mmproj сохранены из исторического manifest. Это не заявление о новом ordinary8acf inference/quality PASS; actual окна должны подтверждать pins отдельно.",
+    "freshly_reverified_for_current_candidate": false
   },
   "intended_profile": {
     "mode": "mtp1",
@@ -148,145 +166,81 @@
     "input_proof_ref": ".local/remed-20261113/codex-closeout/final3-proposal-b641/input-provenance-proof.json"
   },
   "fresh_cpu_verification": {
-    "subject_source_sha": "b641fe3eb4d6a91352a007587b4f17a440fc4aff",
-    "associated_ordinary_binary_sha256": "ef7e3040138761614641311e12efe6e335dfbd5e5b244b578a0e4b4833310cb1",
-    "freshly_tested_on_current_source": true,
-    "status": "PASS",
+    "status": "PASS_SOURCE_EQUIVALENT_TEST_BUILD",
+    "tested_source_base_sha": "36e46be38a956e6d24a2531947828a29ba5b1f57",
+    "tested_patch_sha256": "1e4923888e4e0855525a9e0247a42a9569e43676e901804978ecb8daa1b914e6",
+    "subject_source_sha": "ffc8580a6edb0eae5e26c2a99c0712084faa948d",
+    "associated_ordinary_binary_sha256": "8acf34daf647512159ca29c331f380d4472a7fc3d310968fa4cafc4098bb67a1",
+    "freshly_tested_on_current_binary": false,
+    "changed_source_files_exact_match": 16,
     "targets": [
       "continuation_cache_test",
+      "text_model_runner_test",
       "continuation_disk_store_test",
-      "text_model_runner_test"
+      "speculative_verification_test"
     ],
-    "evidence_ref": ".local/remed-20261113/codex-closeout/remote-evidence/build-minstep1/cand/b641fe3eb4d6a91352a007587b4f17a440fc4aff/MANIFEST.json",
-    "scope": "Три Linux CPU-targets текущего source прошли; этот результат не является модельной, численной или скоростной квалификацией ordinary binary."
+    "build_manifest_ref": ".local/remed-20261113/codex-closeout/snapshot-stream-green3/remote-evidence/snapshot-stream-green3/MANIFEST.json",
+    "build_manifest_sha256": "ec040ff80a7ba1f5897cddb277cf4970f13cafb80005c3fe12b72cfcafb7f399",
+    "independent_review_ref": ".local/remed-20261113/codex-closeout/snapshot-stream-green3-independent-review.json",
+    "independent_review_sha256": "f15e2a2cffa7bb617a3afbbd3f5fdd532dd94222746ae556b07014bb740084c6",
+    "scope": "CPU targets исполнены в отдельной GREEN3 test build; все16 изменённых source/test файлов побайтно равны commit ffc. Это не запуск ordinary ELF8acf и не модельная/скоростная квалификация."
   },
   "ordinary_verification": {
-    "subject_source_sha": "b641fe3eb4d6a91352a007587b4f17a440fc4aff",
-    "subject_binary_sha256": "ef7e3040138761614641311e12efe6e335dfbd5e5b244b578a0e4b4833310cb1",
+    "subject_source_sha": "ffc8580a6edb0eae5e26c2a99c0712084faa948d",
+    "subject_binary_sha256": "8acf34daf647512159ca29c331f380d4472a7fc3d310968fa4cafc4098bb67a1",
     "binary_kind": "ordinary",
     "composition": {
-      "status": "NOT_ACCEPTED",
-      "plan_ref": ".local/remed-20261113/codex-closeout/final3-proposal-b641/plan-final3.json",
-      "plan_sha256": "1a320db88d7acfcfe482b451eaf9b98099c2c00ef15020b98028e5b4bb149001",
-      "config_ref": ".local/remed-20261113/codex-closeout/final3-proposal-b641/config-final3.json",
-      "config_sha256": "a1592a4df69e337f1b03d965b82fc18acb7308f4d502821e356aee89b846053a",
-      "analysis_ledger_ref": ".local/remed-20261113/codex-closeout/final3-proposal-b641/analysis-ledger-preregistered.json",
-      "window_name": "codex-final3-b641",
-      "result": {
-        "review_ref": ".local/remed-20261113/codex-closeout/final3-b641-acceptance-review.json",
-        "status": "NOT_ACCEPTED",
-        "gates": {
-          "duration": {
-            "status": "PASS"
-          },
-          "wire_and_answers": {
-            "status": "PASS"
-          },
-          "post_refill": {
-            "status": "PASS"
-          },
-          "long_c4_mtp": {
-            "status": "PASS",
-            "qualified_rounds": 192,
-            "total_rounds": 192,
-            "partial_rounds": []
-          },
-          "cancellations": {
-            "status": "PASS"
-          },
-          "process_identity": {
-            "status": "PASS"
-          },
-          "restore": {
-            "status": "PASS"
-          },
-          "kernel": {
-            "status": "PASS"
-          },
-          "memory": {
-            "status": "FAIL",
-            "threshold_bytes": 1073741824,
-            "failed_metrics": {
-              "rss_bytes": 2508189696
-            }
-          }
-        },
-        "memory": {
-          "rss_bytes": {
-            "first_samples": 240,
-            "last_samples": 240,
-            "first_max": 6628700160,
-            "last_max": 9136889856,
-            "first_median": 3285237760.0,
-            "last_median": 3353491456.0,
-            "growth_max_bytes": 2508189696,
-            "growth_median_bytes": 68253696.0
-          },
-          "gtt_used_bytes": {
-            "first_samples": 240,
-            "last_samples": 240,
-            "first_max": 66275086336,
-            "last_max": 64398135296,
-            "first_median": 61148598272.0,
-            "last_median": 61142306816.0,
-            "growth_max_bytes": -1876951040,
-            "growth_median_bytes": -6291456.0
-          },
-          "vram_used_bytes": {
-            "first_samples": 240,
-            "last_samples": 240,
-            "first_max": 158044160,
-            "last_max": 158175232,
-            "first_median": 157798400.0,
-            "last_median": 158060544.0,
-            "growth_max_bytes": 131072,
-            "growth_median_bytes": 262144.0
-          },
-          "gpu_used_bytes": {
-            "first_samples": 240,
-            "last_samples": 240,
-            "first_max": 66433048576,
-            "last_max": 64556158976,
-            "first_median": 61306529792.0,
-            "last_median": 61300338688.0,
-            "growth_max_bytes": -1876889600,
-            "growth_median_bytes": -6191104.0
-          }
-        },
-        "load_seconds_after_warmup": 3610.6482179164886,
-        "requests": 1610,
-        "complete_responses": 1418,
-        "confirmed_cancellations": 192,
-        "long_continuations": 768,
-        "qualified_long_c4_rounds": 192,
-        "post_refill_checks": 4,
-        "full_long_history_cache_misses": 0,
-        "partial_c4_rounds": 0,
-        "archive_ref": ".local/remed-20261113/codex-closeout/codex-final3-b641-complete-archive.json",
-        "archive_sha256": "7d3f78f25d8565995c8997c7c07e7260fd6ed360faf36e2d833985f659e6bebf",
-        "restore_ref": ".local/remed-20261113/codex-closeout/final3-b641-live-restore.json",
-        "restored_main_pid": 915853,
-        "restored_main_checked_at": "2026-11-14T04:08:54.453817+03:00"
-      },
-      "status_basis": "Полные raw/result проверены frozen strict reviewer; memory RSS FAIL, остальные восемь gates PASS. Main восстановлен и независимо проверен.",
-      "expected_main_before_pid": 903758,
-      "nonce": "6af771b5",
+      "status": "RUNNING_NOT_EVALUATED",
+      "result": null,
+      "proposal_ref": ".local/remed-20261113/codex-closeout/final4-proposal-ffc/proposal-freeze.json",
+      "plan_ref": ".local/remed-20261113/codex-closeout/final4-proposal-ffc/plan-final4.json",
+      "config_ref": ".local/remed-20261113/codex-closeout/final4-proposal-ffc/config-final4.json",
+      "reviewer_ref": ".local/remed-20261113/codex-closeout/final4-proposal-ffc/final4-review.py",
       "duration_seconds_after_warmup": 3600,
-      "calibration": "Два исходных запроса 256/512, затем четыре fill; без --records и без agent holds.",
+      "nonce": "6af771b5",
       "memory_gate": {
         "comparison_window_seconds": 1200,
         "growth_threshold_bytes": 1073741824,
         "minimum_samples_per_window": 20,
-        "rule": "Прежние first/last20: рост максимума ИЛИ медианы выше порога даёт FAIL; final3 отклонён по росту максимума RSS."
+        "rule": "Рост максимума ИЛИ медианы первых/последних20 минут выше1073741824B даёт FAIL; старые final2/final3 FAIL сохраняются."
       },
-      "reviewer_ref": ".local/remed-20261113/codex-closeout/final3-proposal-b641/final3-review.py",
-      "reviewer_sha256": "a0fb29959bfa263fa00699f7851a1b22193853c64d520709526546acf42ea0c3",
-      "cold_partial_c4_policy": "Сохранить каждый cold reread, частичный C4 и тайминги; прежние две перечитки остаются OPEN. Новая квота допустимых misses не вводится.",
-      "comparison_scope": "Сравнение с final2 только диагностическое: runtime различается, historical result не даёт matched performance qualification; собственные критерии final3 неизменны."
+      "prerequisite": "Пара разобрана со всеми flags; correctness и integrity прошли, timing остаётся INCONCLUSIVE. Час проверяет отдельный неизменённый memory/correctness gate.",
+      "window_name": "codex-final4-ffc",
+      "started_at": "2026-11-14T07:02:24.733073+03:00",
+      "runtime_wrapper_sha256": "4d390370e891104c8f17c46fa5bd48a1ca91e1ba939548e59ff37691bc2e2b58"
     },
-    "model_agents": "NOT_EXECUTED",
-    "matched_speed": "NOT_EXECUTED",
-    "dedicated_api_smoke_and_restart_recovery": "NOT_EXECUTED"
+    "matched_speed": {
+      "status": "INCONCLUSIVE_EVIDENCE",
+      "result": {
+        "comparison_sha256": "0242bca23a16f3c85804e3585e6fcbd9b7fcd46f84bae90ae199d1d1edd837ec",
+        "comparison_ref": ".local/remed-20261113/codex-closeout/snapshot-stream-step2/timing-a2-b2-comparison-v3.json",
+        "request_cells": 180,
+        "phase_cells": 3,
+        "writer_cells": 1,
+        "flags": 9,
+        "issues": 46,
+        "work_differences": 2,
+        "acceptance": "NOT_QUALIFIED"
+      },
+      "control_source_sha": "b641fe3eb4d6a91352a007587b4f17a440fc4aff",
+      "control_binary_sha256": "ef7e3040138761614641311e12efe6e335dfbd5e5b244b578a0e4b4833310cb1",
+      "scope": "Все9 запросов каждой роли/184 cells сохранены. Runtime observer, cold monitor gaps и разный C4 admission препятствуют строгой квалификации;9flags не отброшены."
+    },
+    "model_agents": "NOT_EXERCISED_ON_8ACF",
+    "dedicated_api_smoke_and_restart_recovery": "NOT_EXECUTED",
+    "focused_correctness_and_storage": {
+      "status": "PASS_SCOPED",
+      "requests_per_role": 9,
+      "lifetime_count_per_role": 3,
+      "steps_per_role": 15,
+      "full_cache_integrity_ref": ".local/remed-20261113/codex-closeout/snapshot-stream-step2/timing-a2-b2-full-integrity.json",
+      "full_cache_integrity_sha256": "f0f83211839eff443f788fa75b97fd3c61f8dab756c736f0c5804285a74cfd98",
+      "cache_bytes_read": 22243619704,
+      "actual_stable_image_pairs_byte_equal": 4,
+      "equality_ref": ".local/remed-20261113/codex-closeout/snapshot-stream-step2/timing-a2-b2-cache-byte-equality.json",
+      "equality_sha256": "e79f4e8ecaa9de2e9b96c95e6fb53656e31fafbdb5a59a02771e9e2dd7087f62",
+      "scope": "Холодные seeds и C1/C4 disk restore с pinned ответами/работой. Не весь API/agent/numerical/vision sweep."
+    }
   },
   "diagnostic_experiments": {
     "cache5": {
@@ -481,6 +435,172 @@
       "acceptance": "NOT_QUALIFIED",
       "review_ref": ".local/remed-20261113/codex-closeout/cache4-strict-manual-review.json",
       "state_ref": ".local/remed-20261113/codex-closeout/remote-evidence/accept-out/codex-cache4/state.json"
+    },
+    {
+      "id": "b641-final3-and-cpu",
+      "subject_source_sha": "b641fe3eb4d6a91352a007587b4f17a440fc4aff",
+      "subject_binary_sha256": "ef7e3040138761614641311e12efe6e335dfbd5e5b244b578a0e4b4833310cb1",
+      "binary_kind": "ordinary",
+      "freshly_tested_on_current_binary": false,
+      "status": "NOT_ACCEPTED_FAIL_MEMORY",
+      "candidate_build": {
+        "source_sha": "b641fe3eb4d6a91352a007587b4f17a440fc4aff",
+        "binary_sha256": "ef7e3040138761614641311e12efe6e335dfbd5e5b244b578a0e4b4833310cb1",
+        "binary_kind": "ordinary",
+        "diagnostic": false,
+        "expected_version": "gufo version development (b641fe3eb4d6a91352a007587b4f17a440fc4aff)",
+        "built_at": "2026-11-14T02:30:26.942865+03:00",
+        "build_status": "COMPLETED",
+        "deployed_as_main": false,
+        "change_kind": "EARLY_ADVISORY_MIN_STEP_BEFORE_QUEUE_RETENTION",
+        "writer_final_recheck_preserved": true,
+        "ram_freeze_and_publication_unchanged": true,
+        "numerical_arithmetic_unchanged": true,
+        "identical_future_cache_hits_guaranteed": false,
+        "full_private_manifest_ref": ".local/remed-20261113/codex-closeout/remote-evidence/build-minstep1/cand/b641fe3eb4d6a91352a007587b4f17a440fc4aff/MANIFEST.json",
+        "full_private_manifest_sha256": "c225ca732721e4e344cdd64ec38b48d808667f2c2ccb52549d1e2c67c502ea1f"
+      },
+      "cpu_verification": {
+        "subject_source_sha": "b641fe3eb4d6a91352a007587b4f17a440fc4aff",
+        "associated_ordinary_binary_sha256": "ef7e3040138761614641311e12efe6e335dfbd5e5b244b578a0e4b4833310cb1",
+        "freshly_tested_on_current_source": true,
+        "status": "PASS",
+        "targets": [
+          "continuation_cache_test",
+          "continuation_disk_store_test",
+          "text_model_runner_test"
+        ],
+        "evidence_ref": ".local/remed-20261113/codex-closeout/remote-evidence/build-minstep1/cand/b641fe3eb4d6a91352a007587b4f17a440fc4aff/MANIFEST.json",
+        "scope": "Три Linux CPU-targets текущего source прошли; этот результат не является модельной, численной или скоростной квалификацией ordinary binary."
+      },
+      "ordinary_verification": {
+        "subject_source_sha": "b641fe3eb4d6a91352a007587b4f17a440fc4aff",
+        "subject_binary_sha256": "ef7e3040138761614641311e12efe6e335dfbd5e5b244b578a0e4b4833310cb1",
+        "binary_kind": "ordinary",
+        "composition": {
+          "status": "NOT_ACCEPTED",
+          "plan_ref": ".local/remed-20261113/codex-closeout/final3-proposal-b641/plan-final3.json",
+          "plan_sha256": "1a320db88d7acfcfe482b451eaf9b98099c2c00ef15020b98028e5b4bb149001",
+          "config_ref": ".local/remed-20261113/codex-closeout/final3-proposal-b641/config-final3.json",
+          "config_sha256": "a1592a4df69e337f1b03d965b82fc18acb7308f4d502821e356aee89b846053a",
+          "analysis_ledger_ref": ".local/remed-20261113/codex-closeout/final3-proposal-b641/analysis-ledger-preregistered.json",
+          "window_name": "codex-final3-b641",
+          "result": {
+            "review_ref": ".local/remed-20261113/codex-closeout/final3-b641-acceptance-review.json",
+            "status": "NOT_ACCEPTED",
+            "gates": {
+              "duration": {
+                "status": "PASS"
+              },
+              "wire_and_answers": {
+                "status": "PASS"
+              },
+              "post_refill": {
+                "status": "PASS"
+              },
+              "long_c4_mtp": {
+                "status": "PASS",
+                "qualified_rounds": 192,
+                "total_rounds": 192,
+                "partial_rounds": []
+              },
+              "cancellations": {
+                "status": "PASS"
+              },
+              "process_identity": {
+                "status": "PASS"
+              },
+              "restore": {
+                "status": "PASS"
+              },
+              "kernel": {
+                "status": "PASS"
+              },
+              "memory": {
+                "status": "FAIL",
+                "threshold_bytes": 1073741824,
+                "failed_metrics": {
+                  "rss_bytes": 2508189696
+                }
+              }
+            },
+            "memory": {
+              "rss_bytes": {
+                "first_samples": 240,
+                "last_samples": 240,
+                "first_max": 6628700160,
+                "last_max": 9136889856,
+                "first_median": 3285237760.0,
+                "last_median": 3353491456.0,
+                "growth_max_bytes": 2508189696,
+                "growth_median_bytes": 68253696.0
+              },
+              "gtt_used_bytes": {
+                "first_samples": 240,
+                "last_samples": 240,
+                "first_max": 66275086336,
+                "last_max": 64398135296,
+                "first_median": 61148598272.0,
+                "last_median": 61142306816.0,
+                "growth_max_bytes": -1876951040,
+                "growth_median_bytes": -6291456.0
+              },
+              "vram_used_bytes": {
+                "first_samples": 240,
+                "last_samples": 240,
+                "first_max": 158044160,
+                "last_max": 158175232,
+                "first_median": 157798400.0,
+                "last_median": 158060544.0,
+                "growth_max_bytes": 131072,
+                "growth_median_bytes": 262144.0
+              },
+              "gpu_used_bytes": {
+                "first_samples": 240,
+                "last_samples": 240,
+                "first_max": 66433048576,
+                "last_max": 64556158976,
+                "first_median": 61306529792.0,
+                "last_median": 61300338688.0,
+                "growth_max_bytes": -1876889600,
+                "growth_median_bytes": -6191104.0
+              }
+            },
+            "load_seconds_after_warmup": 3610.6482179164886,
+            "requests": 1610,
+            "complete_responses": 1418,
+            "confirmed_cancellations": 192,
+            "long_continuations": 768,
+            "qualified_long_c4_rounds": 192,
+            "post_refill_checks": 4,
+            "full_long_history_cache_misses": 0,
+            "partial_c4_rounds": 0,
+            "archive_ref": ".local/remed-20261113/codex-closeout/codex-final3-b641-complete-archive.json",
+            "archive_sha256": "7d3f78f25d8565995c8997c7c07e7260fd6ed360faf36e2d833985f659e6bebf",
+            "restore_ref": ".local/remed-20261113/codex-closeout/final3-b641-live-restore.json",
+            "restored_main_pid": 915853,
+            "restored_main_checked_at": "2026-11-14T04:08:54.453817+03:00"
+          },
+          "status_basis": "Полные raw/result проверены frozen strict reviewer; memory RSS FAIL, остальные восемь gates PASS. Main восстановлен и независимо проверен.",
+          "expected_main_before_pid": 903758,
+          "nonce": "6af771b5",
+          "duration_seconds_after_warmup": 3600,
+          "calibration": "Два исходных запроса 256/512, затем четыре fill; без --records и без agent holds.",
+          "memory_gate": {
+            "comparison_window_seconds": 1200,
+            "growth_threshold_bytes": 1073741824,
+            "minimum_samples_per_window": 20,
+            "rule": "Прежние first/last20: рост максимума ИЛИ медианы выше порога даёт FAIL; final3 отклонён по росту максимума RSS."
+          },
+          "reviewer_ref": ".local/remed-20261113/codex-closeout/final3-proposal-b641/final3-review.py",
+          "reviewer_sha256": "a0fb29959bfa263fa00699f7851a1b22193853c64d520709526546acf42ea0c3",
+          "cold_partial_c4_policy": "Сохранить каждый cold reread, частичный C4 и тайминги; прежние две перечитки остаются OPEN. Новая квота допустимых misses не вводится.",
+          "comparison_scope": "Сравнение с final2 только диагностическое: runtime различается, historical result не даёт matched performance qualification; собственные критерии final3 неизменны."
+        },
+        "model_agents": "NOT_EXECUTED",
+        "matched_speed": "NOT_EXECUTED",
+        "dedicated_api_smoke_and_restart_recovery": "NOT_EXECUTED"
+      }
     }
   ],
   "legacy_manifest": {
@@ -491,8 +611,8 @@
   "blocking_reasons": [
     {
       "id": "CURRENT_COMPOSITION",
-      "status": "FAIL_MEMORY",
-      "reason": "Ordinary final3 b641/ef7e: RSS max +2508189696 bytes >1073741824. Все raw проверены; main восстановлен, причина host-пика исследуется."
+      "status": "RUNNING_CURRENT_ORDINARY_HOUR",
+      "reason": "Final4 ffc/8acf начат07:02MSK, итог ещё неизвестен. Final2/final3 FAIL_MEMORY сохранены; streaming correctness не заменяет hour gate."
     },
     {
       "id": "FOCUSED_MEMORY",
@@ -507,7 +627,7 @@
     {
       "id": "C4_TIMING",
       "status": "INCONCLUSIVE",
-      "reason": "diagnostic2 завершена и воспроизвела общий механизм пауз на обеих ревизиях. Это не закрывает сравнительные queue/server TTFT/client TTFT gates mixed-MTP C4: исходные 3 REGRESSION speed1 сохранены. Пороги 5% и 3 мс действуют для каждой фазы/ранга; matched-cohort разбор не заменяет исходную совокупность запросов. Cache5 также оставил 24 timing flags и статус INCONCLUSIVE; это отдельная diagnostic пара, не matched ordinary speed PASS."
+      "reason": "diagnostic2 завершена и воспроизвела общий механизм пауз на обеих ревизиях. Это не закрывает сравнительные queue/server TTFT/client TTFT gates mixed-MTP C4: исходные 3 REGRESSION speed1 сохранены. Пороги 5% и 3 мс действуют для каждой фазы/ранга; matched-cohort разбор не заменяет исходную совокупность запросов. Cache5 также оставил 24 timing flags и статус INCONCLUSIVE; это отдельная diagnostic пара, не matched ordinary speed PASS. Ordinary A2/B2 разобрана:9flags/46issues, late mappings, cold monitor gaps и различный C4 admission; INCONCLUSIVE сохранён. A1 остановлен до measured requests."
     },
     {
       "id": "QUALITY_CONTRACT",
@@ -518,6 +638,16 @@
       "id": "CUTOVER",
       "status": "NOT_AUTHORIZED",
       "reason": "Нужны все согласованные gates, проверенный комплект launcher/recovery и отдельное одобрение владельца этого кандидата."
+    },
+    {
+      "id": "PI_REPLAY",
+      "status": "NOT_EXERCISED",
+      "reason": "Pi не установлен и реальный pi_agent.py не исполнен. OpenCode на старых ordinary binaries не заменяет это обязательство."
+    },
+    {
+      "id": "SNAPSHOT_STREAMING_MEASURED_EFFECT",
+      "status": "TIMING_INCONCLUSIVE_HOUR_RUNNING",
+      "reason": "Actual ordinary9+9 correctness и4 byte-equal stable image pairs PASS; scoped RSS observation не заменяет hour.9timing flags при runtime/monitor/admission confounds сохранены; final4 RUNNING."
     }
   ],
   "cache_compatibility": {
@@ -545,9 +675,61 @@
   },
   "procedure_ref": "docs/faex2/CANDIDATE_SWITCH_2026-11-14.md",
   "procedure_status": "DRAFT_NOT_GENERATED_NOT_INSTALLED_NOT_AUTHORIZED",
-  "evidence_attribution": "Свежие CPU относятся к b641; cache5 выполнен на diagnostic5b804165. Ordinary ef7e3040 завершил final3 NOT_ACCEPTED по RSS, остальные8gates PASS. Прежние model/agent/numerical доказательства сохраняют исходные source/binary SHA.",
+  "evidence_attribution": "Ordinary ffc/8acf:9focused requests PASS, C1/C4 restore и4 byte-equal cache image pairs; strict timing INCONCLUSIVE, final4 RUNNING. GREEN3 CPU4/GPU3 source-equivalent16files перечислены отдельно. Historical b641 final3 FAIL_MEMORY/cache5 INCONCLUSIVE и old model/agent/numerical evidence не переименованы.",
   "agent_verification_scope": {
-    "opencode": "PASS только у перечисленных older ordinary binaries; на b641 не повторён.",
-    "pi": "NOT_EXECUTED: pi не установлен; прежние OpenCode результаты не заменяют обязательство pi replay."
+    "opencode": "PASS только на перечисленных older ordinary binaries; на ffc/8acf не повторён.",
+    "pi": "NOT_EXERCISED: pi не установлен; обязательство реального replay не заменено OpenCode."
+  },
+  "snapshot_streaming_verification": {
+    "status": "PASS_SNAPSHOT_CONTRACTS_ONLY",
+    "acceptance": "NOT_QUALIFIED",
+    "tested_source_base_sha": "36e46be38a956e6d24a2531947828a29ba5b1f57",
+    "tested_patch_sha256": "1e4923888e4e0855525a9e0247a42a9569e43676e901804978ecb8daa1b914e6",
+    "changed_source_files_exact_match": 16,
+    "freshly_tested_on_current_ordinary_binary": false,
+    "gpu_tests": [
+      {
+        "name": "qwen_persistent_snapshot_stream_test",
+        "status": "PASS",
+        "binary_sha256": "a94ebe7a43171f772454906506ff4c1c0ec93c8449b534ae8929da7167f97bfc"
+      },
+      {
+        "name": "qwen_persistent_snapshot_mtp_stream_test",
+        "status": "PASS",
+        "binary_sha256": "4a7b0ea02701f2d39044bd129a49c4df1b51197ba1ba0ae999b9c677055969f7"
+      },
+      {
+        "name": "qwen_snapshot_streaming_test",
+        "status": "PASS",
+        "binary_sha256": "c04fe884f8682847e2aac93618f70d5fdb6c774915363aca308157ef63efa061"
+      }
+    ],
+    "plain_observed": {
+      "bytes": 19542208,
+      "callbacks": 9,
+      "largest_chunk": 8388608,
+      "allocations": 292,
+      "largest_allocation": 8388608,
+      "peak_live_bytes": 8409971,
+      "remaining_live_bytes": 0
+    },
+    "mtp_observed": {
+      "legacy_full_copy_rejected_bytes": 17302021,
+      "large_payload_bytes": 17302021,
+      "large_stream_cpp_allocation_peak": 0,
+      "pending_count": 1,
+      "pending_position": 3,
+      "pending_verifier_bytes": 3685,
+      "first_drafts": 1,
+      "resumed_drafts": 1
+    },
+    "independent_review_ref": ".local/remed-20261113/codex-closeout/snapshot-stream-green3-independent-review.json",
+    "independent_review_sha256": "f15e2a2cffa7bb617a3afbbd3f5fdd532dd94222746ae556b07014bb740084c6",
+    "limits": [
+      "Сохранены byte equality, reload/resume, format/identity и exception/atomic publication guards.",
+      "Allocation guard16MiB+4096 покрывает replaceable C++ new/delete текущего потока, не общий RSS/HIP/malloc.",
+      "Synthetic storage cases не доказывают качество полной35B/vision; generic unknown-draft fallback по-прежнему допускает full-vector.",
+      "Перенос old ordinary hour/model/agent PASS на8acf запрещён."
+    ]
   }
 }
