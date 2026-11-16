@@ -33,7 +33,7 @@
 
 | Область | Где смотреть | Что у нас сейчас | Что именно проверяем / дорабатываем |
 | --- | --- | --- | --- |
-| **1. Бакетные HIP-графы (`hipGraphExec_t`)** | `gufo-laguna` ([`src/models/laguna/`](../../src/models/laguna/gpu/engine.cpp)), `strixite` | [`HipGraphDecodeExecutor`](../../src/core/hip/detail/hip_graph_decode_executor.hpp) захватывает один граф и отключается при `kSplitKAttentionRequired` (длинный контекст) и `kLogitsNotRequested` ([`execution_policy.hpp`](../../src/models/qwen/hip/execution_policy.hpp)). | Как в `laguna` организованы слоты графов под разные размеры пакета (`T = {1, 2, 4, 6}`), как передавать позицию `pos` для split-K через device-память без сброса графа. |
+| **1. Бакетные HIP-графы (`hipGraphExec_t`)** | `gufo-laguna` ([`src/models/laguna/`](../../src/models/laguna/gpu/engine.cpp)), `strixite` | [`HipGraphDecodeExecutor`](../../src/core/hip/detail/hip_graph_decode_executor.hpp) захватывает один граф и отключается при `kSplitKAttentionRequired` (длинный контекст) и `kLogitsNotRequested` ([`execution_policy.hpp`](../../src/models/qwen/hip/execution_policy.hpp)). | Как в `laguna` организованы слоты графов под разные размеры пакета (`T ∈ {1..8}` или бакеты `T ∈ {1, 2, 4, 8}`), как передавать позицию `pos` для split-K через device-память без сброса графа. |
 | **2. MoE-роутинг и верификация черновиков** | `gufo-laguna`, `strixite` | FP32-роутер и `LaunchMoeRouterTopK` ([`moe.hip`](../../src/models/qwen/hip/kernels/moe.hip)). Но при `MTP2`/`MTP3` на 2–4 потоках скорость падает на **5–33 %** ([CONTEXT](CONTEXT.md)). | Проверяем гипотезу «размытия экспертов» при верификации нескольких токенов и устройство grouped/indirect MoE GEMM без лишних чтений всех 256 экспертов. |
 | **3. Контроллер `auto`-спекуляции и стоимость `MTP`/`DFlash2`** | `gufo-laguna`, апстрим `gufo` (`1167a944`, `2caf2a82`) | [`QwenAutoDraftBackend`](../../src/models/qwen/hip/auto_draft.cpp) смотрит только на `tokens_per_second`, а при `temperature > 0` всегда выбирает DFlash2. В [`dflash_policy.hpp`](../../src/models/qwen/dflash_policy.hpp) sampled и смешанные пакеты оцениваются грубо как C1. Порог когорты MTP жёсткий (`GUFO_MTP_MOE_MAX_COHORT=4`). | Переход на оценку стоимости (cost gate) с учётом числа активных потоков, acceptance rate / энтропии и режима `reasoning_effort: medium` (где в одном ответе сначала идёт русская проза рассуждения, а затем JSON tool call). |
 | **4. KV-кэш `Q8_0` (и `turbo6`) на длинном контексте** | `tubo` | KV-кэш 10 слоёв Attention хранится в `FP16` (`QwenKvCacheStorage::kFp16`). На 64K+ чтение KV уже идёт на ~199 ГБ/с ([DECODE_DEPTH.md](DECODE_DEPTH.md)) и упирается в ПСП. | Блочное квантование KV в `Q8_0` на GPU при записи и деквантование на лету в wave64 split-K ядре (`16 голов на 2`) — снизит объём читаемой памяти KV почти вдвое. |
@@ -86,7 +86,7 @@
 10. **Редкие аномалии задержек и стабильности:**
     * **Двухрежимная пауза очереди при 4 пользователях (C4) и на первом запросе:** всплески 27–39 мс против 1 мс на `004d8fa1` и `abbfb006` (связаны с приходом запроса после старта неполной первой группы `codex-diagnostic2` и ленивой загрузкой ELF-модулей `hipBLASLt` 3,6 МиБ).
     * **Два старых полных промаха дискового кэша (`final2` / рабочий `1195d154`, 2 из 736):** причина отказа диска (вероятно «занято») до конца не доказана; решено наблюдать в эксплуатации по новым логам причин (`fb816341`, `158711ad`).
-    * **Очередь записи при малом дисковом кэше (16 ГиБ):** в `r3-earlyskip` `staging_used_bytes` вырастал до ~10,2 ГиБ даже с правилом раннего отказа `min_step`.
+    * **Очередь записи при стресс-тесте малого дискового кэша (16 ГиБ против штатных 64 ГиБ):** в диагностическом прогоне `r3-earlyskip` (где объём дискового кэша намеренно зажимался до 16 ГиБ для провокации постоянного LRU-вытеснения) `staging_used_bytes` вырастал до ~10,2 ГиБ даже с правилом раннего отказа `min_step` (на штатных 64 ГиБ с правилом — 0 ГиБ).
     * **Паузы под давлением памяти (`EXP-N`, Пакет C):** до 6 пауз >1 с в первые 40 с под искусственным давлением.
     * **Единичное зависание MTP-сервера (выход с кодом 75 по таймауту 120 с на `r138` из ~3800 запросов, [INVESTIGATION_RESULT.md](INVESTIGATION_RESULT.md) §Д):** причина не установлена; автоперезапуск `gufo-faex2.service` после реальной аварии и реальной перезагрузки машины ещё не проверен в бою; нет квалификации 24/7.
     * **Устаревшая документация модели:** в `docs/models/qwen3.6-35b-a3b/README.md` всё ещё указано, что изображения не поддерживаются.
@@ -118,7 +118,20 @@ Offset  Size  Field              Description
 0x48    32    numerics_id_hash   SHA-256 численной политики и раскладки (для контроля кэша, находка I3)
 0x68    24    reserved           Нули (по аналогии с outer112B/compact80B)
 ```
-* **Запись таблицы тензоров (`TensorEntry`, 64 байта):** `name_hash` (uint64), `dtype` (uint32), `layout` (uint32: `kRowMajor`, `kWave32Wmma16x16`, `kAie2RuntimeK`), `ndim` (uint32), `dims[4]` (uint32×4), `data_offset` (uint64, кратен **128 байтам** под cache-line и `float4`/`uint4`), `byte_size` (uint64), `checksum` (uint64).
+* **Запись таблицы тензоров (`TensorEntry`, ровно 64 байта, Little-Endian, естественное выравнивание 8-байтовых полей в начале без скрытого паддинга):**
+  ```text
+  Offset  Size  Field         Description
+  0x00    8     name_hash     uint64: FNV-1a 64-bit имени тензора (тот же полином, что в execution_policy.hpp)
+  0x08    8     data_offset   uint64: смещение данных в файле, кратно 128 байтам (под cache-line и float4/uint4)
+  0x10    8     byte_size     uint64: размер тензора в байтах
+  0x18    8     checksum      uint64: FNV-1a 64-bit (или младшие 64 бита SHA-256) от байтов тензора
+  0x20    4     dtype         uint32: тип квантования/элемента (GgmlType / раскладка)
+  0x24    4     layout        uint32: kRowMajor, kWave32Wmma16x16, kAie2RuntimeK
+  0x28    4     ndim          uint32: число размерностей (1..4)
+  0x2C    4     reserved_u32  uint32: 0 (выравнивание до 16 байт перед dims)
+  0x30    16    dims[4]       uint32[4]: размерности тензора (неиспользуемые = 1)
+  ```
+  *Политика коллизий `name_hash`:* офлайн-упаковщик при записи `.ghalo` обязан проверять попарную уникальность `name_hash` всех тензоров модели и завершаться с ошибкой при совпадении хешей разных имён.
 * **Единый упаковщик для GPU и NPU:** если образ собирается с `has_npu_tiles`, ведущие колонки плотных проекций prefill дополнительно сохраняются в block-float (`bfp16`) тайлинге `128x64x128` под `runtime_k` XCLBIN (как в коммитах `4f346915`, `1c00f953`, `35dd096c`), исключая перепаковку при старте.
 
 ---
@@ -154,7 +167,7 @@ Offset  Size  Field              Description
   * сейчас в `FP16`: ~10,5 ГБ (при 4 × 262K — ~21 ГБ; вся GPU-память с буферами — ~55,2 ГБ, см. [BASELINE.md](BASELINE.md));
   * в `Q8_0`: **~5,6 ГБ** на 4 × 128K (экономия ~5 ГБ на 128K и ~10 ГБ на 262K + почти двукратное снижение трафика чтения KV в decode).
 * **Пер-поточные буферы prefill/MoE (4 сессии):** ~0,64 ГБ (`4 × 160 МиБ`).
-* **RAM-кэш снимков продолжений:** 16 ГБ (дисковый кэш — 64 ГБ, мимо page cache).
+* **RAM-кэш снимков продолжений:** 16 ГиБ в ОЗУ; **штатный дисковый кэш — 64 ГиБ** (мимо page cache; значение 16 ГиБ для диска использовалось только в стресс-тесте вытеснения `r3-earlyskip`, см. §2.10).
 
 ---
 
@@ -178,13 +191,10 @@ Offset  Size  Field              Description
 
 Расширение [`HipGraphDecodeExecutor`](../../src/core/hip/detail/hip_graph_decode_executor.hpp) и [`ResolveQwenGraphRejections`](../../src/models/qwen/hip/execution_policy.hpp):
 
-1. **Пул бакетов `T ∈ {1, 2, 4, 6}`:**
-   * Вместо одного экземпляра `hipGraphExec_t` в `QwenGpuExecutor` хранится массив графов по ключу `(workload_identity, T)`:
-     * `T = 1` — одиночный decode (`off` или fallback);
-     * `T = 2` — верификация `MTP1` (1 принятый + 1 черновой токен);
-     * `T = 4` — верификация `MTP3` (при одиночном кодовом запросе);
-     * `T = 6` — верификация `DFlash2` ($K=5$).
-   * Все буферы внутри `QwenGpuArena` выделяются один раз под максимальный `T = 6`; переключение между режимами спекуляции на лету меняет только выбранный `hipGraphExec_t` (0 мкс оверхеда).
+1. **Пул графов под фактические длины верификации (`T ∈ {1..8}` или бакеты `T ∈ {1, 2, 4, 8}`):**
+   * *Сверка с кодом:* в [`dflash_policy.hpp`](../../src/models/qwen/dflash_policy.hpp) `DFlashLengthController::kMaxDraftTokens = 7` (в [BASELINE.md](BASELINE.md) профиль называется `DFlash adaptive 7`), а метод `ChooseMoe()` в адаптивном режиме возвращает любую длину черновика `0..7` — то есть пакет верификации (1 целевой + $K$ черновых токенов) принимает значения **`T ∈ {1..8}`** (а не фиксированное `T = 6` для $K=5$). Для встроенного MTP в MoE глубина составляет `1..3` (`T ∈ {2..4}`, рабочий профиль `MTP1` — это `T = 2`).
+   * **Решение:** вместо одного экземпляра `hipGraphExec_t` в `QwenGpuExecutor` хранится таблица графов по ключу `(workload_identity, T)` (до 8 слотов для одиночной сессии `T ∈ {1..8}`, по аналогии с пулом из 17 слотов графов в [`src/models/laguna/`](../../src/models/laguna/gpu/engine.cpp), либо `ChooseMoe` ограничивается сеткой бакетов `T ∈ {1, 2, 4, 8}`).
+   * Все буферы внутри `QwenGpuArena` выделяются один раз под верхнюю границу (`kArenaMoeDecodeRows = 64` уже покрывает до 8 сессий × `T = 8`); переключение длины верификации на лету выбирает готовый `hipGraphExec_t` **без перезахвата и переинстанциирования графа (`hipGraphInstantiate`)**.
 2. **Снятие отказа `kSplitKAttentionRequired`:**
    * Сейчас при длине истории выше порога `kSplitKDecodeAttentionMinContext` граф отключается (`ResolveQwenGraphRejections` выставляет `kSplitKAttentionRequired`).
    * **Решение:** ядра `QwenDecodeSplitKAttentionHalfPartialsKernel` и `ReduceKernel` читают текущую позицию `pos` и границы разбиения из закреплённого device-буфера (`d_decode_step_params`), обновляемого асинхронно перед запуском графа (аналогично [`attention_decode_graph.hip`](../../src/models/qwen/hip/kernels/attention_decode_graph.hip)), при фиксированной сетке `max_splits`. Это сохраняет захват HIP-графа на длинном контексте вплоть до 128K–256K.
@@ -228,7 +238,7 @@ Offset  Size  Field              Description
 ### Этап 2. Бакетные HIP-графы, устранение пауз очереди и Cost Gate спекуляции
 1. **Снятие `kSplitKAttentionRequired` в `HipGraphDecodeExecutor`:**
    * Перевести параметры split-K (`pos`, `partition`) в device-память, чтобы захваченный граф работал на длинном контексте (16K–128K+).
-2. **Бакеты графов `T ∈ {1, 2, 4, 6}` и прогрев `hipBLASLt` на старте:**
+2. **Пул графов `T ∈ {1..8}` (или бакеты `T ∈ {1, 2, 4, 8}`) и прогрев `hipBLASLt` на старте:**
    * Исключить перезахват графа при смене длины верификации и убрать двухрежимную паузу 27–39 мс / 315 мс на первом запросе и в C4.
 3. **Адаптивный контроллер спекуляции (Cost Gate Пакета E):**
    * Заменить жёсткий порог `GUFO_MTP_MOE_MAX_COHORT` на оценку стоимости; если DFlash2 прошёл Этап 0 — добавить переключение `MTP1 (в <think>) → DFlash2 (в JSON/tool call)` и потоковую запись снимков `StreamPersistent` (≤16 MiB) для DFlash2.
