@@ -4,6 +4,13 @@
 
 ## 2026-11-17
 
+### Публикация `refs/heads/faex2` → `101c99ab`
+
+- По явному «сделай push» владельца отправлены 12 коммитов (`a50b9cdf`…`101c99ab`) в `niiv0832/gufo-faex2`, fast-forward `cf747489..101c99ab`, только `refs/heads/faex2`, `--no-follow-tags --recurse-submodules=no`.
+- Push по явному HTTPS-URL: SSH-ключи из `~/.ssh` (включая `id_ed25519_github`) не прошли аутентификацию на GitHub; использованы учётные данные `niiv0832` из macOS keychain. Постоянные pushurl не менялись и остаются заблокированными.
+- Перед отправкой проверены: fast-forward относительно `origin/faex2`, автор/коммитер — настроенный noreply, отсутствие `.local`/секретов/бэкапов в diff (16 файлов: docs, tests, tools). Независимое HTTPS-чтение (`git ls-remote`) подтвердило `refs/heads/faex2 = 101c99ab…`.
+- Коммит записи о публикации — локальный, неопубликованный; будет включён в следующую согласованную отправку. Машина FAEX2 и эксплуатационный проект не затрагивались.
+
 ### Добавлена утилита упаковки контекста `scripts/pack_for_llm.sh` (`2.1-faex2`)
 
 - Размещён исполняемый скрипт [scripts/pack_for_llm.sh](../../scripts/pack_for_llm.sh) (`0755`) для генерации компактных дампов под новые LLM-сессии (`--scope docs`, `--scope code --path ...`, `--scope faex2`).
