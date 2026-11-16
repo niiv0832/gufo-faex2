@@ -2,6 +2,15 @@
 
 Наш журнал форка. Корневой [CHANGELOG.md](../../CHANGELOG.md) сохранён как журнал исходного Gufo. Новые записи сверху; фиксировать результат, проверки, ограничения и решения, а не стенограмму чата. Текущее состояние — [CONTEXT.md](CONTEXT.md).
 
+## 2026-11-17
+
+### Добавлена утилита упаковки контекста `scripts/pack_for_llm.sh` (`2.1-faex2`)
+
+- Размещён исполняемый скрипт [scripts/pack_for_llm.sh](../../scripts/pack_for_llm.sh) (`0755`) для генерации компактных дампов под новые LLM-сессии (`--scope docs`, `--scope code --path ...`, `--scope faex2`).
+- Скрипт читает только индексированные файлы через `git ls-files -z`, жёстко исключает `.local/`, `.claude/`, секреты, бинарные/весовые артефакты и чужие модели, по умолчанию сохраняет результат в `${HOME}/gufo_faex2_tmp/`, выводит в начало дампа ядро (`AGENTS.md`, `docs/faex2/{CONTEXT,SPEC,DESIGN,ROADMAP_SPEC_01}.md`, `src/models/qwen/AGENTS.md`) и ограничивает `docs/faex2/CHANGELOG.md` (`--changelog-lines 160` по умолчанию), добавляя оглавление остальных файлов `docs/faex2/` (или всё целиком с `--full-docs`).
+- Обновлена документация: [tools/README.md](../../tools/README.md), [CONTEXT.md](CONTEXT.md).
+- Проверено: `bash -n scripts/pack_for_llm.sh` (OK), тестовые прогоны `--scope docs` (219 597 байт, 1040 строк) и `--scope code --path src/models/qwen/AGENTS.md --no-core` (2156 байт, 53 строки); временные дампы в `/tmp` удалены. Код движка, сборки и стенд не затрагивались.
+
 ## 2026-11-16
 
 ### Очищены 6 временных worktree'ев агентов в `.claude/worktrees/`

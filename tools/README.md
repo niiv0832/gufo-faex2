@@ -32,6 +32,10 @@ Functional and regression tests live in [tests/functional/](../tests/functional/
 including the OpenAI SDK suites and interrupted-chat/disk replay. Use its runner
 for API changes.
 
+For packing compact FAEX2 documentation and code context for LLM sessions
+(via `git ls-files -z`, excluding `.local/`, secrets, and unrelated models),
+use [scripts/pack_for_llm.sh](../scripts/pack_for_llm.sh).
+
 ## Qwen27B
 
 `qwen27b/check.py` owns the focused checks (`fast`, `kernels`, `model`, `serving`).
