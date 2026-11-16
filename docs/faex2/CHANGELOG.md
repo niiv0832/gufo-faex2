@@ -4,6 +4,13 @@
 
 ## 2026-11-17
 
+### Оценка заимствований и план работ по ROADMAP_SPEC_01
+
+- Добавлены [BORROW_EVAL_2026-11-17.md](BORROW_EVAL_2026-11-17.md) (отчёт о необходимости/целесообразности/возможности заимствований по каждому пункту roadmap §1.2 и смежным) и [BORROW_PLAN_2026-11-17.md](BORROW_PLAN_2026-11-17.md) (подробный план работ T1–T16 из отчёта). Только документация; код и стенд не затронуты.
+- Источники проверены чтением: gufo-laguna (в дереве), апстрим (`6d793814`, `4ab04ab8`, `1167a944`, `2caf2a82`), клоны `tubo` и `NinjaPear/Q6dense` в `/Users/vlad/Documents/Gitea/_borrow-eval/` (merge-base, собственные коммиты, диффстаты, `git apply --check --3way`), `strixite` — только идеи (**AGPL-3.0: код переносить запрещено**, наш `gufo serve` — сетевой сервис).
+- Ключевые вердикты: графы laguna — делать (~390–700 строк, образец, не патч; `d_decode_step_params` не существует, split-K читает host `pos`); cost gate — `1167a944` ≈20 строк сразу, фаекс-гейт после Этапа 0; `Q8_0` KV — делать с тремя уроками tubo (enum-append, per-layer таблица, одна формула смещения + CPU-оракул; их N46/N47 — ориентиры качества); Q6dense — это рецепт квантования (llama-quantize + `q6dense.types`), не код; MoE-grouped — не заимствовать (indirect и grouped уже в `src/models/qwen38_flash_next/kernels/rocm/mmq/`, `MMVQ_MAX_ROUTED_BATCH=64`, `group_moe_slots`); sparse-attention уже в дереве (`34e61a15`, `GUFO_QWEN_SPARSE_ATTN`) — пробел roadmap в валидации, не в коде; `.ghalo` отложено.
+- Документы прошли два прохода: независимое ревью подтвердило >25 проверяемых утверждений с точностью до строки; исправлены атрибуция замеров tubo (N46 наш / N47 сторонний), пути mmvq (`src/models/qwen38_flash_next/kernels/rocm/mmq/`), диапазоны `mtp/backend.cpp` (env 268, cohort 265–292) и ссылки на пункты roadmap §2.В п.10 / §2.Б п.7. Замечено параллельное обновление roadmap (`26904442` — выравнивание `TensorEntry`).
+
 ### Восстановлен SSH-доступ к GitHub
 
 - Диагностика: ключ `~/.ssh/id_ed25519_github` зарегистрирован на GitHub (отпечаток `SHA256:jdORvz8…` совпадает с публичным списком `niiv0832.keys`), но приватный ключ защищён passphrase, ssh-agent был пуст — неинтерактивный SSH давал `Permission denied (publickey)`.
