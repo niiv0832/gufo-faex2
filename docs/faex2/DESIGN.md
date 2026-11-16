@@ -1,6 +1,6 @@
 # Технический дизайн Gufo FAEX2
 
-Исходный срез: `2c9c6b02`, 2026-11-09. **Текущая рабочая реализация — `1195d154` (2026-11-12), подтверждена на стенде 2026-11-13.** К ней относятся исправления Q8 и потоков GPU (§2а), пакеты [A–D](UPSTREAM_PORT.md) и [оптимизации 35B](OPTIMIZATION_BACKLOG.md). Исторические замеры ниже имеют собственные даты и не являются повторной приёмкой последней сборки. Требования — [SPEC.md](SPEC.md), исходные результаты — [BASELINE.md](BASELINE.md), текущая проверка — [аудит](AUDIT_2026-11-13.md).
+Исходный срез: `2c9c6b02`, 2026-11-09. **Текущая рабочая сборка на стенде — `004d8fa1`/`94a09930…` (вариант Б по [manifest](CANDIDATE_VARIANTB_2026-11-14.json), переведена 2026-11-15; запасная роль — `abbfb006`/`e760a663…`).** К ней относятся исправления Q8 и потоков GPU (§2а), потоковое сохранение snapshot (§2б), пакеты [A–D](UPSTREAM_PORT.md) и [оптимизации 35B](OPTIMIZATION_BACKLOG.md). Исторические замеры ниже имеют собственные даты и не являются повторной приёмкой последней сборки. Текущий статус — [CONTEXT.md](CONTEXT.md), требования — [SPEC.md](SPEC.md), исходные результаты — [BASELINE.md](BASELINE.md), итоги третьего круга и аудита — [AUDIT_CLOSURE_ROUND3_2026-11-14.md](AUDIT_CLOSURE_ROUND3_2026-11-14.md), планы доработок — [ROADMAP_SPEC_01.md](ROADMAP_SPEC_01.md).
 
 ## 1. Происхождение и устройство
 
@@ -39,11 +39,11 @@ API/планировщик готовит запрос; Qwen target executor в�
 
 Планировщик обслуживает все сеансы одним потоком процессора, у каждого сеанса свой поток GPU, а функции prefill возвращаются, не дожидаясь поставленных в очередь ядер. Поэтому рабочая память таких ядер не должна быть общей. С `d891354f` три набора буферов выдаются по ключу «поток GPU»: Q8-активации обёртки `LaunchBatchedQuantGEMM`, рабочий набор `Qwen35MoePrefill` и буфер запасного одиночного MoE FFN. Цена — около 160 МиБ на сеанс сверх первого. Буферы живут до конца процесса и не освобождаются при уничтожении потока GPU; вызов с двух потоков процессора на одном потоке GPU не поддержан. Арифметика не менялась: логиты и ответы побайтно совпали со сборкой до правки.
 
-## 2б. Потоковое сохранение Qwen snapshot — кандидат 2026-11-14
+## 2б. Потоковое сохранение Qwen snapshot
 
 Qwen выдаёт persistent snapshot через sink без полного временного host vector. Порядок outer112B → compact80B/K/V/conv/DeltaNet/rope → logits → verifier96B/rolling/draft и file/payload versions сохранены. GPU данные проходят через один scratch8MiB; host payload MTP выдаётся borrowed spans не больше16MiB без повторного копирования. При исключении transfer синхронизируется раньше освобождения scratch, writer сохраняет прежний atomic checkpoint. Restore по-прежнему читает полный файл; cache policy, budgets и арифметика не менялись.
 
-Три настоящих synthetic GPU tests подтвердили byte equality, bounded allocations, storage formats, throwing sink/retry, actual MTP и pending/reload. Plain19,5MB snapshot имел peak дополнительной C++ heap8409971bytes при лимите16MiB+4096; это не полный RSS, malloc/device/OS и другие потоки observer не охватывает. Legacy fallback неизвестного draft provider сохраняет полную allocation; DFlash не получает обещания bounded memory. Ordinary final4 прошёл исходный часовой memory/correctness gate. Comparative latency остаётся INCONCLUSIVE; общий bound RSS/HIP и причинное улучшение не объявлены, кандидат рабочим не назначен. [План и доказательства](SNAPSHOT_STREAMING_PLAN.md).
+Три настоящих synthetic GPU tests подтвердили byte equality, bounded allocations, storage formats, throwing sink/retry, actual MTP и pending/reload. Plain19,5MB snapshot имел peak дополнительной C++ heap8409971bytes при лимите16MiB+4096; это не полный RSS, malloc/device/OS и другие потоки observer не охватывает. Legacy fallback неизвестного draft provider сохраняет полную allocation; DFlash не получает обещания bounded memory. Ordinary final4 прошёл исходный часовой memory/correctness gate. Comparative latency остаётся INCONCLUSIVE; общий bound RSS/HIP и причинное улучшение не объявлены (на момент проверки `final4` кандидат рабочим не назначался; позже изменение вошло в `abbfb006` и текущий рабочий `004d8fa1`). [План и доказательства](SNAPSHOT_STREAMING_PLAN.md).
 
 ## 3. DFlash2: калиброванный, но экспериментальный путь
 
