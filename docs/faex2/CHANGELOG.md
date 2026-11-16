@@ -4,6 +4,12 @@
 
 ## 2026-11-17
 
+### Восстановлен SSH-доступ к GitHub
+
+- Диагностика: ключ `~/.ssh/id_ed25519_github` зарегистрирован на GitHub (отпечаток `SHA256:jdORvz8…` совпадает с публичным списком `niiv0832.keys`), но приватный ключ защищён passphrase, ssh-agent был пуст — неинтерактивный SSH давал `Permission denied (publickey)`.
+- Владелец добавил ключ в агент: `ssh-add --apple-use-keychain ~/.ssh/id_ed25519_github` (passphrase сохранена в macOS Keychain). В конфиг репозитория установлен локальный `core.sshCommand = ssh -i ~/.ssh/id_ed25519_github -o IdentitiesOnly=yes -o AddKeysToAgent=yes -o UseKeychain=yes`; общий `~/.ssh/config` и Git-идентичность не менялись.
+- Проверено: `ssh -T git@github.com` → `Hi niiv0832!`; `git ls-remote ssh://git@github.com/niiv0832/gufo-faex2.git refs/heads/faex2` вернул `101c99ab…`; `ssh-add -l` показывает ключ. HTTPS с keychain остаётся запасным путём.
+
 ### Публикация `refs/heads/faex2` → `101c99ab`
 
 - По явному «сделай push» владельца отправлены 12 коммитов (`a50b9cdf`…`101c99ab`) в `niiv0832/gufo-faex2`, fast-forward `cf747489..101c99ab`, только `refs/heads/faex2`, `--no-follow-tags --recurse-submodules=no`.
