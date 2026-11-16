@@ -2,6 +2,14 @@
 
 Наш журнал форка. Корневой [CHANGELOG.md](../../CHANGELOG.md) сохранён как журнал исходного Gufo. Новые записи сверху; фиксировать результат, проверки, ограничения и решения, а не стенограмму чата. Текущее состояние — [CONTEXT.md](CONTEXT.md).
 
+## 2026-11-16
+
+### Оформлена единая дорожная карта и техническая спецификация ROADMAP_SPEC_01
+
+- Добавлен [ROADMAP_SPEC_01.md](ROADMAP_SPEC_01.md) (ревизия 2, по всем отчётам `docs/faex2/`): объединены собственный техдолг и открытые вопросы аудита ([AUDIT_CLOSURE_ROUND3](AUDIT_CLOSURE_ROUND3_2026-11-14.md), [INVESTIGATION_RESULT](INVESTIGATION_RESULT.md), [SNAPSHOT_STREAMING_PLAN](SNAPSHOT_STREAMING_PLAN.md)), собственные планы сравнения и бэклог переноса ([DFLASH2_EVAL_PLAN](DFLASH2_EVAL_PLAN_2026-11-15.md), [UPSTREAM_PORT](UPSTREAM_PORT.md), [OPTIMIZATION_BACKLOG](OPTIMIZATION_BACKLOG.md), [DECODE_DEPTH](DECODE_DEPTH.md), [NPU_MAP](NPU_MAP.md)) и заимствования из `strixite`, `gufo-laguna`, `tubo`, `NinjaPear/Q6dense`, апстрима `gufo`.
+- Зафиксированы уже сделанные оптимизации и отрицательные результаты (чтобы не повторять `1b1dfa80` и перенос NPU-стека, который уже в ветке, но выключен из-за бага Data Fabric MC28), спецификации `.ghalo`, `Q8_0`/`turbo6` KV, бакетных HIP-графов `T={1,2,4,6}`, снятия `kSplitKAttentionRequired` и KPI приёмки.
+- Только документация; код, тесты, сборки и стенд не запускались и не менялись.
+
 ## 2026-11-15
 
 ### Записан набор запросов Hermes Agent для проверки DFlash2 (шаг 0)
