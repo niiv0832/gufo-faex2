@@ -4,6 +4,13 @@
 
 ## 2026-11-16
 
+### Оптимизированы объём и структура локального каталога `.local/`
+
+- По поручению владельца объём `.local/` на Mac сокращён с 6,8 ГБ (45 448 файлов, 245 элементов в корне) до 1,3 ГБ (10 487 файлов, 7 элементов в корне) без потери данных.
+- В `.local/remed-20261113/codex-closeout/` (4,8 ГБ → 400 МБ) сырые дампы `compose/` в `codex-final4-ffc`, `codex-final3-b641`, `codex-final2` упакованы в `compose-raw.tar.zst` (с сохранением `state.json`, `verdict.json`, `independent-main-after.json`, `composition.json`, `report.json` на прежних путях), `codex-cache{3,4,5}/probe/` — в `probe.tar.zst`, промежуточные неиспользуемые дампы `final3-*` и `source-76bd2ef2.tar` — в `.zst`.
+- В `.local/audit-20261113/` (1,8 ГБ → 903 МБ) после пофайловой сверки удалены 5 распакованных дубликатов `quality-*-raw/`, все `.tar` сжаты в `.tar.zst`. Старые файлы и папки 9–10 ноября из корня `.local/` собраны в `.local/archive-20261109-1110.tar.zst` (4,9 МБ).
+- Неприкосновенный набор (`HANDOFF.md`, `OPENCODE.md`, `venv-sdk`, `accept`, `coord`, `corpus`, `round3`, `results`, `prefill`) сохранён без изменений; целостность всех архивов проверена `zstd -t`; `test_remed_window.py` — 38 тестов OK. Код и стенд не затрагивались.
+
 ### Оформлена единая дорожная карта и техническая спецификация ROADMAP_SPEC_01
 
 - Добавлен [ROADMAP_SPEC_01.md](ROADMAP_SPEC_01.md) (ревизия 2, по всем отчётам `docs/faex2/`): объединены собственный техдолг и открытые вопросы аудита ([AUDIT_CLOSURE_ROUND3](AUDIT_CLOSURE_ROUND3_2026-11-14.md), [INVESTIGATION_RESULT](INVESTIGATION_RESULT.md), [SNAPSHOT_STREAMING_PLAN](SNAPSHOT_STREAMING_PLAN.md)), собственные планы сравнения и бэклог переноса ([DFLASH2_EVAL_PLAN](DFLASH2_EVAL_PLAN_2026-11-15.md), [UPSTREAM_PORT](UPSTREAM_PORT.md), [OPTIMIZATION_BACKLOG](OPTIMIZATION_BACKLOG.md), [DECODE_DEPTH](DECODE_DEPTH.md), [NPU_MAP](NPU_MAP.md)) и заимствования из `strixite`, `gufo-laguna`, `tubo`, `NinjaPear/Q6dense`, апстрима `gufo`.
