@@ -4,6 +4,11 @@
 
 ## 2026-11-16
 
+### Очищены 6 временных worktree'ев агентов в `.claude/worktrees/`
+
+- Проведена ревизия 6 временных worktree'ев (`agent-a0ec81bb4b67eec1f`, `agent-a2cf6b42b1e0ffd2b`, `agent-a3175d835f0565e37`, `agent-a429cfa5b3cf49c47`, `agent-a58db8b79c9f01f34`, `agent-a6cf3ebf1dab72e3c`): во всех каталогах `git status --short` пуст; все коммиты пяти веток уже присутствуют в `faex2`, а для `155bc716` (`worktree-agent-a429cfa5b3cf49c47`) через `git range-diff` и `git diff` подтверждено, что вся логика вошла в `faex2` через `46c1e59d`.
+- По подтверждению владельца предварительно сохранён резервный архив `~/Downloads/claude-backup/faex2_arhiv/claude-worktrees-2026-11-16.tar.gz` (45 МБ), после чего все 6 worktree'ев удалены через `git worktree remove`, временные ветки — через `git branch -D`, выполнен `git worktree prune`. Код, тесты и стенд не затрагивались.
+
 ### Актуализированы вводные шапки DESIGN.md и BASELINE.md
 
 - В [DESIGN.md](DESIGN.md) обновлена вводная шапка: указана текущая рабочая сборка `004d8fa1`/`94a09930…` (запасная роль `abbfb006`/`e760a663…`), добавлены актуальные ссылки на [CONTEXT.md](CONTEXT.md), [AUDIT_CLOSURE_ROUND3_2026-11-14.md](AUDIT_CLOSURE_ROUND3_2026-11-14.md) и [ROADMAP_SPEC_01.md](ROADMAP_SPEC_01.md), а также уточнён статус раздела 2б (потоковое сохранение snapshot).
