@@ -149,6 +149,13 @@ public:
   std::optional<std::size_t> chat_token_count;
   mutable std::size_t counted_messages{0};
   mutable std::size_t counted_tools{0};
+  std::optional<std::vector<std::uint32_t>> tokenize(
+      std::string_view text) const override {
+    tokenized_text = std::string(text);
+    return token_ids;
+  }
+  std::optional<std::vector<std::uint32_t>> token_ids;
+  mutable std::string tokenized_text;
   Result complete(std::string_view prompt, std::size_t limit,
                   const gufo::sampling::SamplingConfig& sampling,
                   const CancellationCheck& cancel, const TokenCallback& token,
@@ -934,6 +941,59 @@ void TestLlamaProps() {
   assert(named.member_str("model") == "alias");
   assert(named.member_str("model_alias") == "test");
   assert(named.member_str("build_info") == "0.2.0 (abc1234)");
+}
+
+void TestLlamaTokenize() {
+  RunningServer server;
+  const int calls = server.backend->calls;
+
+  // A backend that cannot tokenize says so.
+  ExpectStatus(server.Post("/tokenize", R"({"content":"hi"})"), 501);
+
+  // The ids are the backend's for the content, unchanged; the control-token
+  // spelling reaches it as text, for the tokenizer to parse.
+  server.backend->token_ids = std::vector<std::uint32_t>{151644, 872, 7};
+  const auto response =
+      server.Post("/tokenize", R"({"content":"<|im_start|>user hi"})");
+  ExpectStatus(response, 200);
+  const auto body =
+      gufo::json::parse(response.substr(response.find("\r\n\r\n") + 4));
+  const auto* tokens = body.find("tokens");
+  assert(tokens != nullptr && tokens->is_array() && tokens->size() == 3);
+  assert(tokens->items()[0].as_size() == 151644 &&
+         tokens->items()[2].as_size() == 7);
+  assert(server.backend->tokenized_text == "<|im_start|>user hi");
+
+  // llama-server's defaults are accepted when sent; other values change the
+  // tokens and are refused rather than ignored.
+  ExpectStatus(server.Post("/tokenize", R"({"content":"hi","add_special":false,
+                                            "parse_special":true,
+                                            "with_pieces":false})"),
+               200);
+  ExpectStatus(
+      server.Post("/tokenize", R"({"content":"hi","add_special":true})"), 400);
+  ExpectStatus(
+      server.Post("/tokenize", R"({"content":"hi","parse_special":false})"),
+      400);
+  ExpectStatus(
+      server.Post("/tokenize", R"({"content":"hi","with_pieces":true})"), 400);
+  ExpectStatus(
+      server.Post("/tokenize", R"({"content":"hi","add_special":"no"})"), 400);
+  ExpectStatus(server.Post("/tokenize", R"({"content":["hi"]})"), 400);
+  ExpectStatus(server.Post("/tokenize", R"([])"), 400);
+  ExpectStatus(server.Post("/tokenize", R"({})"), 400);
+  ExpectStatus(server.Post("/tokenize", "not json"), 400);
+
+  // Empty content is no tokens, as in llama-server.
+  server.backend->token_ids = std::vector<std::uint32_t>{};
+  const auto empty = server.Post("/tokenize", R"({"content":""})");
+  ExpectStatus(empty, 200);
+  const auto none = gufo::json::parse(empty.substr(empty.find("\r\n\r\n") + 4));
+  assert(none.find("tokens") != nullptr && none.find("tokens")->is_array() &&
+         none.find("tokens")->empty());
+  // Tokenizing never generates.
+  assert(server.backend->calls == calls);
+  server.backend->token_ids.reset();
 }
 
 void TestLlamaSlotsAndMetrics() {
@@ -3214,6 +3274,7 @@ int main() {
   TestExpectContinue();
   TestFallbackBackendMetrics();
   TestLlamaProps();
+  TestLlamaTokenize();
   TestLlamaSlotsAndMetrics();
   TestCompatibilityRequests();
   TestTextOnlyBackendRefusesImagesBeforeReading();

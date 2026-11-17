@@ -4,6 +4,16 @@
 
 ## 2026-11-17
 
+### Ручной перенос `POST /tokenize` (`T1`, из апстрима `6d793814`)
+
+- Вручную перенесён маршрут `POST /tokenize` из апстрима `6d793814` без механического 3-way патча и без изменения кода моделей/GPU:
+  - [text_generation_backend.hpp](../../src/cli/serve/text_generation_backend.hpp): добавлен виртуальный метод `tokenize(std::string_view)` с дефолтным `std::nullopt`;
+  - [inference_backend.hpp](../../src/cli/serve/inference_backend.hpp) и [inference_backend.cpp](../../src/cli/serve/inference_backend.cpp): реализован `InferenceBackend::tokenize` через `state->scheduler->runner().Tokenize(text)` (под `#if defined(ENGINE_ENABLE_HIP)`);
+  - [http_server.cpp](../../src/cli/serve/http_server.cpp): добавлен хэндлер `LlamaTokenize` (проверка объекта JSON, строкового `content`, допустимости дефолтов `add_special=false`, `parse_special=true`, `with_pieces=false`, возврат `{"tokens": [...]}` или `501` при отсутствии поддержки) и регистрация маршрута `add("POST", "/tokenize", LlamaTokenize)` в `HttpServer::register_routes()`;
+  - [http_server_test.cpp](../../tests/cli/http_server_test.cpp): добавлен мок `tokenize` в `FakeBackend` и юнит-тест `TestLlamaTokenize()` (501 без токенизатора, 200 со спецтокеном `<|im_start|>`, проверка дефолтов/ошибок 400, пустой `content`, инвариант `calls` без генерации).
+- Проверено локально на Mac: `clang++ -std=c++20 -fsyntax-only` для `inference_backend.cpp` и `http_server_test.cpp` (OK; `http_server.cpp` упёрся в отсутствие `openssl/evp.h`), `git diff --check`, длина всех новых строк ≤ 80 символов.
+- Не проверено на Mac (нет `clang-format`, `cmake`, `nix`, OpenSSL и GPU-окружения): `tools/ci/check-format.py`, компиляция/запуск `http_server_test` и HTTP smoke-тест `POST /tokenize` на `faex2`. Стенд и рабочий сервис `004d8fa1` не затрагивались.
+
 ### Синхронизация `ROADMAP_SPEC_01` (`T16`) и обновление vision-документации `qwen3.6-35b-a3b`
 
 - [ROADMAP_SPEC_01.md](ROADMAP_SPEC_01.md) обновлён до ревизии 3 по задачам **`T16`** ([BORROW_PLAN_2026-11-17.md](BORROW_PLAN_2026-11-17.md)) и результатам Шага 1 ([DFLASH2_STEP1_REPORT_2026-11-17.md](DFLASH2_STEP1_REPORT_2026-11-17.md)):

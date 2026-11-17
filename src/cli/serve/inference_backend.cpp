@@ -6046,4 +6046,18 @@ std::optional<std::size_t> InferenceBackend::count_chat_tokens(
 #endif
 }
 
+std::optional<std::vector<std::uint32_t>> InferenceBackend::tokenize(
+    std::string_view text) const {
+#if defined(ENGINE_ENABLE_HIP)
+  const auto state = impl_->Snapshot();
+  if (state == nullptr) {
+    return std::nullopt;
+  }
+  return state->scheduler->runner().Tokenize(text);
+#else
+  (void)text;
+  return std::nullopt;
+#endif
+}
+
 }  // namespace gufo::server

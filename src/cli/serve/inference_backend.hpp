@@ -221,6 +221,10 @@ public:
   [[nodiscard]] std::optional<std::size_t> count_chat_tokens(
       const ChatRequest& request) const override;
 
+  /// Token ids of raw text, as complete() tokenizes a prompt.
+  [[nodiscard]] std::optional<std::vector<std::uint32_t>> tokenize(
+      std::string_view text) const override;
+
 private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
