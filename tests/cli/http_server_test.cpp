@@ -98,7 +98,11 @@ public:
   bool supports_images() const override { return image_support.load(); }
   std::atomic<bool> image_support{false};
   std::uint32_t max_context() const override { return 65536; }
-  std::vector<SessionState> session_states() const override { return sessions; }
+  std::vector<SessionState> session_states() const override {
+    ++session_state_queries;
+    return sessions;
+  }
+  mutable std::size_t session_state_queries{0};
   std::vector<SessionState> sessions;
   std::string model_path() const override { return served_path; }
   std::string build_info() const override { return served_build; }
@@ -953,6 +957,16 @@ void TestLlamaProps() {
 void TestLlamaTokenize() {
   RunningServer server;
   const int calls = server.backend->calls;
+  const auto count_metric_line = [](const std::string& metrics,
+                                    std::string_view key) -> std::string {
+    const auto pos = metrics.find(key);
+    assert(pos != std::string::npos);
+    const auto start = pos + key.size();
+    const auto end = metrics.find('\n', start);
+    return metrics.substr(start, end - start);
+  };
+  const auto metrics_before = server.Send("GET /metrics HTTP/1.1\r\n\r\n");
+  ExpectStatus(metrics_before, 200);
 
   // A backend that cannot tokenize says so.
   ExpectStatus(server.Post("/tokenize", R"({"content":"hi"})"), 501);
@@ -998,8 +1012,22 @@ void TestLlamaTokenize() {
   const auto none = gufo::json::parse(empty.substr(empty.find("\r\n\r\n") + 4));
   assert(none.find("tokens") != nullptr && none.find("tokens")->is_array() &&
          none.find("tokens")->empty());
-  // Tokenizing never generates.
+  // Tokenizing never generates or updates cache/request metrics.
   assert(server.backend->calls == calls);
+  const auto metrics_after = server.Send("GET /metrics HTTP/1.1\r\n\r\n");
+  ExpectStatus(metrics_after, 200);
+  for (const std::string_view key : {
+           "gufo_request_prompt_tokens_count ",
+           "gufo_request_cached_fraction_count ",
+           R"(gufo_request_cache_total{cache="miss"} )",
+           R"(gufo_request_cache_total{cache="memory"} )",
+           R"(gufo_request_cache_total{cache="disk"} )",
+           R"(gufo_active_long_requests{threshold_tokens="16384"} )",
+           "llamacpp:prompt_tokens_total ",
+       }) {
+    assert(count_metric_line(metrics_after, key) ==
+           count_metric_line(metrics_before, key));
+  }
   server.backend->token_ids.reset();
 }
 
@@ -1027,6 +1055,17 @@ void TestOpenAiInputTokens() {
     const auto path = std::string(endpoint.path) + "/input_tokens";
     auto body = gufo::json::parse(endpoint.body);
     const int calls = server.backend->calls;
+    const auto count_metric_line = [](const std::string& metrics,
+                                      std::string_view key) -> std::string {
+      const auto pos = metrics.find(key);
+      assert(pos != std::string::npos);
+      const auto start = pos + key.size();
+      const auto end = metrics.find('\n', start);
+      return metrics.substr(start, end - start);
+    };
+    const auto metrics_before_count =
+        server.Send("GET /metrics HTTP/1.1\r\n\r\n");
+    ExpectStatus(metrics_before_count, 200);
     // A registered endpoint reports an unsupported backend, not a fake count.
     const auto unsupported = server.Post(path, body.dump());
     ExpectStatus(unsupported, 501);
@@ -1059,6 +1098,21 @@ void TestOpenAiInputTokens() {
     assert(server.backend->calls == calls);
     assert(body_of(server.Send("GET /slots HTTP/1.1\r\n\r\n")).dump() ==
            slots_before);
+    const auto metrics_after_count =
+        server.Send("GET /metrics HTTP/1.1\r\n\r\n");
+    ExpectStatus(metrics_after_count, 200);
+    for (const std::string_view key : {
+             "gufo_request_prompt_tokens_count ",
+             "gufo_request_cached_fraction_count ",
+             R"(gufo_request_cache_total{cache="miss"} )",
+             R"(gufo_request_cache_total{cache="memory"} )",
+             R"(gufo_request_cache_total{cache="disk"} )",
+             R"(gufo_active_long_requests{threshold_tokens="16384"} )",
+             "llamacpp:prompt_tokens_total ",
+         }) {
+      assert(count_metric_line(metrics_after_count, key) ==
+             count_metric_line(metrics_before_count, key));
+    }
     // Generation still receives the same conversation and defaults.
     body["stream"] = false;
     ExpectStatus(server.Post(endpoint.path, body.dump()), 200);
@@ -1070,6 +1124,8 @@ void TestOpenAiInputTokens() {
     assert(generated.reasoning.effort == gufo::ReasoningEffort::kMedium);
     assert(generated.client_id == server.backend->counted_chat.client_id);
 
+    const auto metrics_after_gen = server.Send("GET /metrics HTTP/1.1\r\n\r\n");
+    ExpectStatus(metrics_after_gen, 200);
     for (const auto* invalid : {"{", "[]", "null"})
       ExpectStatus(server.Post(path, invalid), 400);
     for (const auto* field : {"model", "stream"}) {
@@ -1095,6 +1151,19 @@ void TestOpenAiInputTokens() {
     const auto zero = server.Post(path, body.dump());
     ExpectStatus(zero, 200);
     assert(body_of(zero).member_size("input_tokens", 99) == 0);
+    const auto metrics_after_errors =
+        server.Send("GET /metrics HTTP/1.1\r\n\r\n");
+    ExpectStatus(metrics_after_errors, 200);
+    for (const std::string_view key : {
+             "gufo_request_prompt_tokens_count ",
+             "gufo_request_cached_fraction_count ",
+             R"(gufo_request_cache_total{cache="miss"} )",
+             R"(gufo_request_cache_total{cache="memory"} )",
+             R"(gufo_request_cache_total{cache="disk"} )",
+         }) {
+      assert(count_metric_line(metrics_after_errors, key) ==
+             count_metric_line(metrics_after_gen, key));
+    }
     server.backend->chat_token_count.reset();
     assert(server.backend->calls == calls + 1);
   }
@@ -1254,6 +1323,150 @@ void TestLlamaSlotsAndMetrics() {
   }
   assert(metrics.find("# TYPE llamacpp:kv_cache_usage_ratio gauge\n") !=
          std::string::npos);
+}
+
+void TestCacheDistributionMetrics() {
+  RunningServer server;
+  const auto extract_metric = [](const std::string& body,
+                                 std::string_view prefix) -> std::string {
+    const auto pos = body.find(prefix);
+    assert(pos != std::string::npos);
+    const auto start = pos + prefix.size();
+    const auto end = body.find('\n', start);
+    assert(end != std::string::npos);
+    return body.substr(start, end - start);
+  };
+
+  // Without loaded sessions, active gauges and metadata still render as zeros.
+  server.backend->sessions.clear();
+  server.backend->session_state_queries = 0;
+  const auto empty_metrics = server.Send("GET /metrics HTTP/1.1\r\n\r\n");
+  ExpectStatus(empty_metrics, 200);
+  assert(server.backend->session_state_queries == 1);
+  for (const std::string_view family :
+       {"gufo_request_prompt_tokens", "gufo_request_cached_fraction",
+        "gufo_request_cache_total", "gufo_active_long_requests"}) {
+    assert(empty_metrics.find("# HELP " + std::string(family) + " ") !=
+           std::string::npos);
+  }
+  assert(empty_metrics.find("# TYPE gufo_request_prompt_tokens histogram\n") !=
+         std::string::npos);
+  assert(
+      empty_metrics.find("# TYPE gufo_request_cached_fraction histogram\n") !=
+      std::string::npos);
+  assert(empty_metrics.find("# TYPE gufo_request_cache_total counter\n") !=
+         std::string::npos);
+  assert(empty_metrics.find("# TYPE gufo_active_long_requests gauge\n") !=
+         std::string::npos);
+  for (const std::string_view threshold : {"16384", "32768", "65536"}) {
+    assert(extract_metric(empty_metrics,
+                          "gufo_active_long_requests{threshold_tokens=\"" +
+                              std::string(threshold) + "\"} ") == "0");
+  }
+
+  // Strictly > threshold on processing sessions only; generated_tokens never
+  // counts toward active long prompt gauges; one session_states() snapshot is
+  // shared with llamacpp:kv_cache_usage_ratio.
+  server.backend->sessions = {
+      {.processing = false, .prompt_tokens = 100000, .generated_tokens = 10},
+      {.processing = true, .prompt_tokens = 16384, .generated_tokens = 50000},
+      {.processing = true, .prompt_tokens = 16385, .generated_tokens = 1},
+      {.processing = true, .prompt_tokens = 32768, .generated_tokens = 1},
+      {.processing = true, .prompt_tokens = 32769, .generated_tokens = 1},
+      {.processing = true, .prompt_tokens = 65536, .generated_tokens = 1},
+      {.processing = true, .prompt_tokens = 65537, .generated_tokens = 1},
+  };
+  server.backend->session_state_queries = 0;
+  const auto active_metrics = server.Send("GET /metrics HTTP/1.1\r\n\r\n");
+  ExpectStatus(active_metrics, 200);
+  assert(server.backend->session_state_queries == 1);
+  assert(extract_metric(
+             active_metrics,
+             R"(gufo_active_long_requests{threshold_tokens="16384"} )") == "5");
+  assert(extract_metric(
+             active_metrics,
+             R"(gufo_active_long_requests{threshold_tokens="32768"} )") == "3");
+  assert(extract_metric(
+             active_metrics,
+             R"(gufo_active_long_requests{threshold_tokens="65536"} )") == "1");
+
+  // Record miss, memory, and disk observations and check cumulative buckets.
+  const auto before = server.Send("GET /metrics HTTP/1.1\r\n\r\n");
+  ExpectStatus(before, 200);
+  const auto val = [&](const std::string& body,
+                       std::string_view key) -> std::uint64_t {
+    return std::stoull(extract_metric(body, key));
+  };
+  {
+    gufo::server::TextGenerationBackend::Result r;
+    r.prompt_tokens = 512;
+    r.cached_prompt_tokens = 0;
+    gufo::server::RecordCacheRequestMetrics(r);
+  }
+  {
+    gufo::server::TextGenerationBackend::Result r;
+    r.prompt_tokens = 2048;
+    r.cached_prompt_tokens = 1024;
+    r.cache_hit = true;
+    gufo::server::RecordCacheRequestMetrics(r);
+  }
+  {
+    gufo::server::TextGenerationBackend::Result r;
+    r.prompt_tokens = 16385;
+    r.cached_prompt_tokens = 16385;
+    r.cache_hit = true;
+    r.cache_disk_hit = true;
+    gufo::server::RecordCacheRequestMetrics(r);
+  }
+  const auto after = server.Send("GET /metrics HTTP/1.1\r\n\r\n");
+  ExpectStatus(after, 200);
+  assert(val(after, R"(gufo_request_cache_total{cache="miss"} )") -
+             val(before, R"(gufo_request_cache_total{cache="miss"} )") ==
+         1);
+  assert(val(after, R"(gufo_request_cache_total{cache="memory"} )") -
+             val(before, R"(gufo_request_cache_total{cache="memory"} )") ==
+         1);
+  assert(val(after, R"(gufo_request_cache_total{cache="disk"} )") -
+             val(before, R"(gufo_request_cache_total{cache="disk"} )") ==
+         1);
+  assert(val(after, R"(gufo_request_prompt_tokens_bucket{le="512"} )") -
+             val(before, R"(gufo_request_prompt_tokens_bucket{le="512"} )") ==
+         1);
+  assert(val(after, R"(gufo_request_prompt_tokens_bucket{le="2048"} )") -
+             val(before, R"(gufo_request_prompt_tokens_bucket{le="2048"} )") ==
+         2);
+  assert(val(after, R"(gufo_request_prompt_tokens_bucket{le="32768"} )") -
+             val(before, R"(gufo_request_prompt_tokens_bucket{le="32768"} )") ==
+         3);
+  assert(val(after, R"(gufo_request_prompt_tokens_bucket{le="+Inf"} )") -
+             val(before, R"(gufo_request_prompt_tokens_bucket{le="+Inf"} )") ==
+         3);
+  assert(val(after, "gufo_request_prompt_tokens_count ") -
+             val(before, "gufo_request_prompt_tokens_count ") ==
+         3);
+  assert(val(after, "gufo_request_prompt_tokens_sum ") -
+             val(before, "gufo_request_prompt_tokens_sum ") ==
+         512 + 2048 + 16385);
+  assert(val(after, R"(gufo_request_cached_fraction_bucket{le="0"} )") -
+             val(before, R"(gufo_request_cached_fraction_bucket{le="0"} )") ==
+         1);
+  assert(val(after, R"(gufo_request_cached_fraction_bucket{le="0.5"} )") -
+             val(before, R"(gufo_request_cached_fraction_bucket{le="0.5"} )") ==
+         2);
+  assert(val(after, R"(gufo_request_cached_fraction_bucket{le="1"} )") -
+             val(before, R"(gufo_request_cached_fraction_bucket{le="1"} )") ==
+         3);
+  assert(
+      val(after, R"(gufo_request_cached_fraction_bucket{le="+Inf"} )") -
+          val(before, R"(gufo_request_cached_fraction_bucket{le="+Inf"} )") ==
+      3);
+  assert(val(after, "gufo_request_cached_fraction_count ") -
+             val(before, "gufo_request_cached_fraction_count ") ==
+         3);
+  const double frac_delta =
+      std::stod(extract_metric(after, "gufo_request_cached_fraction_sum ")) -
+      std::stod(extract_metric(before, "gufo_request_cached_fraction_sum "));
+  assert(std::abs(frac_delta - 1.5) < 1e-9);
 }
 
 void TestResponsesToolImages() {
@@ -3440,6 +3653,7 @@ int main() {
   TestLlamaTokenize();
   TestOpenAiInputTokens();
   TestLlamaSlotsAndMetrics();
+  TestCacheDistributionMetrics();
   TestCompatibilityRequests();
   TestTextOnlyBackendRefusesImagesBeforeReading();
   TestResponsesToolImages();

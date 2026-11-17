@@ -1033,6 +1033,39 @@ class FunctionalRunnerTest(unittest.TestCase):
             with self.subTest(text=bad), self.assertRaises(ValueError):
                 parse_metrics(bad)
 
+    def test_prometheus_additional_cache_series_preserve_legacy_accounting(self):
+        legacy = "".join(f"# HELP {name} Description\n# TYPE {name} {kind}\n{name} 0\n"
+                         for name, kind in TYPES.items())
+        additional = (
+            "# HELP gufo_request_prompt_tokens Prompt length in tokens\n"
+            "# TYPE gufo_request_prompt_tokens histogram\n"
+            'gufo_request_prompt_tokens_bucket{le="512"} 1\n'
+            'gufo_request_prompt_tokens_bucket{le="+Inf"} 1\n'
+            "gufo_request_prompt_tokens_sum 304\n"
+            "gufo_request_prompt_tokens_count 1\n"
+            "# HELP gufo_request_cached_fraction Cached fraction\n"
+            "# TYPE gufo_request_cached_fraction histogram\n"
+            'gufo_request_cached_fraction_bucket{le="0"} 0\n'
+            'gufo_request_cached_fraction_bucket{le="1"} 1\n'
+            'gufo_request_cached_fraction_bucket{le="+Inf"} 1\n'
+            "gufo_request_cached_fraction_sum 1\n"
+            "gufo_request_cached_fraction_count 1\n"
+            "# HELP gufo_request_cache_total Cache hits and misses\n"
+            "# TYPE gufo_request_cache_total counter\n"
+            'gufo_request_cache_total{cache="miss"} 0\n'
+            'gufo_request_cache_total{cache="memory"} 1\n'
+            'gufo_request_cache_total{cache="disk"} 0\n'
+            "# HELP gufo_active_long_requests Active long requests\n"
+            "# TYPE gufo_active_long_requests gauge\n"
+            'gufo_active_long_requests{threshold_tokens="16384"} 2\n'
+            'gufo_active_long_requests{threshold_tokens="32768"} 1\n'
+            'gufo_active_long_requests{threshold_tokens="65536"} 0\n'
+        )
+        parsed = parse_metrics(legacy + additional)
+        self.assertEqual(parsed, dict.fromkeys(TYPES, 0))
+        self.assertEqual({k: parsed[k] - dict.fromkeys(TYPES, 0)[k] for k in COUNTERS},
+                         dict.fromkeys(COUNTERS, 0))
+
     def test_prometheus_accounting_uses_uncached_work_once(self):
         before = dict.fromkeys(COUNTERS, 10)
         rows = [

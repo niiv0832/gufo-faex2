@@ -2,9 +2,13 @@
 #define GUFO_SERVER_GENERATION_METRICS_HPP_
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <iomanip>
+#include <limits>
+#include <ostream>
+#include <span>
 #include <sstream>
 
 #include "src/cli/serve/text_generation_backend.hpp"
@@ -74,6 +78,44 @@ inline std::atomic<std::int64_t>& RequestsDeferred() {
   static std::atomic<std::int64_t> count{0};
   return count;
 }
+
+inline constexpr std::array<std::size_t, 7> kPromptTokenBucketBounds{
+    512, 2048, 8192, 16384, 32768, 65536, 131072};
+inline constexpr std::array<double, 7> kCachedFractionBucketBounds{
+    0.0, 0.25, 0.5, 0.75, 0.9, 0.99, 1.0};
+inline constexpr std::array<const char*, 7> kCachedFractionBucketLabels{
+    "0", "0.25", "0.5", "0.75", "0.9", "0.99", "1"};
+inline constexpr std::array<std::size_t, 3> kActiveLongRequestThresholds{
+    16384, 32768, 65536};
+
+inline std::array<std::atomic<std::uint64_t>, 8>& PromptTokenBuckets() {
+  static std::array<std::atomic<std::uint64_t>, 8> buckets{};
+  return buckets;
+}
+inline std::atomic<std::uint64_t>& PromptTokenSum() {
+  static std::atomic<std::uint64_t> sum{0};
+  return sum;
+}
+inline std::array<std::atomic<std::uint64_t>, 8>& CachedFractionBuckets() {
+  static std::array<std::atomic<std::uint64_t>, 8> buckets{};
+  return buckets;
+}
+inline std::atomic<double>& CachedFractionSum() {
+  static std::atomic<double> sum{0.0};
+  return sum;
+}
+inline std::atomic<std::uint64_t>& CacheMissRequestsTotal() {
+  static std::atomic<std::uint64_t> count{0};
+  return count;
+}
+inline std::atomic<std::uint64_t>& CacheMemoryRequestsTotal() {
+  static std::atomic<std::uint64_t> count{0};
+  return count;
+}
+inline std::atomic<std::uint64_t>& CacheDiskRequestsTotal() {
+  static std::atomic<std::uint64_t> count{0};
+  return count;
+}
 }  // namespace detail
 
 inline double PrefillTokensPerSecond(
@@ -125,6 +167,121 @@ inline void RecordRequestMetrics(const TextGenerationBackend::Result& result) {
   }
   if (tok_per_sec > 0.0) {
     detail::LastGenSpeed().store(tok_per_sec, std::memory_order_relaxed);
+  }
+}
+
+/// Observes prompt length and cache reuse once per request that completed
+/// cache lookup in the scheduler. Failures, pre-lookup cancellations, and
+/// token-counting endpoints are excluded.
+inline void RecordCacheRequestMetrics(
+    const TextGenerationBackend::Result& result) {
+  std::size_t prompt_bin = detail::kPromptTokenBucketBounds.size();
+  for (std::size_t i = 0; i < detail::kPromptTokenBucketBounds.size(); ++i) {
+    if (result.prompt_tokens <= detail::kPromptTokenBucketBounds[i]) {
+      prompt_bin = i;
+      break;
+    }
+  }
+  detail::PromptTokenBuckets()[prompt_bin].fetch_add(1,
+                                                     std::memory_order_relaxed);
+  detail::PromptTokenSum().fetch_add(result.prompt_tokens,
+                                     std::memory_order_relaxed);
+
+  if (result.prompt_tokens > 0) {
+    const std::size_t cached =
+        std::min(result.cached_prompt_tokens, result.prompt_tokens);
+    const double fraction =
+        static_cast<double>(cached) / static_cast<double>(result.prompt_tokens);
+    std::size_t fraction_bin = detail::kCachedFractionBucketBounds.size();
+    for (std::size_t i = 0; i < detail::kCachedFractionBucketBounds.size();
+         ++i) {
+      if (fraction <= detail::kCachedFractionBucketBounds[i]) {
+        fraction_bin = i;
+        break;
+      }
+    }
+    detail::CachedFractionBuckets()[fraction_bin].fetch_add(
+        1, std::memory_order_relaxed);
+    double sum = detail::CachedFractionSum().load(std::memory_order_relaxed);
+    while (!detail::CachedFractionSum().compare_exchange_weak(
+        sum, sum + fraction, std::memory_order_relaxed)) {
+    }
+  }
+
+  if (result.cache_disk_hit) {
+    detail::CacheDiskRequestsTotal().fetch_add(1, std::memory_order_relaxed);
+  } else if (result.cache_hit) {
+    detail::CacheMemoryRequestsTotal().fetch_add(1, std::memory_order_relaxed);
+  } else {
+    detail::CacheMissRequestsTotal().fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
+inline void WriteCacheRequestMetrics(std::ostream& out) {
+  out << "# HELP gufo_request_prompt_tokens Prompt length in tokens for "
+         "requests that completed cache lookup\n"
+      << "# TYPE gufo_request_prompt_tokens histogram\n";
+  std::uint64_t prompt_cum = 0;
+  for (std::size_t i = 0; i < detail::kPromptTokenBucketBounds.size(); ++i) {
+    prompt_cum +=
+        detail::PromptTokenBuckets()[i].load(std::memory_order_relaxed);
+    out << "gufo_request_prompt_tokens_bucket{le=\""
+        << detail::kPromptTokenBucketBounds[i] << "\"} " << prompt_cum << "\n";
+  }
+  prompt_cum +=
+      detail::PromptTokenBuckets().back().load(std::memory_order_relaxed);
+  out << "gufo_request_prompt_tokens_bucket{le=\"+Inf\"} " << prompt_cum << "\n"
+      << "gufo_request_prompt_tokens_sum "
+      << detail::PromptTokenSum().load(std::memory_order_relaxed) << "\n"
+      << "gufo_request_prompt_tokens_count " << prompt_cum << "\n";
+
+  out << "# HELP gufo_request_cached_fraction Fraction of prompt tokens "
+         "reused from cache for nonempty requests that completed cache lookup\n"
+      << "# TYPE gufo_request_cached_fraction histogram\n";
+  std::uint64_t frac_cum = 0;
+  for (std::size_t i = 0; i < detail::kCachedFractionBucketLabels.size(); ++i) {
+    frac_cum +=
+        detail::CachedFractionBuckets()[i].load(std::memory_order_relaxed);
+    out << "gufo_request_cached_fraction_bucket{le=\""
+        << detail::kCachedFractionBucketLabels[i] << "\"} " << frac_cum << "\n";
+  }
+  frac_cum +=
+      detail::CachedFractionBuckets().back().load(std::memory_order_relaxed);
+  out << "gufo_request_cached_fraction_bucket{le=\"+Inf\"} " << frac_cum << "\n"
+      << "gufo_request_cached_fraction_sum "
+      << detail::CachedFractionSum().load(std::memory_order_relaxed) << "\n"
+      << "gufo_request_cached_fraction_count " << frac_cum << "\n";
+
+  out << "# HELP gufo_request_cache_total Completed-lookup requests by cache "
+         "reuse source\n"
+      << "# TYPE gufo_request_cache_total counter\n"
+      << "gufo_request_cache_total{cache=\"miss\"} "
+      << detail::CacheMissRequestsTotal().load(std::memory_order_relaxed)
+      << "\n"
+      << "gufo_request_cache_total{cache=\"memory\"} "
+      << detail::CacheMemoryRequestsTotal().load(std::memory_order_relaxed)
+      << "\n"
+      << "gufo_request_cache_total{cache=\"disk\"} "
+      << detail::CacheDiskRequestsTotal().load(std::memory_order_relaxed)
+      << "\n";
+}
+
+inline void WriteActiveLongRequestMetrics(
+    std::ostream& out,
+    std::span<const TextGenerationBackend::SessionState> sessions) {
+  out << "# HELP gufo_active_long_requests Processing requests (including "
+         "cache preparation and parked shared-prefix followers) with prompt "
+         "tokens strictly above threshold\n"
+      << "# TYPE gufo_active_long_requests gauge\n";
+  for (const std::size_t threshold : detail::kActiveLongRequestThresholds) {
+    std::size_t count = 0;
+    for (const auto& session : sessions) {
+      if (session.processing && session.prompt_tokens > threshold) {
+        ++count;
+      }
+    }
+    out << "gufo_active_long_requests{threshold_tokens=\"" << threshold
+        << "\"} " << count << "\n";
   }
 }
 

@@ -1597,8 +1597,9 @@ HttpResponse LlamaSlots(const HttpRequest&, TextGenerationBackend& b) {
 }
 
 /// Context held by in-flight requests across all sessions.
-double KvCacheUsageRatio(const TextGenerationBackend& b) {
-  const auto sessions = b.session_states();
+double KvCacheUsageRatio(
+    const TextGenerationBackend& b,
+    std::span<const TextGenerationBackend::SessionState> sessions) {
   const std::size_t capacity = sessions.size() * b.max_context();
   if (capacity == 0) {
     return 0.0;
@@ -1611,6 +1612,7 @@ double KvCacheUsageRatio(const TextGenerationBackend& b) {
 }
 
 HttpResponse LlamaMetrics(const HttpRequest&, TextGenerationBackend& b) {
+  const auto sessions = b.session_states();
   std::ostringstream out;
   out << std::setprecision(std::numeric_limits<double>::max_digits10);
   out << "# HELP gufo_device_lost_total Confirmed GPU context losses\n"
@@ -1684,7 +1686,10 @@ HttpResponse LlamaMetrics(const HttpRequest&, TextGenerationBackend& b) {
       << "# HELP llamacpp:kv_cache_usage_ratio In-flight prompt and generated "
          "tokens over sessions times context; excludes retained cache\n"
       << "# TYPE llamacpp:kv_cache_usage_ratio gauge\n"
-      << "llamacpp:kv_cache_usage_ratio " << KvCacheUsageRatio(b) << "\n";
+      << "llamacpp:kv_cache_usage_ratio " << KvCacheUsageRatio(b, sessions)
+      << "\n";
+  WriteCacheRequestMetrics(out);
+  WriteActiveLongRequestMetrics(out, sessions);
   return {.status = 200,
           .reason = "OK",
           .body = out.str(),

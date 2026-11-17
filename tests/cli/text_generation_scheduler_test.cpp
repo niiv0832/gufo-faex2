@@ -3165,11 +3165,380 @@ void TestSchedulerPassesRamOnlyPolicy() {
          "ordinary conversation remains cached after scheduler ram_only turn");
 }
 
+struct ParsedCacheMetrics {
+  std::vector<std::pair<std::string, std::uint64_t>> prompt_buckets;
+  double prompt_sum{0.0};
+  std::uint64_t prompt_count{0};
+  std::vector<std::pair<std::string, std::uint64_t>> fraction_buckets;
+  double fraction_sum{0.0};
+  std::uint64_t fraction_count{0};
+  std::uint64_t cache_miss{0};
+  std::uint64_t cache_memory{0};
+  std::uint64_t cache_disk{0};
+  std::uint64_t active_16k{0};
+  std::uint64_t active_32k{0};
+  std::uint64_t active_64k{0};
+};
+
+ParsedCacheMetrics ReadCacheMetrics(
+    std::span<const gufo::server::TextGenerationBackend::SessionState>
+        sessions = {}) {
+  std::ostringstream out;
+  gufo::server::WriteCacheRequestMetrics(out);
+  gufo::server::WriteActiveLongRequestMetrics(out, sessions);
+  ParsedCacheMetrics parsed;
+  std::istringstream lines(out.str());
+  const auto extract_label = [](std::string_view line,
+                                std::string_view key) -> std::string {
+    const std::string needle = std::string(key) + "=\"";
+    const auto pos = line.find(needle);
+    if (pos == std::string_view::npos)
+      return {};
+    const auto start = pos + needle.size();
+    const auto end = line.find('"', start);
+    return end == std::string_view::npos
+               ? std::string{}
+               : std::string(line.substr(start, end - start));
+  };
+  for (std::string line; std::getline(lines, line);) {
+    if (line.empty() || line[0] == '#')
+      continue;
+    const auto space = line.rfind(' ');
+    Expect(space != std::string::npos, "prometheus metric line has value");
+    const std::string_view key(line.data(), space);
+    const std::string val_str = line.substr(space + 1);
+    if (key.starts_with("gufo_request_prompt_tokens_bucket{")) {
+      parsed.prompt_buckets.emplace_back(extract_label(key, "le"),
+                                         std::stoull(val_str));
+    } else if (key == "gufo_request_prompt_tokens_sum") {
+      parsed.prompt_sum = std::stod(val_str);
+    } else if (key == "gufo_request_prompt_tokens_count") {
+      parsed.prompt_count = std::stoull(val_str);
+    } else if (key.starts_with("gufo_request_cached_fraction_bucket{")) {
+      parsed.fraction_buckets.emplace_back(extract_label(key, "le"),
+                                           std::stoull(val_str));
+    } else if (key == "gufo_request_cached_fraction_sum") {
+      parsed.fraction_sum = std::stod(val_str);
+    } else if (key == "gufo_request_cached_fraction_count") {
+      parsed.fraction_count = std::stoull(val_str);
+    } else if (key == R"(gufo_request_cache_total{cache="miss"})") {
+      parsed.cache_miss = std::stoull(val_str);
+    } else if (key == R"(gufo_request_cache_total{cache="memory"})") {
+      parsed.cache_memory = std::stoull(val_str);
+    } else if (key == R"(gufo_request_cache_total{cache="disk"})") {
+      parsed.cache_disk = std::stoull(val_str);
+    } else if (key ==
+               R"(gufo_active_long_requests{threshold_tokens="16384"})") {
+      parsed.active_16k = std::stoull(val_str);
+    } else if (key ==
+               R"(gufo_active_long_requests{threshold_tokens="32768"})") {
+      parsed.active_32k = std::stoull(val_str);
+    } else if (key ==
+               R"(gufo_active_long_requests{threshold_tokens="65536"})") {
+      parsed.active_64k = std::stoull(val_str);
+    }
+  }
+  return parsed;
+}
+
+void TestCacheRequestDistributions() {
+  using Result = gufo::server::TextGenerationBackend::Result;
+
+  // 1. Direct RecordCacheRequestMetrics boundary & fraction checks (deltas).
+  {
+    const auto before = ReadCacheMetrics();
+    Expect(before.prompt_buckets.size() == 8 &&
+               before.fraction_buckets.size() == 8,
+           "both histograms expose all 8 cumulative buckets");
+    const std::array<std::size_t, 9> prompt_sizes{
+        512, 513, 2048, 8192, 16384, 32768, 65536, 131072, 131073};
+    double expected_prompt_sum = 0.0;
+    for (const auto n : prompt_sizes) {
+      Result r;
+      r.prompt_tokens = n;
+      gufo::server::RecordCacheRequestMetrics(r);
+      expected_prompt_sum += static_cast<double>(n);
+    }
+    const auto after_len = ReadCacheMetrics();
+    Expect(after_len.prompt_count - before.prompt_count == 9,
+           "prompt histogram count tracks every observed request");
+    Expect(after_len.prompt_sum - before.prompt_sum == expected_prompt_sum,
+           "prompt histogram sum matches exact token total");
+    // Exact cumulative counts for [512, 2048, 8192, 16384, 32768, 65536,
+    // 131072, +Inf]: 512 -> le512(1); 513,2048 -> le2048(+2=3); 8192 -> 4; ...
+    // +Inf -> 9.
+    const std::array<std::uint64_t, 8> expected_prompt_cum{1, 3, 4, 5,
+                                                           6, 7, 8, 9};
+    for (std::size_t i = 0; i < 8; ++i) {
+      Expect(after_len.prompt_buckets[i].second -
+                     before.prompt_buckets[i].second ==
+                 expected_prompt_cum[i],
+             "prompt length bucket matches boundary");
+    }
+
+    // Fraction boundaries: 0, 0.25, 0.5, 0.75, 0.9, 0.99, 1.0, cached>prompt,
+    // and prompt=0 (excluded from fraction histogram, no division by zero).
+    const auto b_frac = ReadCacheMetrics();
+    const std::array<std::pair<std::size_t, std::size_t>, 9> frac_cases{{
+        {100, 0},    // 0.0 -> miss
+        {100, 25},   // 0.25 -> memory
+        {100, 50},   // 0.5 -> memory
+        {100, 75},   // 0.75 -> disk
+        {100, 90},   // 0.9 -> memory
+        {100, 99},   // 0.99 -> memory
+        {100, 100},  // 1.0 -> memory
+        {100, 150},  // clamped to 1.0 -> disk
+        {0, 0},      // empty prompt: skipped in fraction histogram
+    }};
+    for (std::size_t i = 0; i < frac_cases.size(); ++i) {
+      Result r;
+      r.prompt_tokens = frac_cases[i].first;
+      r.cached_prompt_tokens = frac_cases[i].second;
+      if (frac_cases[i].second > 0) {
+        r.cache_hit = true;
+        r.cache_disk_hit = (i == 3 || i == 7);
+      }
+      gufo::server::RecordCacheRequestMetrics(r);
+    }
+    const auto a_frac = ReadCacheMetrics();
+    Expect(a_frac.prompt_count - b_frac.prompt_count == 9,
+           "zero-prompt direct observation still records prompt_tokens=0");
+    Expect(a_frac.fraction_count - b_frac.fraction_count == 8,
+           "zero-prompt request is excluded from cached_fraction histogram");
+    const double expected_frac_sum =
+        0.0 + 0.25 + 0.5 + 0.75 + 0.9 + 0.99 + 1.0 + 1.0;
+    Expect(std::abs((a_frac.fraction_sum - b_frac.fraction_sum) -
+                    expected_frac_sum) < 1e-9,
+           "cached_fraction sum clamps cached>prompt to 1.0");
+    const std::array<std::uint64_t, 8> expected_frac_cum{1, 2, 3, 4,
+                                                         5, 6, 8, 8};
+    for (std::size_t i = 0; i < 8; ++i) {
+      Expect(a_frac.fraction_buckets[i].second -
+                     b_frac.fraction_buckets[i].second ==
+                 expected_frac_cum[i],
+             "cached_fraction bucket matches boundary");
+    }
+    Expect(a_frac.cache_miss - b_frac.cache_miss == 2 &&
+               a_frac.cache_memory - b_frac.cache_memory == 5 &&
+               a_frac.cache_disk - b_frac.cache_disk == 2,
+           "cache source counter separates miss, memory, and disk");
+  }
+
+  // 2. Scheduler admission boundary, no Wait / repeated Wait, failure, and
+  // parked follower cancellation regressions.
+  {
+    // A. Completion without Wait, repeated Wait, post-Acquire cancel,
+    // cache_prompt=false, and failure.
+    auto control = std::make_shared<FakeControl>();
+    control->snapshot_callback = [] {};
+    auto scheduler = MakeScheduler(control, 1);
+    const auto m0 = ReadCacheMetrics();
+
+    // Request completes in background WITHOUT calling Wait() first.
+    {
+      auto no_wait = scheduler->Submit({1, 2, 3}, 1, 0.0F);
+      const auto deadline = std::chrono::steady_clock::now() + kTestTimeout;
+      while (no_wait.phase() != TextRequestPhase::kTerminal &&
+             std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+      Expect(no_wait.phase() == TextRequestPhase::kTerminal,
+             "request completes without Wait");
+      const auto m1 = ReadCacheMetrics();
+      Expect(m1.prompt_count - m0.prompt_count == 1 &&
+                 m1.cache_miss - m0.cache_miss == 1,
+             "terminal observation runs in scheduler without Wait");
+      // First Wait returns result; repeated Wait throws; neither double-counts.
+      (void)no_wait.Wait();
+      bool repeated_threw = false;
+      try {
+        (void)no_wait.Wait();
+      } catch (const std::logic_error&) {
+        repeated_threw = true;
+      }
+      Expect(repeated_threw, "repeated Wait throws");
+      const auto m2 = ReadCacheMetrics();
+      Expect(
+          m2.prompt_count == m1.prompt_count && m2.cache_miss == m1.cache_miss,
+          "Wait and repeated Wait never double-count cache metrics");
+    }
+
+    // cache_prompt=false reports miss even when prefix is cached.
+    {
+      TextRequestMetadata no_reuse;
+      no_reuse.cache_prompt = false;
+      const auto before = ReadCacheMetrics();
+      const auto res =
+          scheduler->Submit({1, 2, 3, 4}, 1, 0.0F, {}, false, no_reuse).Wait();
+      Expect(!res.cache_hit, "cache_prompt=false bypasses reuse");
+      const auto after = ReadCacheMetrics();
+      Expect(after.cache_miss - before.cache_miss == 1 &&
+                 after.cache_memory - before.cache_memory == 0 &&
+                 after.fraction_buckets[0].second -
+                         before.fraction_buckets[0].second ==
+                     1,
+             "cache_prompt=false records cache=miss and fraction=0");
+    }
+
+    // Cancelled AFTER Acquire (during prefill): recorded once as memory hit.
+    {
+      {
+        const std::lock_guard<std::mutex> lock(control->mutex);
+        control->block_prefill_label = 1;
+      }
+      const auto before = ReadCacheMetrics();
+      auto cancelled_after = scheduler->Submit({1, 2, 3, 4, 5}, 2, 0.0F);
+      control->WaitForPrefill(1);
+      cancelled_after.Cancel();
+      control->ReleasePrefill();
+      Expect(cancelled_after.Wait().cancelled,
+             "post-Acquire cancel completes as cancelled");
+      const auto after = ReadCacheMetrics();
+      Expect(after.prompt_count - before.prompt_count == 1 &&
+                 after.cache_memory - before.cache_memory == 1,
+             "post-Acquire cancel records actual cache hit once");
+    }
+
+    // Failure inside Acquire (invalid prompt_context) and failure during
+    // decode: neither records in new cache metrics.
+    {
+      const auto before = ReadCacheMetrics();
+      TextRequestMetadata bad_ctx;
+      bad_ctx.prompt_context =
+          std::make_shared<gufo::server::TextPromptContext>();
+      bool acquire_failed = false;
+      try {
+        (void)scheduler->Submit({9}, 1, 0.0F, {}, false, bad_ctx).Wait();
+      } catch (const std::invalid_argument&) {
+        acquire_failed = true;
+      }
+      Expect(acquire_failed, "Acquire failure propagates");
+
+      {
+        const std::lock_guard<std::mutex> lock(control->mutex);
+        control->block_prefill_label = 0;
+        control->release_prefill = false;
+        control->throw_advance_label = 9;
+      }
+      bool decode_failed = false;
+      try {
+        (void)scheduler->Submit({9, 10}, 2, 0.0F).Wait();
+      } catch (const std::runtime_error&) {
+        decode_failed = true;
+      }
+      Expect(decode_failed, "decode failure propagates");
+      const auto after = ReadCacheMetrics();
+      Expect(
+          after.prompt_count == before.prompt_count &&
+              after.fraction_count == before.fraction_count &&
+              after.cache_miss == before.cache_miss &&
+              after.cache_memory == before.cache_memory &&
+              after.cache_disk == before.cache_disk,
+          "failed Acquire and failed generation add zero cache observations");
+    }
+  }
+
+  // B. Queued cancellation and Acquire-time cancellation add zero observations.
+  {
+    namespace metrics = gufo::server::detail;
+    auto control = std::make_shared<FakeControl>();
+    auto runner = std::make_shared<FakeRunner>(control);
+    auto pool = std::make_shared<TextRunnerPool>(std::move(runner), 1);
+    auto scheduler = std::make_unique<TextGenerationScheduler>(pool);
+    const auto before = ReadCacheMetrics();
+    const auto processing_before = metrics::RequestsProcessing().load();
+
+    // Hold the sole runner slot outside the scheduler so waiting_acquire
+    // pops the queue and blocks inside pool->Acquire waiting for a slot.
+    auto held = pool->Acquire(std::vector<TextRunnerToken>{9},
+                              TextRunnerPool::CancellationCheck{});
+    Expect(static_cast<bool>(held), "external lease occupies sole runner slot");
+
+    auto waiting_acquire = scheduler->Submit({2, 20}, 1, 0.0F);
+    const auto pop_deadline = std::chrono::steady_clock::now() + kTestTimeout;
+    while (metrics::RequestsProcessing().load() < processing_before + 1 &&
+           std::chrono::steady_clock::now() < pop_deadline) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    Expect(metrics::RequestsProcessing().load() == processing_before + 1,
+           "request popped queue into Acquire while external lease holds slot");
+    auto queued = scheduler->Submit({3, 30}, 1, 0.0F);
+
+    waiting_acquire.Cancel();
+    queued.Cancel();
+    Expect(waiting_acquire.Wait().cancelled,
+           "Acquire-time cancellation returns cancelled");
+    Expect(queued.Wait().cancelled, "queued cancellation returns cancelled");
+
+    held = {};
+    const auto completed = scheduler->Submit({1, 10}, 1, 0.0F).Wait();
+    Expect(!completed.cancelled && completed.tokens == ExpectedTokens(1, 1),
+           "subsequent request completes once slot is released");
+    const auto after = ReadCacheMetrics();
+    Expect(after.prompt_count - before.prompt_count == 1,
+           "only the completed request was observed, not queued or "
+           "Acquire-cancelled requests");
+  }
+
+  // C. Parked shared-prefix follower cancelled without lookup:
+  // active gauge includes it (>16384) while parked, but cache histograms/
+  // counters record ZERO observation for the cancelled parked follower!
+  {
+    auto control = SharedPrefixControl(true);
+    control->max_context = 32768;
+    control->block_prefill_label = 1;
+    std::binary_semaphore entered(0), release(0);
+    std::atomic<unsigned> captures{0};
+    control->snapshot_callback = [&] {
+      if (captures.fetch_add(1) == 0) {
+        entered.release();
+        if (!release.try_acquire_for(kTestTimeout))
+          throw std::runtime_error("parked follower snapshot gate timed out");
+      }
+    };
+    auto scheduler = MakeScheduler(control, 4);
+    const auto before = ReadCacheMetrics();
+
+    const auto leader_prompt = SharedPrompt(16400, 7000, 100);
+    auto leader = scheduler->Submit(leader_prompt, 1, 0.0F);
+    control->WaitForPrefill(1);
+    auto follower = scheduler->Submit(SharedPrompt(16400, 8000, 100), 1, 0.0F);
+    // Unblock chunk 0 (256 tokens) so Admit parks follower while leader is
+    // still prefilling toward the shared boundary snapshot.
+    control->ReleasePrefill();
+
+    Expect(
+        entered.try_acquire_for(kTestTimeout),
+        "leader reaches checkpoint snapshot after follower is admitted/parked");
+    const auto during = ReadCacheMetrics(scheduler->SessionStates());
+    Expect(during.active_16k == 2,
+           "parked long follower is visible in gufo_active_long_requests gauge "
+           "while waiting for shared prefix");
+
+    follower.Cancel();
+    Expect(follower.Wait().cancelled,
+           "cancelled parked follower finishes as cancelled");
+    release.release();
+    (void)leader.Wait();
+    const auto after = ReadCacheMetrics(scheduler->SessionStates());
+    Expect(after.active_16k == 0,
+           "active long gauge returns to 0 after completion and cancel");
+    Expect(after.prompt_count - before.prompt_count == 1 &&
+               after.fraction_count - before.fraction_count == 1 &&
+               after.cache_miss - before.cache_miss == 1 &&
+               after.cache_memory == before.cache_memory &&
+               after.cache_disk == before.cache_disk,
+           "parked follower cancelled before lookup produces zero cache "
+           "histogram or miss observations");
+  }
+}
+
 int main() {
   // Log assertions in this binary match the plain "[LEVEL] [component]" text
   // captured from a redirected sink; a TTY stderr would tint the level tag.
   ::setenv("NO_COLOR", "1", 1);
   TestSchedulerPassesRamOnlyPolicy();
+  TestCacheRequestDistributions();
   TestProgressLoggingIsOptInAndBounded();
   TestStructuredOutputIsPreparedBeforeServing();
   TestAdmissionLoggingIsDebugTierOnly();

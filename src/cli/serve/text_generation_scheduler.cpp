@@ -131,6 +131,8 @@ struct ScheduledRequest {
   bool backpressure_logged{false};
   // Only the scheduler worker changes this, from admission through cleanup.
   bool counted_processing{false};
+  bool cache_lookup_complete{false};
+  bool cache_metrics_recorded{false};
   // Admission waits at most once for a resident request to publish the
   // prompt prefix both share. Only the scheduler thread touches these.
   std::shared_ptr<ScheduledRequest> prefix_leader;
@@ -171,6 +173,14 @@ void ReleaseBufferedOutputLocked(
   request->output_pieces.clear();
   request->output_budget->Release(request->buffered_output_bytes);
   request->buffered_output_bytes = 0;
+}
+
+void RecordTerminalCacheTelemetry(
+    const std::shared_ptr<ScheduledRequest>& request) noexcept {
+  if (request->cache_lookup_complete &&
+      !std::exchange(request->cache_metrics_recorded, true)) {
+    RecordCacheRequestMetrics(request->result);
+  }
 }
 
 void PublishTerminal(const std::shared_ptr<ScheduledRequest>& request,
@@ -757,6 +767,7 @@ struct TextGenerationScheduler::Impl {
       FinalizeResult(request, TextGenerationBackend::FinishReason::kCancelled);
       LogDecodeProgress(request, true);
       RecordRequestMetrics(request->result);
+      RecordTerminalCacheTelemetry(request);
       PublishTerminal(request, {}, true);
     } catch (...) {
       PublishTerminal(request, std::current_exception(), true);
@@ -930,6 +941,7 @@ struct TextGenerationScheduler::Impl {
     // Recorded here rather than by the HTTP adapter, so a client that leaves
     // before reading the result still counts.
     RecordRequestMetrics(request->result);
+    RecordTerminalCacheTelemetry(request);
     PublishTerminal(request);
   }
 
@@ -1146,6 +1158,7 @@ struct TextGenerationScheduler::Impl {
             request->runner_request.cache_restore_ms();
         request->result.cache_disk_hit =
             request->runner_request.cache_disk_hit();
+        request->cache_lookup_complete = true;
         request->result.incremental_prefill_supported =
             incremental_prefill_supported;
         request->result.queue_ms = std::chrono::duration<double, std::milli>(

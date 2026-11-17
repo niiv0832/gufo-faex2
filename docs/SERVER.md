@@ -1198,6 +1198,20 @@ even if the client disconnects before reading it; requests that fail in the
 scheduler, such as on a deadline or a runner error, add none of these.
 `llamacpp:kv_cache_usage_ratio` is the in-flight prompt and generated tokens
 over sessions times context; retained cache entries are not counted.
+`/metrics` also exports `gufo_request_prompt_tokens` (histogram with `le`
+buckets `512`, `2048`, `8192`, `16384`, `32768`, `65536`, `131072`, `+Inf`),
+`gufo_request_cached_fraction` (histogram of `min(cached, prompt) / prompt`
+with `le` buckets `0`, `0.25`, `0.5`, `0.75`, `0.9`, `0.99`, `1`, `+Inf`),
+`gufo_request_cache_total{cache="miss|memory|disk"}`, and
+`gufo_active_long_requests{threshold_tokens="16384|32768|65536"}`.
+The histograms and cache counter observe a request once at completion or
+cancellation only after a runner lease is acquired and cache lookup completes
+(excluding queue/Acquire failures, parked cancellations, and counting
+endpoints); `gufo_active_long_requests` counts processing sessions strictly
+above each prompt-token threshold from the same `session_states` snapshot as
+`llamacpp:kv_cache_usage_ratio`, including cache preparation and parked
+shared-prefix followers. None of these metrics carry user IDs, prompt texts, or
+token IDs.
 `Server-Timing`, generation `timings`, and Chat Completions `usage.gufo`
 provide request-level measurements.
 
