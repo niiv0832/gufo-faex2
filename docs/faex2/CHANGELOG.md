@@ -11,8 +11,12 @@
   - [inference_backend.hpp](../../src/cli/serve/inference_backend.hpp) и [inference_backend.cpp](../../src/cli/serve/inference_backend.cpp): реализован `InferenceBackend::tokenize` через `state->scheduler->runner().Tokenize(text)` (под `#if defined(ENGINE_ENABLE_HIP)`);
   - [http_server.cpp](../../src/cli/serve/http_server.cpp): добавлен хэндлер `LlamaTokenize` (проверка объекта JSON, строкового `content`, допустимости дефолтов `add_special=false`, `parse_special=true`, `with_pieces=false`, возврат `{"tokens": [...]}` или `501` при отсутствии поддержки) и регистрация маршрута `add("POST", "/tokenize", LlamaTokenize)` в `HttpServer::register_routes()`;
   - [http_server_test.cpp](../../tests/cli/http_server_test.cpp): добавлен мок `tokenize` в `FakeBackend` и юнит-тест `TestLlamaTokenize()` (501 без токенизатора, 200 со спецтокеном `<|im_start|>`, проверка дефолтов/ошибок 400, пустой `content`, инвариант `calls` без генерации).
-- Проверено локально на Mac: `clang++ -std=c++20 -fsyntax-only` для `inference_backend.cpp` и `http_server_test.cpp` (OK; `http_server.cpp` упёрся в отсутствие `openssl/evp.h`), `git diff --check`, длина всех новых строк ≤ 80 символов.
-- Не проверено на Mac (нет `clang-format`, `cmake`, `nix`, OpenSSL и GPU-окружения): `tools/ci/check-format.py`, компиляция/запуск `http_server_test` и HTTP smoke-тест `POST /tokenize` на `faex2`. Стенд и рабочий сервис `004d8fa1` не затрагивались.
+- Проверено на стенде `faex2` (в изолированном временном каталоге `~/gufo-t1-verify-20261117`, затем удалённом; рабочий `gufo-faex2.service` не останавливался — `active`, `/health` OK, `~/src/gufo-mk` и `~/src/gufo-faex2` не изменялись):
+  - `python3 tools/ci/check-format.py` (`clang-format 23.1.5`) — **PASS: Checked 727 C++ files**;
+  - `cmake --preset cpu-test && cmake --build --preset pr` — **56/56 tests passed** (включая `http_server_test` 2,35 с, `openai_chat_test`, `serve_cli_test`, `text_model_runner_test`, `text_generation_scheduler_test`, `check_docs_test`);
+  - `cmake --preset cpu-sanitizer` (`http_server_test` под ASan + UBSan) — **1/1 Passed** (3,13 с);
+  - компиляция `CMakeFiles/gufo.dir/src/cli/serve/inference_backend.cpp.o` с `ENGINE_ENABLE_HIP=ON` (`therock-10.1.0`, `gfx1151`) — **0 ошибок** (и 0 предупреждений в `InferenceBackend::tokenize`).
+- Ещё не выполнено: полная линковка GPU `gufo` и живой HTTP smoke-тест `POST /tokenize` против загруженной модели `Qwen3.6-35B-A3B` (требует согласованного окна остановки рабочего сервера; целесообразно совместить с `T2` `input_tokens`).
 
 ### Синхронизация `ROADMAP_SPEC_01` (`T16`) и обновление vision-документации `qwen3.6-35b-a3b`
 
