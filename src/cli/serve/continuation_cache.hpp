@@ -112,6 +112,13 @@ struct ContinuationLookup {
   std::size_t checkpoint_tokens{0};
 };
 
+/// Summarizes the closest retained or live RAM prefix seen during lookup.
+struct ContinuationPrefixMatch {
+  std::size_t common_prefix_tokens{0};
+  std::size_t nearest_tokens{0};
+  bool input_matches{false};
+};
+
 /// Bounded exact-prefix cache over opaque model continuation states.
 ///
 /// The first deployment uses one entry. Supporting a bounded entry count here
@@ -157,6 +164,9 @@ public:
       return restored_from_disk_;
     }
     [[nodiscard]] ContinuationLookup lookup() const noexcept { return lookup_; }
+    [[nodiscard]] ContinuationPrefixMatch prefix_match() const noexcept {
+      return prefix_match_;
+    }
     [[nodiscard]] bool HasSnapshotFor(
         std::span<const ContinuationToken> tokens) const;
 
@@ -228,6 +238,7 @@ public:
       return PrefixInputIdentity(input_identity_, input_prefixes_, count);
     }
     ContinuationLookup lookup_;
+    ContinuationPrefixMatch prefix_match_;
   };
 
   /// Snapshot records are separate from execution slots. A zero record count

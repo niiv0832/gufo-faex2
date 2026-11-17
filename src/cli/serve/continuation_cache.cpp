@@ -305,7 +305,8 @@ ContinuationCache::Lease::Lease(Lease&& other) noexcept
       stable_prefix_tokens_(std::exchange(other.stable_prefix_tokens_, 0)),
       input_identity_(std::move(other.input_identity_)),
       input_prefixes_(std::move(other.input_prefixes_)),
-      lookup_(std::exchange(other.lookup_, {})) {}
+      lookup_(std::exchange(other.lookup_, {})),
+      prefix_match_(std::exchange(other.prefix_match_, {})) {}
 
 ContinuationCache::Lease& ContinuationCache::Lease::operator=(
     Lease&& other) noexcept {
@@ -327,6 +328,7 @@ ContinuationCache::Lease& ContinuationCache::Lease::operator=(
     input_identity_ = std::move(other.input_identity_);
     input_prefixes_ = std::move(other.input_prefixes_);
     lookup_ = std::exchange(other.lookup_, {});
+    prefix_match_ = std::exchange(other.prefix_match_, {});
   }
   return *this;
 }
@@ -615,6 +617,38 @@ ContinuationCache::Lease ContinuationCache::Acquire(
 
     const bool live_hit = live_source != no_entry;
     const bool cache_hit = live_hit || source != no_entry;
+    ContinuationPrefixMatch prefix_match;
+    if (reuse_prompt) {
+      const auto consider_prefix = [&](const auto& tokens,
+                                       const auto& identity) {
+        if (tokens.empty())
+          return;
+        const auto common =
+            static_cast<std::size_t>(std::mismatch(tokens.begin(), tokens.end(),
+                                                   prompt.begin(), prompt.end())
+                                         .first -
+                                     tokens.begin());
+        const bool id_matches = matches_input(identity, tokens.size());
+        const bool better = prefix_match.nearest_tokens == 0 ||
+                            common > prefix_match.common_prefix_tokens ||
+                            (common == prefix_match.common_prefix_tokens &&
+                             ((id_matches && !prefix_match.input_matches) ||
+                              (id_matches == prefix_match.input_matches &&
+                               tokens.size() > prefix_match.nearest_tokens)));
+        if (better) {
+          prefix_match = {
+              .common_prefix_tokens = common,
+              .nearest_tokens = tokens.size(),
+              .input_matches = id_matches,
+          };
+        }
+      };
+      for (const auto& entry : impl_->entries) {
+        if (entry->valid)
+          consider_prefix(entry->tokens, entry->input_identity);
+        consider_prefix(entry->live_tokens, entry->live_identity);
+      }
+    }
     ContinuationLookup lookup;
     if (!cache_hit) {
       lookup.miss_reason = reuse_prompt ? "no_checkpoint" : "disabled";
@@ -812,6 +846,7 @@ ContinuationCache::Lease ContinuationCache::Acquire(
       lease.stable_prefix_tokens_ = stable_prefix_tokens;
       lease.ram_only_ = ram_only;
       lease.lookup_ = lookup;
+      lease.prefix_match_ = prefix_match;
       return lease;
     }
 

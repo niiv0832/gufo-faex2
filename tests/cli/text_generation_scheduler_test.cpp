@@ -184,6 +184,7 @@ struct FakeControl {
   std::uint32_t max_context{128};
   std::optional<std::size_t> stop_after;
   std::optional<std::size_t> eos_after;
+  std::optional<TextRunnerToken> message_start_token;
   std::function<void()> snapshot_callback;
 };
 
@@ -288,6 +289,11 @@ public:
   [[nodiscard]] std::vector<TextRunnerToken> Tokenize(
       std::string_view text) const override {
     return {static_cast<TextRunnerToken>(text.size())};
+  }
+
+  [[nodiscard]] std::optional<TextRunnerToken> MessageStartToken()
+      const override {
+    return control_->message_start_token;
   }
 
   [[nodiscard]] std::shared_ptr<const gufo::sampling::ConstraintVocabulary>
@@ -3533,10 +3539,309 @@ void TestCacheRequestDistributions() {
   }
 }
 
+void TestPrefixLossThresholdsAndPrivacy() {
+  using Result = gufo::server::TextGenerationBackend::Result;
+  using Kind = gufo::server::TextPromptPosition::Kind;
+
+  const auto count_substr = [](std::string_view text, std::string_view needle) {
+    std::size_t count = 0;
+    std::size_t pos = 0;
+    while ((pos = text.find(needle, pos)) != std::string_view::npos) {
+      ++count;
+      pos += needle.size();
+    }
+    return count;
+  };
+
+  // 1. Direct formatter & threshold boundary tests.
+  {
+    Result clean;
+    clean.cache_prompt_enabled = true;
+    clean.cache_prefix_match = {
+        .common_prefix_tokens = 1000,
+        .nearest_tokens = 1000,
+        .input_matches = true,
+    };
+    clean.cached_prompt_tokens = 1000;
+    clean.prefill_tokens = 256;
+    Expect(gufo::server::CachePrefixLossLogDetails(clean).empty(),
+           "exact hit produces no prefix loss event");
+
+    Result disabled;
+    disabled.cache_prompt_enabled = false;
+    disabled.cache_prefix_match = {
+        .common_prefix_tokens = 10,
+        .nearest_tokens = 9000,
+        .input_matches = false,
+    };
+    disabled.prefill_tokens = 9000;
+    Expect(gufo::server::CachePrefixLossLogDetails(disabled).empty(),
+           "cache_prompt=false suppresses prefix loss event");
+
+    Result no_record;
+    no_record.cache_prompt_enabled = true;
+    no_record.prefill_tokens = 9000;
+    Expect(gufo::server::CachePrefixLossLogDetails(no_record).empty(),
+           "nearest_tokens=0 (cold cache) suppresses prefix loss event");
+
+    // lost = 512, unreused = 512 -> quiet below >512 threshold.
+    Result edge_512;
+    edge_512.cache_prompt_enabled = true;
+    edge_512.cache_prefix_match = {
+        .common_prefix_tokens = 1000,
+        .nearest_tokens = 1512,
+        .input_matches = true,
+    };
+    edge_512.cached_prompt_tokens = 488;
+    edge_512.prefill_tokens = 8191;
+    Expect(gufo::server::CachePrefixLossLogDetails(edge_512).empty(),
+           "lost=512 and unreused=512 at prefill=8191 stay quiet");
+
+    // lost = 513 -> INFO (<8192 prefill).
+    Result info_lost = edge_512;
+    info_lost.cache_prefix_match.nearest_tokens = 1513;
+    info_lost.cached_prompt_tokens = 1000;
+    info_lost.cache_divergence = {.kind = Kind::kUnknown};
+    const auto info_lost_msg =
+        gufo::server::CachePrefixLossLogDetails(info_lost);
+    Expect(
+        !info_lost_msg.empty() &&
+            !gufo::server::CachePrefixLossIsWarn(info_lost) &&
+            info_lost_msg.find("event=cache_prefix_loss") !=
+                std::string::npos &&
+            info_lost_msg.find("lost_tokens=513") != std::string::npos &&
+            info_lost_msg.find("divergence=unknown") != std::string::npos &&
+            info_lost_msg.find("divergence_message_index") == std::string::npos,
+        "lost=513 logs INFO without divergence_message_index when unknown");
+
+    // unreused = 513 -> INFO (<8192 prefill).
+    Result info_unreused;
+    info_unreused.cache_prompt_enabled = true;
+    info_unreused.cache_prefix_match = {
+        .common_prefix_tokens = 1000,
+        .nearest_tokens = 1000,
+        .input_matches = true,
+    };
+    info_unreused.cached_prompt_tokens = 487;
+    info_unreused.prefill_tokens = 1000;
+    info_unreused.cache_divergence = {
+        .kind = Kind::kMessage,
+        .message_index = 2,
+        .token_offset = 17,
+    };
+    const auto info_unreused_msg =
+        gufo::server::CachePrefixLossLogDetails(info_unreused);
+    Expect(!info_unreused_msg.empty() &&
+               !gufo::server::CachePrefixLossIsWarn(info_unreused) &&
+               info_unreused_msg.find("reason=prefix_unreused") !=
+                   std::string::npos &&
+               info_unreused_msg.find("unreused_prefix_tokens=513") !=
+                   std::string::npos &&
+               info_unreused_msg.find("divergence=message "
+                                      "divergence_message_index=2 "
+                                      "divergence_token_offset=17") !=
+                   std::string::npos,
+           "unreused=513 logs INFO with rendered message index and offset");
+
+    // common = 0 + changed prefix with prefill < 8192 stays quiet; at >= 8192
+    // becomes WARN!
+    Result zero_common_small;
+    zero_common_small.cache_prompt_enabled = true;
+    zero_common_small.cache_prefix_match = {
+        .common_prefix_tokens = 0,
+        .nearest_tokens = 2000,
+        .input_matches = true,
+    };
+    zero_common_small.prefill_tokens = 2000;
+    Expect(gufo::server::CachePrefixLossLogDetails(zero_common_small).empty(),
+           "unrelated small request with common=0 stays quiet");
+
+    Result zero_common_large = zero_common_small;
+    zero_common_large.prefill_tokens = 8192;
+    const auto zero_large_msg =
+        gufo::server::CachePrefixLossLogDetails(zero_common_large);
+    Expect(!zero_large_msg.empty() &&
+               gufo::server::CachePrefixLossIsWarn(zero_common_large),
+           "common=0 with lost>0 and prefill=8192 promotes to WARN");
+
+    // input_matches = false at prefill >= 8192 triggers WARN even with lost=0.
+    Result input_mismatch_warn;
+    input_mismatch_warn.cache_prompt_enabled = true;
+    input_mismatch_warn.cache_prefix_match = {
+        .common_prefix_tokens = 9000,
+        .nearest_tokens = 9000,
+        .input_matches = false,
+    };
+    input_mismatch_warn.cached_prompt_tokens = 0;
+    input_mismatch_warn.prefill_tokens = 9000;
+    input_mismatch_warn.cache_divergence = {
+        .kind = Kind::kBeforeMessages,
+        .token_offset = 5,
+    };
+    const auto input_warn_msg =
+        gufo::server::CachePrefixLossLogDetails(input_mismatch_warn);
+    Expect(
+        !input_warn_msg.empty() &&
+            gufo::server::CachePrefixLossIsWarn(input_mismatch_warn) &&
+            input_warn_msg.find("reason=input_mismatch") != std::string::npos &&
+            input_warn_msg.find("divergence=before_messages "
+                                "divergence_token_offset=5") !=
+                std::string::npos,
+        "input mismatch with prefill>=8192 logs WARN");
+  }
+
+  // 2. End-to-end scheduler tests: INFO/WARN emission, once per terminal,
+  // cancellation boundaries, cache_prompt=false, privacy.
+  const std::vector<TextRunnerToken> kMsgStart{999};
+  const auto make_two_msg_prompt =
+      [&](std::size_t msg0_len, std::size_t msg1_len, TextRunnerToken msg1_base,
+          TextRunnerToken secret_tok) {
+        std::vector<TextRunnerToken> p;
+        p.push_back(999);
+        for (std::size_t i = 0; i < msg0_len; ++i)
+          p.push_back(static_cast<TextRunnerToken>(10 + i));
+        p.push_back(999);
+        p.push_back(secret_tok);
+        for (std::size_t i = 1; i < msg1_len; ++i)
+          p.push_back(static_cast<TextRunnerToken>(msg1_base + i));
+        return p;
+      };
+  (void)kMsgStart;
+
+  {
+    auto control = SharedPrefixControl(true);
+    control->max_context = 32768;
+    control->prefill_capacity = 20000;
+    control->message_start_token = 999;
+    auto scheduler = MakeScheduler(control, 2);
+
+    std::ostringstream captured;
+    auto* prev_buf = std::clog.rdbuf(captured.rdbuf());
+    struct RestoreLog {
+      std::streambuf* prev;
+      ~RestoreLog() { std::clog.rdbuf(prev); }
+    } restore_log{prev_buf};
+
+    // Warm exact prompt (len = 9002 tokens, secret token 3133799 in message 1).
+    const auto warm_prompt =
+        make_two_msg_prompt(100, 8900, 100000, /*secret_tok=*/3133799);
+    const auto warm = scheduler->Submit(warm_prompt, 1, 0.0F).Wait();
+    Expect(!warm.cancelled && warm.tokens == ExpectedTokens(999, 1),
+           "warm long prompt succeeds");
+    Expect(count_substr(captured.str(), "event=cache_prefix_loss") == 0,
+           "cold warm-up emits zero cache_prefix_loss events");
+
+    // Repeat exact warm prompt -> silent.
+    const auto exact = scheduler->Submit(warm_prompt, 1, 0.0F).Wait();
+    Expect(exact.cached_prompt_tokens == warm_prompt.size() &&
+               count_substr(captured.str(), "event=cache_prefix_loss") == 0,
+           "exact hit emits zero cache_prefix_loss events");
+
+    // Diverge at start of message 1 (msg0 unchanged len=100, msg1 changed for
+    // 8900 tokens) -> WARN, once, rendered message_index=1.
+    const auto diverged_warn =
+        make_two_msg_prompt(100, 8900, 200000, /*secret_tok=*/3133800);
+    (void)scheduler->Submit(diverged_warn, 1, 0.0F).Wait();
+    const auto after_warn = captured.str();
+    Expect(
+        count_substr(after_warn, "event=cache_prefix_loss") == 1 &&
+            count_substr(after_warn, "[WARN] [cache]") >= 1 &&
+            after_warn.find("divergence=message "
+                            "divergence_message_index=1 "
+                            "divergence_token_offset=1") != std::string::npos,
+        "large divergence >=8192 prefill emits one WARN with message 1");
+
+    // cache_prompt=false -> silent even with diverged prompt.
+    (void)scheduler
+        ->Submit(make_two_msg_prompt(100, 8900, 300000, /*secret_tok=*/3133801),
+                 1, 0.0F, {}, false, {.cache_prompt = false})
+        .Wait();
+    Expect(count_substr(captured.str(), "event=cache_prefix_loss") == 1,
+           "cache_prompt=false emits zero prefix loss events");
+
+    // Moderate loss >512 (<8192 prefill): prompt diverged after common=8400,
+    // lost=602, prefill=602 -> INFO once.
+    {
+      auto mod_prompt = warm_prompt;
+      for (std::size_t i = 8400; i < mod_prompt.size(); ++i)
+        mod_prompt[i] = static_cast<TextRunnerToken>(400000 + i);
+      // Actually restore warm_prompt into cache first? No, warn request evicted
+      // single-slot live frontier if capacity=2 didn't; warm_prompt still in
+      // retained cache! So mod_prompt finds common=8400 vs retained warm_prompt
+      // (nearest=9002) -> lost=602 (>512), prefill=602 (<8192) -> INFO!
+      (void)scheduler->Submit(mod_prompt, 1, 0.0F).Wait();
+    }
+    const auto after_info = captured.str();
+    Expect(count_substr(after_info, "event=cache_prefix_loss") == 2 &&
+               count_substr(after_info, "[INFO] [cache] ") >= 1 &&
+               after_info.find("lost_tokens=602") != std::string::npos,
+           "moderate loss >512 with <8192 prefill emits INFO once");
+
+    // Post-lookup prefill cancellation emits once; pre-lookup Acquire
+    // cancellation emits zero.
+    {
+      auto cancel_control = SharedPrefixControl(true);
+      cancel_control->max_context = 32768;
+      cancel_control->prefill_capacity = 512;
+      cancel_control->message_start_token = 999;
+      auto runner = std::make_shared<FakeRunner>(cancel_control);
+      auto pool = std::make_shared<TextRunnerPool>(std::move(runner), 1);
+      auto cancel_sched = std::make_unique<TextGenerationScheduler>(pool);
+
+      const auto base_p =
+          make_two_msg_prompt(100, 8900, 500000, /*secret_tok=*/3133802);
+      (void)cancel_sched->Submit(base_p, 1, 0.0F).Wait();
+      const auto events_before =
+          count_substr(captured.str(), "event=cache_prefix_loss");
+
+      // Hold slot outside so next cancels inside Acquire (pre-lookup) -> zero.
+      auto held = pool->Acquire(std::vector<TextRunnerToken>{9},
+                                TextRunnerPool::CancellationCheck{});
+      auto pre_lookup_cancel = cancel_sched->Submit(
+          make_two_msg_prompt(50, 8900, 600000, /*secret_tok=*/3133803), 1,
+          0.0F);
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+      pre_lookup_cancel.Cancel();
+      Expect(pre_lookup_cancel.Wait().cancelled,
+             "pre-lookup cancel returns cancelled");
+      Expect(count_substr(captured.str(), "event=cache_prefix_loss") ==
+                 events_before,
+             "pre-lookup Acquire cancellation emits zero prefix loss events");
+      held = {};
+
+      // Now block during prefill AFTER lookup succeeded: cancels with
+      // prefill < 8192? Wait: make a large divergence so lost > 512 even when
+      // prefill stops at chunk 0 (512 tokens) -> INFO once!
+      cancel_control->block_prefill_label = 999;
+      auto post_lookup = cancel_sched->Submit(
+          make_two_msg_prompt(100, 8900, 700000, /*secret_tok=*/3133804), 1,
+          0.0F);
+      cancel_control->WaitForPrefill(999);
+      post_lookup.Cancel();
+      cancel_control->ReleasePrefill();
+      Expect(post_lookup.Wait().cancelled,
+             "post-lookup cancel returns cancelled");
+      Expect(count_substr(captured.str(), "event=cache_prefix_loss") ==
+                 events_before + 1,
+             "post-lookup cancellation with >512 lost emits once on terminal");
+    }
+
+    const auto final_log = captured.str();
+    for (std::string_view forbidden :
+         {"3133799", "3133800", "3133801", "3133802", "3133803", "3133804",
+          "hermes", "eviction", "memory_pressure", "truncat"}) {
+      Expect(final_log.find(forbidden) == std::string::npos,
+             "prefix loss log never leaks token IDs, secrets, or guessed "
+             "causes");
+    }
+  }
+}
+
 int main() {
   // Log assertions in this binary match the plain "[LEVEL] [component]" text
   // captured from a redirected sink; a TTY stderr would tint the level tag.
   ::setenv("NO_COLOR", "1", 1);
+  TestPrefixLossThresholdsAndPrivacy();
   TestSchedulerPassesRamOnlyPolicy();
   TestCacheRequestDistributions();
   TestProgressLoggingIsOptInAndBounded();

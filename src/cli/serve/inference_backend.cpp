@@ -1227,6 +1227,14 @@ public:
     return model_->GetTokenizer().Encode(text);
   }
 
+  [[nodiscard]] std::optional<TextRunnerToken> MessageStartToken()
+      const override {
+    const auto tokens = TokenizeControl(tokenization::kImStart);
+    if (tokens.size() != 1)
+      return std::nullopt;
+    return tokens.front();
+  }
+
   [[nodiscard]] std::optional<std::vector<TextRunnerToken>> RenderAndTokenize(
       const ChatRequest& request) const override {
     return tokenization::QwenChatTemplate::RenderAndTokenize(

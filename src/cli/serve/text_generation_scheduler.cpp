@@ -180,6 +180,20 @@ void RecordTerminalCacheTelemetry(
   if (request->cache_lookup_complete &&
       !std::exchange(request->cache_metrics_recorded, true)) {
     RecordCacheRequestMetrics(request->result);
+    try {
+      const auto details = CachePrefixLossLogDetails(request->result);
+      if (!details.empty()) {
+        const auto line =
+            "request=" + std::to_string(request->id) + ' ' + details;
+        if (CachePrefixLossIsWarn(request->result)) {
+          Logger::Warn("cache", line);
+        } else {
+          Logger::Info("cache", line);
+        }
+      }
+    } catch (...) {
+      // Telemetry formatting never fails request completion.
+    }
   }
 }
 
@@ -1158,6 +1172,16 @@ struct TextGenerationScheduler::Impl {
             request->runner_request.cache_restore_ms();
         request->result.cache_disk_hit =
             request->runner_request.cache_disk_hit();
+        request->result.cache_prompt_enabled = request->cache_prompt;
+        request->result.cache_prefix_match =
+            request->runner_request.cache_prefix_match();
+        if (request->cache_prompt &&
+            request->result.cache_prefix_match.nearest_tokens > 0) {
+          request->result.cache_divergence = LocatePromptPosition(
+              request->runner_request.prompt(),
+              request->result.cache_prefix_match.common_prefix_tokens,
+              runner_pool->runner().MessageStartToken());
+        }
         request->cache_lookup_complete = true;
         request->result.incremental_prefill_supported =
             incremental_prefill_supported;

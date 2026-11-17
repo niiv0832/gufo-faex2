@@ -349,6 +349,11 @@ public:
       std::string_view text) const {
     return Tokenize(text);
   }
+  /// Single token that opens a rendered chat message, or `nullopt` if unknown.
+  [[nodiscard]] virtual std::optional<TextRunnerToken> MessageStartToken()
+      const {
+    return std::nullopt;
+  }
   [[nodiscard]] virtual std::optional<std::vector<TextRunnerToken>>
   RenderAndTokenize(const ChatRequest& request) const = 0;
   [[nodiscard]] virtual std::optional<TextPreparedPrompt> PreparePrompt(
@@ -543,6 +548,7 @@ public:
     [[nodiscard]] explicit operator bool() const noexcept;
     [[nodiscard]] bool cache_hit() const noexcept;
     [[nodiscard]] ContinuationLookup cache_lookup() const noexcept;
+    [[nodiscard]] ContinuationPrefixMatch cache_prefix_match() const noexcept;
     [[nodiscard]] std::size_t cached_prompt_tokens() const noexcept;
     [[nodiscard]] std::size_t cache_restore_bytes() const noexcept;
     [[nodiscard]] double cache_restore_ms() const noexcept;
@@ -661,6 +667,12 @@ inline constexpr std::size_t kRamOnlyMaxPromptTokens = 1024;
 /// conversations.
 [[nodiscard]] bool IsRamOnlyChatRequest(
     const ChatRequest& original, std::size_t prepared_prompt_tokens) noexcept;
+
+/// Locates token offset `at` inside rendered chat messages using
+/// `message_start`.
+[[nodiscard]] TextPromptPosition LocatePromptPosition(
+    std::span<const TextRunnerToken> prompt, std::size_t at,
+    std::optional<TextRunnerToken> message_start) noexcept;
 
 }  // namespace gufo::server
 

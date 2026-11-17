@@ -2806,9 +2806,118 @@ void TestRamOnlyNeverUsesDiskStore() {
   }
 }
 
+void TestPrefixMatchSurvivesDiskRestore() {
+  TemporaryDirectory directory;
+  const TextRunnerDiskCacheOptions disk_cache{
+      .directory = directory.path(),
+      .capacity_bytes = 8192,
+      .staging_capacity_bytes = 4096,
+      .shared_prefix_min_tokens = 2,
+      .shared_prefix_max_boundaries = 4,
+      .min_checkpoint_step_tokens = 0,
+  };
+
+  // Producer persists {70, 71, 72, 73} to disk.
+  {
+    auto stats = std::make_shared<FakeStats>();
+    auto runner = std::make_shared<PersistentSnapshotRunner>(
+        stats, "artifact-prefix-match", 4 * sizeof(FakeSnapshot));
+    TextRunnerPool producer(runner, 1, disk_cache);
+    auto seed = producer.Acquire({70, 71, 72, 73});
+    Expect(seed.Prefill(8).decode_ready, "seed prefills before disk commit");
+    (void)seed.SelectNext();
+    seed.Advance();
+    Expect(seed.Commit().disk_queued_bytes > 0, "seed queues disk snapshot");
+  }
+
+  // Consumer warms RAM with {70, 71, 99} (no checkpoint at 2 tokens), then
+  // acquires {70, 71, 72, 73}: RAM misses (!cache_hit) with prefix_match
+  // {common=2, nearest=3, input_matches=true}, then disk restore adopts 4
+  // tokens without clearing prefix_match.
+  {
+    auto stats = std::make_shared<FakeStats>();
+    auto runner = std::make_shared<PersistentSnapshotRunner>(
+        stats, "artifact-prefix-match", 4 * sizeof(FakeSnapshot));
+    TextRunnerPool consumer(runner, 1, disk_cache);
+    auto ram_only_seed = consumer.Acquire({70, 71, 99}, {}, {}, {}, true, 0,
+                                          true, /*ram_only=*/true);
+    while (!ram_only_seed.Prefill(8).decode_ready) {
+    }
+    (void)ram_only_seed.Commit();
+
+    auto restored = consumer.Acquire({70, 71, 72, 73});
+    Expect(restored.cache_hit() && restored.cache_disk_hit() &&
+               restored.cached_prompt_tokens() == 4,
+           "consumer restores exact prefix from disk");
+    const auto match = restored.cache_prefix_match();
+    Expect(match.common_prefix_tokens == 2 && match.nearest_tokens == 3 &&
+               match.input_matches,
+           "AdoptRestoredPrefix preserves RAM/live prefix_match");
+    restored.Invalidate();
+  }
+}
+
+void TestPromptDivergencePosition() {
+  using gufo::server::LocatePromptPosition;
+  using Kind = gufo::server::TextPromptPosition::Kind;
+
+  auto stats = std::make_shared<FakeStats>();
+  SnapshotRunner runner(stats, 64, 256, 4096);
+  Expect(!runner.MessageStartToken().has_value(),
+         "generic TextModelRunner defaults MessageStartToken to nullopt");
+
+  // Layout: [900(preamble), 1(im_start), 10, 11, 1(im_start), 20, 21, 22]
+  const std::vector<TextRunnerToken> prompt{900, 1, 10, 11, 1, 20, 21, 22};
+
+  // nullopt message_start -> kUnknown
+  {
+    const auto pos = LocatePromptPosition(prompt, 4, std::nullopt);
+    Expect(pos.kind == Kind::kUnknown,
+           "missing message start token yields kUnknown");
+  }
+  // Empty message_start not in prompt -> kUnknown even at offset 0
+  {
+    const std::vector<TextRunnerToken> no_markers{10, 20, 30};
+    const auto pos = LocatePromptPosition(no_markers, 1, 1);
+    Expect(pos.kind == Kind::kUnknown,
+           "prompt without message start markers yields kUnknown");
+  }
+  // Before first marker (at = 0) -> kBeforeMessages
+  {
+    const auto pos = LocatePromptPosition(prompt, 0, 1);
+    Expect(pos.kind == Kind::kBeforeMessages && pos.token_offset == 0,
+           "position before first message marker reports kBeforeMessages");
+  }
+  // Start of rendered message 0 (at = 1, the marker itself) -> index 0, offset
+  // 0
+  {
+    const auto pos = LocatePromptPosition(prompt, 1, 1);
+    Expect(pos.kind == Kind::kMessage && pos.message_index == 0 &&
+               pos.token_offset == 0,
+           "position on first marker reports message 0 offset 0");
+  }
+  // Middle of rendered message 1 (at = 6) -> index 1, offset 2
+  {
+    const auto pos = LocatePromptPosition(prompt, 6, 1);
+    Expect(
+        pos.kind == Kind::kMessage && pos.message_index == 1 &&
+            pos.token_offset == 2,
+        "position inside rendered message 1 reports 0-based index and offset");
+  }
+  // At or beyond prompt end -> kEnd
+  {
+    const auto pos = LocatePromptPosition(prompt, prompt.size(), 1);
+    Expect(pos.kind == Kind::kEnd, "at == prompt.size() reports kEnd");
+    const auto past = LocatePromptPosition(prompt, prompt.size() + 3, 1);
+    Expect(past.kind == Kind::kEnd, "at > prompt.size() reports kEnd");
+  }
+}
+
 }  // namespace
 
 int main() {
+  TestPrefixMatchSurvivesDiskRestore();
+  TestPromptDivergencePosition();
   TestRamOnlyChatClassification();
   TestRamOnlyUsesFinalPreparedLength();
   TestRamOnlyNeverUsesDiskStore();

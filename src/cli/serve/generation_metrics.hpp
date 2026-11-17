@@ -335,6 +335,74 @@ inline std::string GenerationLogDetails(
   return out.str();
 }
 
+[[nodiscard]] inline bool CachePrefixLossIsWarn(
+    const TextGenerationBackend::Result& result) noexcept {
+  if (!result.cache_prompt_enabled ||
+      result.cache_prefix_match.nearest_tokens == 0) {
+    return false;
+  }
+  const auto& match = result.cache_prefix_match;
+  const std::size_t lost =
+      match.nearest_tokens > match.common_prefix_tokens
+          ? match.nearest_tokens - match.common_prefix_tokens
+          : 0;
+  const bool input_changed = !match.input_matches;
+  return (lost > 0 || input_changed) && result.prefill_tokens >= 8192;
+}
+
+/// Formats a bounded prefix-loss diagnostic line for `[cache]` without any
+/// prompt text, token IDs, or guessed root causes.
+[[nodiscard]] inline std::string CachePrefixLossLogDetails(
+    const TextGenerationBackend::Result& result) {
+  if (!result.cache_prompt_enabled ||
+      result.cache_prefix_match.nearest_tokens == 0) {
+    return {};
+  }
+  const auto& match = result.cache_prefix_match;
+  const std::size_t common = match.common_prefix_tokens;
+  const std::size_t nearest = match.nearest_tokens;
+  const std::size_t lost = nearest > common ? nearest - common : 0;
+  const std::size_t unreused = common > result.cached_prompt_tokens
+                                   ? common - result.cached_prompt_tokens
+                                   : 0;
+  const bool input_changed = !match.input_matches;
+  const bool warn = CachePrefixLossIsWarn(result);
+  const bool info = !warn && common > 0 && (lost > 512 || unreused > 512);
+  if (!warn && !info) {
+    return {};
+  }
+  const std::string_view reason = input_changed ? "input_mismatch"
+                                  : lost > 0    ? "prefix_diverged"
+                                                : "prefix_unreused";
+  std::ostringstream out;
+  out << "event=cache_prefix_loss source=ram_live reason=" << reason
+      << " common_prefix_tokens=" << common << " lost_tokens=" << lost
+      << " nearest_tokens=" << nearest
+      << " cached_tokens=" << result.cached_prompt_tokens
+      << " unreused_prefix_tokens=" << unreused
+      << " prefill_tokens=" << result.prefill_tokens;
+  using Kind = TextPromptPosition::Kind;
+  switch (result.cache_divergence.kind) {
+    case Kind::kMessage:
+      out << " divergence=message divergence_message_index="
+          << result.cache_divergence.message_index
+          << " divergence_token_offset="
+          << result.cache_divergence.token_offset;
+      break;
+    case Kind::kBeforeMessages:
+      out << " divergence=before_messages divergence_token_offset="
+          << result.cache_divergence.token_offset;
+      break;
+    case Kind::kEnd:
+      out << " divergence=end";
+      break;
+    case Kind::kUnknown:
+      out << " divergence=unknown";
+      break;
+  }
+  return out.str();
+}
+
 /// Timed prefill counts work actually executed; usage counts the full prompt.
 inline json::Value GenerationTimings(
     const TextGenerationBackend::Result& result) {

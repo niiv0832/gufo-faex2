@@ -1376,6 +1376,12 @@ ContinuationLookup TextRunnerPool::Request::cache_lookup() const noexcept {
   return impl_ != nullptr ? impl_->lease.lookup() : ContinuationLookup{};
 }
 
+ContinuationPrefixMatch TextRunnerPool::Request::cache_prefix_match()
+    const noexcept {
+  return impl_ != nullptr ? impl_->lease.prefix_match()
+                          : ContinuationPrefixMatch{};
+}
+
 std::size_t TextRunnerPool::Request::cache_restore_bytes() const noexcept {
   return impl_ != nullptr ? impl_->lease.restored_snapshot_bytes() : 0;
 }
@@ -2217,6 +2223,38 @@ std::size_t TextRunnerPool::CachedPrefixTokens(
     return impl_->cache.CachedPrefixTokens(prompt);
   return impl_->cache.CachedPrefixTokens(prompt, context->cache_identity,
                                          context->cache_prefixes);
+}
+
+TextPromptPosition LocatePromptPosition(
+    std::span<const TextRunnerToken> prompt, std::size_t at,
+    std::optional<TextRunnerToken> message_start) noexcept {
+  using Kind = TextPromptPosition::Kind;
+  if (!message_start) {
+    return {.kind = Kind::kUnknown};
+  }
+  if (at >= prompt.size()) {
+    return {.kind = Kind::kEnd};
+  }
+  std::size_t count = 0;
+  std::size_t last_start = 0;
+  for (std::size_t index = 0; index <= at; ++index) {
+    if (prompt[index] == *message_start) {
+      ++count;
+      last_start = index;
+    }
+  }
+  if (count == 0) {
+    const auto tail = prompt.subspan(at + 1);
+    if (std::ranges::find(tail, *message_start) != tail.end()) {
+      return {.kind = Kind::kBeforeMessages, .token_offset = at};
+    }
+    return {.kind = Kind::kUnknown};
+  }
+  return {
+      .kind = Kind::kMessage,
+      .message_index = count - 1,
+      .token_offset = at - last_start,
+  };
 }
 
 }  // namespace gufo::server

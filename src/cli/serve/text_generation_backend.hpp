@@ -14,6 +14,7 @@
 #include <utility>
 #include <vector>
 
+#include "src/cli/serve/continuation_cache.hpp"
 #include "src/core/reasoning.hpp"
 #include "src/core/sampling.hpp"
 #include "src/core/text_sampling_defaults.hpp"
@@ -21,6 +22,20 @@
 #include "src/models/qwen/tokenizer.hpp"
 
 namespace gufo::server {
+
+/// Rendered-prompt position where cache prefix diverged, without leaking text.
+struct TextPromptPosition {
+  enum class Kind : std::uint8_t {
+    kUnknown,
+    kBeforeMessages,
+    kMessage,
+    kEnd,
+  };
+
+  Kind kind{Kind::kUnknown};
+  std::size_t message_index{0};
+  std::size_t token_offset{0};
+};
 
 enum class TextGenerationErrorCode : std::uint8_t {
   kQueueFull,
@@ -243,9 +258,12 @@ public:
     std::string cache_miss_reason;
     std::size_t cache_common_prefix_tokens{0};
     std::size_t cache_checkpoint_tokens{0};
+    ContinuationPrefixMatch cache_prefix_match;
+    TextPromptPosition cache_divergence;
     FinishReason finish_reason{FinishReason::kStop};
     std::string stop_sequence;
     bool incremental_prefill_supported{false};
+    bool cache_prompt_enabled{true};
     bool cache_hit{false};
     bool cache_disk_hit{false};
     bool cancelled{false};

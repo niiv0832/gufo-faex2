@@ -1215,6 +1215,16 @@ token IDs.
 `Server-Timing`, generation `timings`, and Chat Completions `usage.gufo`
 provide request-level measurements.
 
+When prompt cache reuse is enabled, requests that complete cache lookup also
+emit at most one terminal `[cache]` `event=cache_prefix_loss` log line from the
+nearest retained or live RAM entry (`source=ram_live`): `INFO` when a shared
+prefix loses or fails to reuse more than 512 tokens while prefill stays under
+8192 tokens, and `WARN` when at least 8192 tokens are prefilled with lost prefix
+tokens or an input-identity mismatch (`divergence_message_index` and
+`divergence_token_offset` use the 0-based rendered prompt message layout when a
+message-start token is known, and omit client text, token IDs, and guessed
+causes).
+
 `GET /slots` (alias `/v1/slots`) lists one llama-server slot per `--sessions`
 entry. A session is processing from admission, including cache preparation,
 until the request ends, so the processing slots match

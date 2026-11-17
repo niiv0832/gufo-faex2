@@ -1693,7 +1693,168 @@ void TestRamOnlyAdmissionDoesNotDowngradeOrdinary() {
   }
 }
 
+void TestPrefixMatchSurvivesPartialHitAndDiskRestore() {
+  using namespace gufo::server;
+  using Tokens = std::vector<ContinuationToken>;
+  std::vector<std::size_t> invalidations(4);
+  std::size_t next_id = 0;
+  const auto make_cache = [&](std::size_t capacity, std::size_t bytes = 1024,
+                              std::size_t records = 8) {
+    next_id = 0;
+    return std::make_unique<ContinuationCache>(
+        capacity,
+        [&] { return std::make_unique<FakeState>(next_id++, &invalidations); },
+        ContinuationCache::SnapshotSupport{
+            .restore =
+                [](ContinuationState& state,
+                   const ContinuationSnapshot& snapshot) {
+                  dynamic_cast<FakeState&>(state).value =
+                      dynamic_cast<const FakeSnapshot&>(snapshot).value;
+                },
+            .capacity_bytes = [bytes] { return bytes; },
+            .on_event = {},
+        },
+        records);
+  };
+
+  // Cold / no records -> zero match.
+  {
+    auto cache = make_cache(1);
+    auto lease = cache->Acquire(Tokens{10, 20, 30});
+    Expect(!lease.cache_hit() && lease.prefix_match().nearest_tokens == 0 &&
+               lease.prefix_match().common_prefix_tokens == 0 &&
+               !lease.prefix_match().input_matches,
+           "cold acquire reports empty prefix match");
+    lease.Invalidate();
+  }
+
+  // Disabled reuse -> zero match even with retained/live records.
+  {
+    auto cache = make_cache(1);
+    {
+      auto first = cache->Acquire(Tokens{1, 2, 3, 4});
+      (void)first.TryReserveSnapshot(64, 4);
+      (void)first.Commit(Tokens{1, 2, 3, 4},
+                         std::make_unique<FakeSnapshot>(1, 64),
+                         Tokens{1, 2, 3, 4, 5});
+    }
+    auto disabled = cache->Acquire(Tokens{1, 2, 3}, {}, {}, {},
+                                   /*reuse_prompt=*/false);
+    Expect(!disabled.cache_hit() &&
+               disabled.prefix_match().nearest_tokens == 0 &&
+               disabled.prefix_match().common_prefix_tokens == 0,
+           "disabled reuse leaves prefix match empty");
+    disabled.Invalidate();
+  }
+
+  // Full hit sets common == nearest == prompt.size() and input_matches == true.
+  {
+    auto cache = make_cache(1);
+    Tokens p{1, 2, 3, 4};
+    {
+      auto first = cache->Acquire(p);
+      (void)first.TryReserveSnapshot(64, p.size());
+      (void)first.Commit(p, std::make_unique<FakeSnapshot>(1, 64));
+    }
+    auto hit = cache->Acquire(p);
+    Expect(hit.cache_hit() && hit.cached_tokens() == 4 &&
+               hit.prefix_match().common_prefix_tokens == 4 &&
+               hit.prefix_match().nearest_tokens == 4 &&
+               hit.prefix_match().input_matches,
+           "full hit sets full prefix match");
+    hit.Invalidate();
+  }
+
+  // Partial / short hit + deeper retained record + truncate + live_tokens
+  // before invalidation/clear.
+  {
+    auto cache = make_cache(1, 2048, 8);
+    // Retained short prefix [1, 2]
+    {
+      auto a = cache->Acquire(Tokens{1, 2});
+      (void)a.TryReserveSnapshot(64, 2);
+      (void)a.Commit(Tokens{1, 2}, std::make_unique<FakeSnapshot>(1, 64));
+    }
+    // Live longer frontier [1, 2, 3, 4, 5, 6] stored on state before clear.
+    {
+      auto b = cache->Acquire(Tokens{1, 2, 3, 4, 5});
+      (void)b.TryReserveSnapshot(64, 5);
+      (void)b.Commit(Tokens{1, 2, 3, 4, 5},
+                     std::make_unique<FakeSnapshot>(2, 64),
+                     Tokens{1, 2, 3, 4, 5, 6});
+    }
+    // Probe [1, 2, 3, 4, 99, 100]: captures live frontier [1..6] -> common=4,
+    // nearest=6 before live_tokens.clear()!
+    auto probe = cache->Acquire(Tokens{1, 2, 3, 4, 99, 100});
+    Expect(
+        probe.prefix_match().common_prefix_tokens == 4 &&
+            probe.prefix_match().nearest_tokens == 6 &&
+            probe.prefix_match().input_matches,
+        "live frontier longer than retained snapshot is captured before clear");
+    probe.Invalidate();
+
+    // Truncated request [1, 2, 3]: matches retained/live, common == 3,
+    // nearest >= 5.
+    auto truncated = cache->Acquire(Tokens{1, 2, 3});
+    Expect(truncated.prefix_match().common_prefix_tokens == 3 &&
+               truncated.prefix_match().nearest_tokens >= 5 &&
+               truncated.prefix_match().input_matches,
+           "truncated request sees deeper nearest record");
+    truncated.Invalidate();
+  }
+
+  // Identity mismatch and LCP tie-breaking: larger common wins; tie prefers
+  // compatible identity, then longer nearest_tokens.
+  {
+    auto cache = make_cache(1, 2048, 8);
+    const std::vector<std::uint8_t> id_a{1, 1, 1, 1};
+    const std::vector<std::uint8_t> id_b{2, 2, 2, 2};
+    const std::vector<ContinuationInputPrefix> pref_a{
+        {.token_count = 3, .identity = id_a}};
+    const std::vector<ContinuationInputPrefix> pref_b{
+        {.token_count = 3, .identity = id_b}};
+    {
+      auto a =
+          cache->Acquire(Tokens{10, 20, 30, 40}, {}, id_a, {}, true, 0, pref_a);
+      (void)a.TryReserveSnapshot(64, 4);
+      (void)a.Commit(Tokens{10, 20, 30, 40},
+                     std::make_unique<FakeSnapshot>(10, 64));
+    }
+    {
+      auto b = cache->Acquire(Tokens{10, 20, 30, 50, 60}, {}, id_b, {}, true, 0,
+                              pref_b);
+      (void)b.TryReserveSnapshot(64, 5);
+      (void)b.Commit(Tokens{10, 20, 30, 50, 60},
+                     std::make_unique<FakeSnapshot>(11, 64));
+    }
+    // Probe with id_a matches {10,20,30} for both (common=3): compatible id_a
+    // beats mismatched id_b even though id_b has nearest=5 vs id_a's nearest=4.
+    auto tie_id =
+        cache->Acquire(Tokens{10, 20, 30, 99}, {}, id_a, {}, true, 0, pref_a);
+    Expect(tie_id.prefix_match().common_prefix_tokens == 3 &&
+               tie_id.prefix_match().nearest_tokens == 4 &&
+               tie_id.prefix_match().input_matches,
+           "tie in common prefix prefers compatible input identity");
+    tie_id.Invalidate();
+
+    // Mismatched identity id_c hits neither cleanly -> input_matches == false
+    // and longer nearest (5) wins tie!
+    const std::vector<std::uint8_t> id_c{3, 3, 3, 3};
+    const std::vector<ContinuationInputPrefix> pref_c{
+        {.token_count = 3, .identity = id_c}};
+    auto mismatch =
+        cache->Acquire(Tokens{10, 20, 30, 99}, {}, id_c, {}, true, 0, pref_c);
+    Expect(
+        mismatch.prefix_match().common_prefix_tokens == 3 &&
+            mismatch.prefix_match().nearest_tokens == 5 &&
+            !mismatch.prefix_match().input_matches,
+        "identity mismatch reports input_matches=false and picks longest tie");
+    mismatch.Invalidate();
+  }
+}
+
 int main() {
+  TestPrefixMatchSurvivesPartialHitAndDiskRestore();
   TestRamOnlyKeepsLongConversation();
   TestRamOnlyAdmissionDoesNotDowngradeOrdinary();
   TestMissReasonNamesEvictionAndStableBoundary();
