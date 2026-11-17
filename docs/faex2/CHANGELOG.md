@@ -4,6 +4,15 @@
 
 ## 2026-11-17
 
+### Шаг 1 оценки DFlash2 против MTP1 на `hermes_synth`: DFlash2 закрыт для `35B-A3B`
+
+- В согласованном окне стенда (`13:27:55`–`13:33:54 MSK`, простой штатного API 359 с, возврат через `systemctl --user start gufo-faex2.service`, READY, `004d8fa1`) выполнен Шаг 1 [DFLASH2_EVAL_PLAN_2026-11-15.md](DFLASH2_EVAL_PLAN_2026-11-15.md) (Этап 0 п. 1 [ROADMAP_SPEC_01.md](ROADMAP_SPEC_01.md)). Код движка не менялся и не пересобирался.
+- Добавлены HTTP-скрипт оценки [dflash2_eval.py](../../tests/functional/dflash2_eval.py), модульный тест [test_dflash2_eval.py](../../tests/functional/test_dflash2_eval.py) (`faex2.py` не изменялся) и подробный отчёт [DFLASH2_STEP1_REPORT_2026-11-17.md](DFLASH2_STEP1_REPORT_2026-11-17.md).
+- Сравнены 3 руки (`off`, `mtp --draft-tokens 1`, `dflash2 --draft-policy adaptive --draft-tokens 7`) на `127.0.0.1:13345` (`C1`, `--temperature 0 --seed 1`, `--think on --reasoning-budget 512`, `--context 131072`, `--max-tokens 2048`, без `--mmproj`, раздельные кэши) на 15 случаях `hermes_synth` + `aux_title_request.json` в 2 проходах (холодный/прогретый 55K-префикс + полный кэш).
+- Результат: все 3×33 ответа побитово совпали (`output_sha256` 33/33), ошибок/предупреждений в логах 0. На классе `tool` `DFlash2` уступил `MTP1` **−8,76 %** по `wall_ms` в Проходе 1 (`13 635,9` vs `12 537,1 мс`, `74,86` vs `86,90 tok/s`) и **−16,13 %** в Проходе 2 (`6 646,9` vs `5 723,6 мс`, `74,97` vs `87,06 tok/s`); на `mixed` — **−10,56 % / −12,24 %**; на `prose` — **−12,15 % / −12,46 %**; по эпизоду из 15 случаев — **−10,95 % / −13,00 %**; на коротком `aux_title` (18 ток.) +2,56 % (в сумме −15,8 мс). Принятие черновиков: `MTP1` 83,2–91,8 % (`aux` 100 %), `DFlash2` 48,7–52,7 %.
+- Вердикт по критерию отказа (`tool` ≥ +15 %): **«DFlash2 закрыт для Qwen3.6-35B-A3B, Шаг 2 не нужен»**. В `T7 cost gate` ([BORROW_PLAN_2026-11-17.md](BORROW_PLAN_2026-11-17.md)) остаётся только ветка `MTP1 ↔ AR` на `C2–C8`; ветка `DFlash2` и условный техдолг DFlash2 ([ROADMAP_SPEC_01.md](ROADMAP_SPEC_01.md) §2.Б п. 6) сняты.
+- Проверки: `test_hermes_synth.py` (4/4 OK), `test_dflash2_eval.py` (1/1 OK, локально и на стенде), штатный сервер возвращён и проверен (`/health`, `fork_restart.sh --status`, `"28+28="` → `"56"`, `journalctl --user`). Границы: `C1`, `temperature = 0`, без `--mmproj`, синтетический набор.
+
 ### Доработка `BORROW_EVAL_2026-11-17` и `BORROW_PLAN_2026-11-17` по итогам аудита + карта логики `strixite`
 
 - Все выводы двойного аудита перенесены в [BORROW_EVAL_2026-11-17.md](BORROW_EVAL_2026-11-17.md) и [BORROW_PLAN_2026-11-17.md](BORROW_PLAN_2026-11-17.md); временный отчёт `BORROW_AUDIT_2026-11-17.md` по согласованию с владельцем удалён. Код движка не менялся.
