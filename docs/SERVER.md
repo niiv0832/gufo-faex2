@@ -425,7 +425,9 @@ cache snapshots. HTTP handlers do not implement model kernels.
 | --- | --- | --- |
 | `GET` | `/v1/models` | List loaded model aliases and capabilities |
 | `POST` | `/v1/responses` | Text/images, structured output, optional SSE streaming |
+| `POST` | `/v1/responses/input_tokens` | Count prompt tokens for Responses without generating |
 | `POST` | `/v1/chat/completions` | Main chat, streaming, image and tool API |
+| `POST` | `/v1/chat/completions/input_tokens` | Count prompt tokens for Chat Completions without generating |
 | `POST` | `/v1/completions` | Optional legacy text completion adapter |
 | `POST` | `/tokenize` | Tokenize raw text into model token IDs without generating |
 | `GET` | `/health` | Process liveness and GPU context (aliases: `/v1/health`, `/healthz`) |
@@ -595,6 +597,35 @@ Text endpoints use `ChatRequest` and `SamplingConfig` at the
 Chat messages retain roles, reasoning, tool calls and image content until the
 model's tokenizer and template turn them into model input. The scheduler owns
 request limits, cancellation, cache accounting and completion state.
+
+## OpenAI input token counts
+
+`POST /v1/chat/completions/input_tokens` and
+`POST /v1/responses/input_tokens` accept the same request body and model
+selection as their respective generation endpoints and return:
+
+```json
+{"object":"response.input_tokens","input_tokens":123}
+```
+
+Responses follows OpenAI's input-token-count response shape; Chat Completions
+uses the equivalent llama-server extension. Counts include the model's chat
+template, system/instructions, tools and tool history, reasoning settings,
+structured-output instructions and supported image tokens. They describe the
+complete prompt, independent of any cached prefix, and agree with Chat
+`usage.prompt_tokens` or Responses `usage.input_tokens` for the same request.
+
+Counting does not schedule inference, prefill or generation, and does not
+update the continuation cache or generation metrics. It can count prompts
+larger than the execution context so clients can decide how much to trim.
+Image inputs still undergo the usual image loading and validation and may
+populate the CPU image-preprocessing cache. Generation options are validated as
+usual, but `stream: true` is accepted and still returns
+one JSON count response. Output-token limits are not added to `input_tokens`.
+Malformed requests return 400, a model that is not served returns 404, and a
+backend without prompt-count support returns 501. As with generation, Responses
+clients must supply the complete conversation; server-side history is not
+resolved by these endpoints.
 
 ## Responses API Subset
 

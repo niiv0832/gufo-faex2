@@ -12,6 +12,16 @@ namespace gufo::server {
 HttpResponse HandleOpenAiChat(const HttpRequest& request,
                               TextGenerationBackend& backend);
 
+/// Count the same prompt as Chat Completions, without scheduling generation.
+/// Streaming options are accepted but the result is always one JSON response.
+HttpResponse HandleOpenAiChatInputTokens(const HttpRequest& request,
+                                         TextGenerationBackend& backend);
+
+/// Shared Chat/Responses result, including unsupported-backend and prompt
+/// errors.
+HttpResponse CountOpenAiInputTokens(const ChatRequest& chat,
+                                    TextGenerationBackend& backend);
+
 /// Responses nests output schema under text.format and effort under reasoning.
 /// Shared controls stay validated as in Chat Completions, but the Responses
 /// adapter tolerates standard Responses fields with no native effect (hosted
