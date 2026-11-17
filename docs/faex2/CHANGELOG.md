@@ -4,6 +4,16 @@
 
 ## 2026-11-18
 
+### Закрытие Minor 2–5 ревью `T2a-1` (Minor 1 отклонён)
+
+- По итогам ревью (`e958b9ba`) в коммите `69464413` исправлены 4 из 5 замечаний Minor:
+  - Minor 2 (`generation_metrics.hpp`): переведены `RecordCacheRequestMetrics` и `WriteCacheRequestMetrics` на единый снимок `CacheMetricsSnapshot` под коротким `std::mutex` (согласованные бакеты, `+Inf`, `_sum`, `_count` и `cache_total` при конкурентном scrape без CAS-циклов);
+  - Minor 3 (`continuation_cache.cpp:649`): перед чтением `live_tokens` в скане `prefix_match` добавлен явный guard `if (entry->available)`, согласованный с поиском `live_hit`;
+  - Minor 4 (`generation_metrics.hpp` + `text_generation_scheduler_test.cpp`): добавлен ранний выход при `result.prompt_tokens == 0` в `RecordCacheRequestMetrics`, чтобы инвариант равенства `_count` между гистограммами и `cache_total` выполнялся даже при прямых вызовах; тест `TestCacheRequestDistributions` обновлён;
+  - Minor 5 (`docs/SERVER.md`): уточнена формулировка про переиспользование освободившегося idle execution slot после сохранения RAM-чекпоинта предыдущего владельца.
+- Minor 1 (`continuation_cache.cpp:1266,1310`, `candidate == source_index`) сознательно **отклонён**: в `snapshot_mode()` сохранённые снимки занимают индексы `[state_count .. entries.size())`, поэтому `source_index` лежит в том же диапазоне, что и `candidate`; условие не мёртвое и защищает собственный родительский checkpoint от самовытеснения при `> 1` записи или `!IsContinuation(purpose)`.
+- Проверено без остановки сервиса (`004d8fa1`, PID `100729`, SHA-256 `94a09930…`): локально `test_runner.py` (**82 tests OK**); на `faex2` в изолированном `~/gufo-t2a1-verify-20261117-r2` (временные `src/` и `tmp/` удалены, `out/` сохранён, `minor_verify.log` перенесён в `LLM_FAEX2/results/2026-11-17-t2a1-hermes-cpu/`): `check-format.py` (**PASS: 727 C++ files**), `git diff --check`, `check_docs_test.py` (**11/11 OK**), затронутый `cpu-test` (**5/5 Passed**), `cpu-sanitizer` ASan/UBSan (**5/5 Passed**).
+
 ### Независимое ревью `T2a-1`: APPROVE, 5 Minor отложены
 
 - Проведено fresh-context ревью полного диффа `ef407ca8..520603da` (4 коммита, 226 КБ) против [плана](../superpowers/plans/2026-11-17-hermes-cache-telemetry.md) и [дизайна](../superpowers/specs/2026-11-17-hermes-cache-telemetry-design.md), четыре прохода (кэш → runner/disk → scheduler/metrics/HTTP → тесты/docs). **Вердикт: APPROVE**; все пять пунктов «Особого внимания» плана подтверждены кодом и тестами.
