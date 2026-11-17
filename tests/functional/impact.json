@@ -29,6 +29,7 @@
   },
   "suites": {
     "discovery": {"covers": ["discovery"], "uses": [], "status": "active", "configuration": "standard", "vision_required": false},
+    "openai-count-tokens": {"covers": ["accounting", "vision"], "uses": ["tokenization", "framing", "sampling", "limits", "scheduling", "continuation", "structured", "tool-schemas", "generation"], "status": "active", "configuration": "standard", "vision_required": false},
     "messages-count-tokens": {"covers": ["accounting", "tool-schemas"], "uses": ["tokenization", "framing", "sampling", "limits", "scheduling", "continuation", "structured", "generation"], "status": "active", "configuration": "standard", "vision_required": false},
     "messages-image-counts": {"covers": ["accounting", "vision"], "uses": ["tokenization", "framing", "sampling", "limits", "scheduling", "continuation", "structured", "tool-schemas", "generation"], "status": "active", "configuration": "standard", "vision_required": false},
     "responses": {"covers": ["framing", "streaming"], "uses": ["tokenization", "sampling", "limits", "scheduling", "continuation", "structured", "tool-schemas", "generation"], "status": "active", "configuration": "standard", "vision_required": false},
