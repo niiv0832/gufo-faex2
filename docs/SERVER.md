@@ -427,6 +427,7 @@ cache snapshots. HTTP handlers do not implement model kernels.
 | `POST` | `/v1/responses` | Text/images, structured output, optional SSE streaming |
 | `POST` | `/v1/chat/completions` | Main chat, streaming, image and tool API |
 | `POST` | `/v1/completions` | Optional legacy text completion adapter |
+| `POST` | `/tokenize` | Tokenize raw text into model token IDs without generating |
 | `GET` | `/health` | Process liveness and GPU context (aliases: `/v1/health`, `/healthz`) |
 | `GET` | `/ready` | Model and backend readiness (aliases: `/v1/ready`, `/readyz`) |
 | `GET` | `/metrics` | Prometheus-format operational metrics (text LLM serving only) |
@@ -710,6 +711,14 @@ generation, without running the vision encoder; the matching projector must
 be loaded. Models without image support reject image counts with 400.
 Backends without chat counting support return 501. `/infill` still returns 501 because
 suffix-conditioned infill is not implemented.
+
+`POST /tokenize` takes `{"content": "..."}` and returns `{"tokens": [...]}`,
+the loaded model's token IDs for raw text. Control-token spellings become their
+special tokens and nothing is prepended, as `/completion` tokenizes a prompt
+(llama-server's defaults: `add_special` false, `parse_special` true,
+`with_pieces` false). Those three boolean fields are accepted only at their
+defaults (or `null`); other values and invalid types return 400. Nothing is
+prefilled or cached. Backends that cannot tokenize return 501.
 
 Raw Completions accepts `stream: true` and
 `stream_options: {"include_usage": true}`. The final usage event reports prompt,
