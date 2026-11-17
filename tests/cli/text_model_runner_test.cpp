@@ -5,11 +5,13 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <semaphore>
@@ -2416,9 +2418,400 @@ void TestServerInstructionsAreFraming() {
   }
 }
 
+void TestRamOnlyChatClassification() {
+  using gufo::server::IsRamOnlyChatRequest;
+  using gufo::server::kRamOnlyMaxPromptTokens;
+  using gufo::tokenization::ChatMessage;
+  using gufo::tokenization::ChatRole;
+
+  const auto schema = gufo::sampling::JsonConstraint::Compile(
+      gufo::json::parse(
+          R"({"type":"object","properties":{"title":{"type":"string"}},"required":["title"],"additionalProperties":false})"),
+      false);
+  const auto json_object = gufo::sampling::JsonConstraint::Object();
+
+  ChatRequest aux({{ChatRole::kSystem, "Title generator"},
+                   {ChatRole::kUser, "Generate a short title"}});
+  aux.response_format = schema;
+  Expect(kRamOnlyMaxPromptTokens == 1024,
+         "ram_only prompt token limit is 1024");
+  Expect(IsRamOnlyChatRequest(aux, 304),
+         "system+user with json_schema and 304 tokens is ram_only");
+  Expect(IsRamOnlyChatRequest(aux, 1024),
+         "exact 1024-token boundary stays ram_only");
+  Expect(!IsRamOnlyChatRequest(aux, 1025),
+         "1025 prepared tokens exceeds ram_only limit");
+  Expect(!IsRamOnlyChatRequest(aux, 0),
+         "empty prepared prompt is not ram_only");
+
+  // High 64-bit size_t values above UINT32_MAX must stay false without
+  // narrowing or allocating a large vector.
+  const std::size_t above_uint32 =
+      static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max()) + 10;
+  Expect(!IsRamOnlyChatRequest(aux, above_uint32),
+         "64-bit prompt size above UINT32_MAX must not wrap into ram_only");
+
+  ChatRequest dev_obj(
+      {{ChatRole::kDeveloper, "Format JSON"}, {ChatRole::kUser, "Classify"}});
+  dev_obj.response_format = json_object;
+  Expect(IsRamOnlyChatRequest(dev_obj, 128),
+         "developer+user with json_object is ram_only");
+
+  ChatRequest user_only({{ChatRole::kUser, "Only user"}});
+  user_only.response_format = schema;
+  Expect(IsRamOnlyChatRequest(user_only, 64),
+         "single user message with response_format is ram_only");
+
+  {
+    auto no_format = aux;
+    no_format.response_format.reset();
+    Expect(!IsRamOnlyChatRequest(no_format, 304),
+           "ordinary chat without response_format is not ram_only");
+  }
+  {
+    auto with_tools = aux;
+    with_tools.tools.push_back({.name = "search", .parameters_json = "{}"});
+    Expect(!IsRamOnlyChatRequest(with_tools, 304),
+           "requests with tools are not ram_only");
+  }
+  {
+    auto with_assistant = aux;
+    with_assistant.messages.insert(with_assistant.messages.begin() + 1,
+                                   {ChatRole::kAssistant, "Earlier answer"});
+    Expect(!IsRamOnlyChatRequest(with_assistant, 304),
+           "assistant history is not ram_only");
+  }
+  {
+    auto with_tool_msg = aux;
+    ChatMessage tool_msg(ChatRole::kTool, "result");
+    tool_msg.tool_call_id = "call_1";
+    with_tool_msg.messages.insert(with_tool_msg.messages.begin() + 1,
+                                  std::move(tool_msg));
+    Expect(!IsRamOnlyChatRequest(with_tool_msg, 304),
+           "tool history is not ram_only");
+  }
+  {
+    auto with_tool_calls = aux;
+    with_tool_calls.messages.front().tool_calls.push_back(
+        {.id = "call_1", .name = "search", .arguments = {}});
+    Expect(!IsRamOnlyChatRequest(with_tool_calls, 304),
+           "messages with tool_calls are not ram_only");
+  }
+  {
+    auto with_image = aux;
+    with_image.messages.back().images.push_back(
+        {0, std::make_shared<const std::vector<std::uint8_t>>(
+                std::initializer_list<std::uint8_t>{1, 2, 3})});
+    Expect(!IsRamOnlyChatRequest(with_image, 304),
+           "image requests are not ram_only");
+  }
+  {
+    auto two_users = aux;
+    two_users.messages.insert(two_users.messages.begin() + 1,
+                              {ChatRole::kUser, "First question"});
+    Expect(!IsRamOnlyChatRequest(two_users, 304),
+           "two user messages are not ram_only");
+  }
+  {
+    auto invalid_role = aux;
+    invalid_role.messages.front().role = static_cast<ChatRole>(99);
+    Expect(!IsRamOnlyChatRequest(invalid_role, 304),
+           "invalid enum role is rejected by ram_only classifier");
+  }
+  {
+    ChatRequest empty_req;
+    empty_req.response_format = schema;
+    Expect(!IsRamOnlyChatRequest(empty_req, 10),
+           "empty messages are not ram_only");
+  }
+}
+
+void TestRamOnlyUsesFinalPreparedLength() {
+  using gufo::server::ConstrainChatRequest;
+  using gufo::server::IsRamOnlyChatRequest;
+  using gufo::tokenization::ChatRole;
+
+  class FramingCountingRunner final : public FakeRunner {
+  public:
+    FramingCountingRunner()
+        : FakeRunner(std::make_shared<FakeStats>(), 64, 256, 256) {}
+    [[nodiscard]] TextRunnerDescriptor Descriptor() const override {
+      auto d = FakeRunner::Descriptor();
+      d.max_context = 4096;
+      return d;
+    }
+    [[nodiscard]] std::shared_ptr<const gufo::sampling::ConstraintVocabulary>
+    BuildConstraintVocabulary() const override {
+      return std::make_shared<gufo::sampling::ConstraintVocabulary>(
+          256, [](std::uint32_t id) {
+            return gufo::sampling::ConstraintVocabulary::Piece{
+                std::string(1, static_cast<char>(id)), false};
+          });
+    }
+    [[nodiscard]] std::optional<std::vector<TextRunnerToken>> RenderAndTokenize(
+        const ChatRequest& request) const override {
+      std::vector<TextRunnerToken> tokens;
+      for (const auto& message : request.messages) {
+        for (const char ch : message.content)
+          tokens.push_back(static_cast<unsigned char>(ch));
+        for (const char ch : message.framing_suffix)
+          tokens.push_back(static_cast<unsigned char>(ch));
+      }
+      return tokens;
+    }
+  };
+
+  const FramingCountingRunner runner;
+  const auto schema = gufo::sampling::JsonConstraint::Compile(
+      gufo::json::parse(
+          R"({"type":"object","properties":{"title":{"type":"string"}},"required":["title"],"additionalProperties":false})"),
+      false);
+
+  ChatRequest base({{ChatRole::kSystem, "sys"}, {ChatRole::kUser, "short"}});
+  base.response_format = schema;
+  base.response_format_description = "d";
+
+  // Measure framing overhead added by ConstrainChatRequest with a non-empty
+  // description so the "\n\n" separator is already accounted for.
+  gufo::sampling::SamplingConfig sampling;
+  const auto probe = ConstrainChatRequest(base, runner, &sampling);
+  Expect(probe.has_value(), "response_format produces constrained request");
+  const auto probe_prepared = runner.PreparePrompt(*probe);
+  Expect(probe_prepared.has_value() && probe_prepared->tokens.size() < 1024,
+         "base constrained prompt fits well below 1024 tokens");
+
+  // Size response_format_description so the final prepared prompt lands at
+  // exactly 1024 vs 1025 tokens, while original messages stay 8 chars long.
+  const std::size_t extra_padding = 1024 - probe_prepared->tokens.size();
+  for (const std::size_t delta : {std::size_t{0}, std::size_t{1}}) {
+    auto req = base;
+    req.response_format_description =
+        std::string(1 + extra_padding + delta, 'd');
+    gufo::sampling::SamplingConfig req_sampling;
+    const auto constrained = ConstrainChatRequest(req, runner, &req_sampling);
+    Expect(constrained.has_value(), "constrained request constructed");
+    const auto prepared = runner.PreparePrompt(*constrained);
+    Expect(prepared.has_value() && prepared->tokens.size() == 1024 + delta,
+           "prepared prompt matches exact boundary length");
+    Expect(
+        IsRamOnlyChatRequest(req, prepared->tokens.size()) == (delta == 0),
+        "ram_only uses final prepared length including framing instructions");
+  }
+}
+
+void TestRamOnlyNeverUsesDiskStore() {
+  TemporaryDirectory directory;
+  const TextRunnerDiskCacheOptions disk_cache{
+      .directory = directory.path(),
+      .capacity_bytes = 8192,
+      .staging_capacity_bytes = 4096,
+      .shared_prefix_min_tokens = 2,
+      .shared_prefix_max_boundaries = 4,
+      .min_checkpoint_step_tokens = 0,
+  };
+
+  const std::vector<TextRunnerToken> aux_prompt{11, 22, 33, 44};
+  const std::vector<TextRunnerToken> corrupt_prompt{55, 66, 77, 88};
+
+  // Seed two valid ordinary disk snapshots, then corrupt one payload byte
+  // (keeping its header intact so ContinuationDiskStore indexes it on startup
+  // and only detects the checksum mismatch when a request attempts restore).
+  std::filesystem::path valid_file;
+  std::filesystem::path corrupt_file;
+  std::uintmax_t valid_size = 0;
+  std::filesystem::file_time_type valid_mtime{};
+  std::uintmax_t corrupt_size = 0;
+  std::filesystem::file_time_type corrupt_mtime{};
+  {
+    auto seed_stats = std::make_shared<FakeStats>();
+    auto seed_runner = std::make_shared<PersistentSnapshotRunner>(
+        seed_stats, "artifact-A", /*retained_snapshot_capacity_bytes=*/0);
+    TextRunnerPool seed_pool(seed_runner, 1, disk_cache);
+    auto req = seed_pool.Acquire(aux_prompt);
+    Expect(req.Prefill(8).decode_ready, "seed ordinary prefill succeeds");
+    const auto commit = req.Commit();
+    Expect(commit.disk_queued_bytes > 0, "seed ordinary persists to disk");
+  }
+  for (const auto& entry :
+       std::filesystem::directory_iterator(directory.path())) {
+    if (entry.is_regular_file() && entry.path().extension() == ".kvc") {
+      valid_file = entry.path();
+      break;
+    }
+  }
+  Expect(!valid_file.empty(), "ordinary request wrote a .kvc file");
+  {
+    auto seed_stats = std::make_shared<FakeStats>();
+    auto seed_runner = std::make_shared<PersistentSnapshotRunner>(
+        seed_stats, "artifact-A", /*retained_snapshot_capacity_bytes=*/0);
+    TextRunnerPool seed_pool(seed_runner, 1, disk_cache);
+    auto req = seed_pool.Acquire(corrupt_prompt);
+    Expect(req.Prefill(8).decode_ready,
+           "second seed ordinary prefill succeeds");
+    Expect(req.Commit().disk_queued_bytes > 0,
+           "second seed ordinary persists to disk");
+  }
+  for (const auto& entry :
+       std::filesystem::directory_iterator(directory.path())) {
+    if (entry.is_regular_file() && entry.path().extension() == ".kvc" &&
+        entry.path() != valid_file) {
+      corrupt_file = entry.path();
+      break;
+    }
+  }
+  Expect(!corrupt_file.empty(), "second ordinary request wrote a .kvc file");
+  {
+    std::fstream io(corrupt_file,
+                    std::ios::in | std::ios::out | std::ios::binary);
+    Expect(io.good(), "corrupt fixture opens for payload flip");
+    io.seekg(-1, std::ios::end);
+    char last = 0;
+    io.get(last);
+    io.seekp(-1, std::ios::end);
+    const char flipped = static_cast<char>(last ^ 0xFF);
+    io.write(&flipped, 1);
+    Expect(io.good(), "corrupt fixture flipped trailing payload byte");
+  }
+  // Set timestamps in the past so any touch or rewrite is observable.
+  const auto past =
+      std::filesystem::file_time_type::clock::now() - std::chrono::seconds(30);
+  std::filesystem::last_write_time(valid_file, past);
+  std::filesystem::last_write_time(corrupt_file, past);
+  valid_size = std::filesystem::file_size(valid_file);
+  valid_mtime = std::filesystem::last_write_time(valid_file);
+  corrupt_size = std::filesystem::file_size(corrupt_file);
+  corrupt_mtime = std::filesystem::last_write_time(corrupt_file);
+
+  const auto count_kvc_files = [&] {
+    std::size_t count = 0;
+    for (const auto& entry :
+         std::filesystem::directory_iterator(directory.path())) {
+      if (entry.is_regular_file() && entry.path().extension() == ".kvc")
+        ++count;
+    }
+    return count;
+  };
+  const std::size_t initial_files = count_kvc_files();
+  Expect(initial_files == 2, "two seeded disk files exist before aux checks");
+
+  // Case A: RAM-refused pool (budget = 0) + ram_only=true across prefill,
+  // Cancel, and corrupt-target lookup.
+  {
+    auto stats = std::make_shared<FakeStats>();
+    auto runner = std::make_shared<PersistentSnapshotRunner>(
+        stats, "artifact-A", /*retained_snapshot_capacity_bytes=*/0);
+    TextRunnerPool pool(runner, 1, disk_cache);
+
+    auto aux = pool.Acquire(aux_prompt, {}, {}, {}, true, 0, true,
+                            /*ram_only=*/true);
+    Expect(!aux.cache_hit() && !aux.cache_disk_hit() &&
+               stats->snapshot_restores == 0,
+           "ram_only never restores from disk store");
+    Expect(aux.Prefill(8).decode_ready, "aux prefills completely");
+    (void)aux.SelectNext();
+    aux.Advance();
+    const auto commit = aux.Commit();
+    Expect(commit.disk_queued_bytes == 0 &&
+               commit.shared_prefix_snapshots == 0 &&
+               commit.shared_prefix_bytes == 0 && commit.snapshot_bytes == 0,
+           "ram_only queues zero disk bytes even when RAM budget is zero");
+
+    auto aux_corrupt = pool.Acquire(corrupt_prompt, {}, {}, {}, true, 0, true,
+                                    /*ram_only=*/true);
+    Expect(!aux_corrupt.cache_hit() && !aux_corrupt.cache_disk_hit() &&
+               stats->snapshot_restores == 0,
+           "ram_only ignores corrupt disk snapshot");
+    aux_corrupt.Invalidate();
+
+    auto aux_cancel = pool.Acquire({11, 22, 99, 100}, {}, {}, {}, true, 0, true,
+                                   /*ram_only=*/true);
+    (void)aux_cancel.Prefill(2);
+    const auto cancelled_commit = aux_cancel.Cancel();
+    Expect(cancelled_commit.disk_queued_bytes == 0 &&
+               cancelled_commit.shared_prefix_snapshots == 0,
+           "cancelled ram_only writes zero disk bytes");
+  }
+
+  // Case B: C4 pool (capacity = 2) with RAM budget enough for 2 snapshots:
+  // test live-checkpoint, repeated RAM aux hit, and ordinary persistence.
+  {
+    auto stats = std::make_shared<FakeStats>();
+    auto runner = std::make_shared<PersistentSnapshotRunner>(
+        stats, "artifact-A", 2 * sizeof(FakeSnapshot));
+    TextRunnerPool pool(runner, 2, disk_cache);
+
+    auto aux1 = pool.Acquire({70, 71, 72, 73}, {}, {}, {}, true, 0, true,
+                             /*ram_only=*/true);
+    Expect(aux1.Prefill(8).decode_ready, "first C4 aux prefills");
+    // Advance 1 token (90) so live_tokens ({70,71,72,73,90}) extends beyond
+    // the prompt snapshot ({70,71,72,73}); aux2 then exercises live_checkpoint!
+    Expect(aux1.SelectNext().token == 90, "aux1 selects first decode token");
+    aux1.Advance();
+    const auto c1 = aux1.Commit();
+    Expect(
+        c1.disk_queued_bytes == 0 && c1.snapshot_bytes == sizeof(FakeSnapshot),
+        "ram_only retains in RAM without touching disk");
+
+    // Second C4 aux hitting the live frontier triggers C4 live-checkpoint
+    // inside Acquire; must NOT call disk_store->SaveAsync.
+    auto aux2 = pool.Acquire({70, 71, 72, 73, 90, 74}, {}, {}, {}, true, 0,
+                             true, /*ram_only=*/true);
+    Expect(aux2.cache_hit() && !aux2.cache_disk_hit() &&
+               aux2.cached_prompt_tokens() == 5,
+           "ram_only repeats from RAM live frontier when capacity permits");
+    Expect(aux2.Prefill(8).decode_ready, "second C4 aux prefills suffix");
+    const auto c2 = aux2.Commit();
+    Expect(c2.disk_queued_bytes == 0,
+           "C4 live-checkpoint and commit for ram_only write zero disk bytes");
+
+    // Ordinary request on the same pool still persists to disk and restores.
+    const std::vector<TextRunnerToken> ord_tokens{101, 102, 103, 104};
+    auto ord = pool.Acquire(ord_tokens);
+    Expect(ord.Prefill(8).decode_ready, "ordinary request prefills");
+    const auto c_ord = ord.Commit();
+    Expect(c_ord.disk_queued_bytes > 0,
+           "ordinary request in same pool still persists to disk");
+  }
+
+  Expect(count_kvc_files() == initial_files + 1,
+         "only the ordinary request added a new disk snapshot file");
+  Expect(
+      std::filesystem::exists(valid_file) &&
+          std::filesystem::file_size(valid_file) == valid_size &&
+          std::filesystem::last_write_time(valid_file) == valid_mtime,
+      "existing valid disk snapshot was neither touched nor modified by aux");
+  Expect(std::filesystem::exists(corrupt_file) &&
+             std::filesystem::file_size(corrupt_file) == corrupt_size &&
+             std::filesystem::last_write_time(corrupt_file) == corrupt_mtime,
+         "corrupt disk snapshot was neither opened nor deleted by aux");
+
+  // New pool restores the ordinary request from disk and proves an ordinary
+  // request (unlike ram_only) does inspect and remove corrupt_file.
+  {
+    auto stats = std::make_shared<FakeStats>();
+    auto runner = std::make_shared<PersistentSnapshotRunner>(
+        stats, "artifact-A", /*retained_snapshot_capacity_bytes=*/0);
+    TextRunnerPool pool(runner, 1, disk_cache);
+    auto restored = pool.Acquire({101, 102, 103, 104, 105});
+    Expect(restored.cache_hit() && restored.cache_disk_hit() &&
+               restored.cached_prompt_tokens() == 4,
+           "ordinary request still restores from disk in a fresh pool");
+    restored.Invalidate();
+
+    auto check_corrupt = pool.Acquire(corrupt_prompt);
+    Expect(!check_corrupt.cache_hit() && !check_corrupt.cache_disk_hit() &&
+               !std::filesystem::exists(corrupt_file),
+           "ordinary request still detects and removes corrupt disk snapshot");
+    check_corrupt.Invalidate();
+  }
+}
+
 }  // namespace
 
 int main() {
+  TestRamOnlyChatClassification();
+  TestRamOnlyUsesFinalPreparedLength();
+  TestRamOnlyNeverUsesDiskStore();
   TestPromptCountingValidatesCapabilitiesBeforeInference();
   TestServerInstructionsAreFraming();
   TestPreparedConstraintVocabularyKeepsGrammarBehavior();

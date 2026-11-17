@@ -3139,10 +3139,37 @@ void TestEmptyTokenIsPublished() {
          "an empty streamed piece still charges the output budget");
 }
 
+void TestSchedulerPassesRamOnlyPolicy() {
+  auto control = std::make_shared<FakeControl>();
+  control->snapshot_callback = [] {};
+  auto runner = std::make_shared<FakeRunner>(control);
+  auto pool = std::make_shared<TextRunnerPool>(
+      runner, 1, std::nullopt,
+      gufo::server::TextRunnerRamCacheOptions{
+          .capacity_bytes = sizeof(FakeRunner::SnapshotState)});
+  TextGenerationScheduler scheduler(pool);
+
+  const auto ord1 = scheduler.Submit({1, 2, 3}, 1, 0.0F).Wait();
+  Expect(ord1.cache_snapshot_bytes == sizeof(FakeRunner::SnapshotState),
+         "ordinary request fills the 1-snapshot RAM budget");
+
+  TextRequestMetadata aux_meta;
+  aux_meta.ram_only = true;
+  const auto aux =
+      scheduler.Submit({9, 8, 7}, 1, 0.0F, {}, false, aux_meta).Wait();
+  Expect(aux.cache_snapshot_bytes == 0,
+         "scheduler forwards ram_only so aux cannot evict ordinary snapshot");
+
+  const auto ord2 = scheduler.Submit({1, 2, 3, 4}, 1, 0.0F).Wait();
+  Expect(ord2.cache_hit && ord2.cached_prompt_tokens == 3,
+         "ordinary conversation remains cached after scheduler ram_only turn");
+}
+
 int main() {
   // Log assertions in this binary match the plain "[LEVEL] [component]" text
   // captured from a redirected sink; a TTY stderr would tint the level tag.
   ::setenv("NO_COLOR", "1", 1);
+  TestSchedulerPassesRamOnlyPolicy();
   TestProgressLoggingIsOptInAndBounded();
   TestStructuredOutputIsPreparedBeforeServing();
   TestAdmissionLoggingIsDebugTierOnly();

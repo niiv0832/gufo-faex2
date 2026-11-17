@@ -89,6 +89,33 @@ std::optional<ChatRequest> ConstrainChatRequest(
   return constrained;
 }
 
+bool IsRamOnlyChatRequest(const ChatRequest& original,
+                          std::size_t prepared_prompt_tokens) noexcept {
+  if (original.response_format == nullptr || !original.tools.empty() ||
+      original.messages.empty() || prepared_prompt_tokens == 0 ||
+      prepared_prompt_tokens > kRamOnlyMaxPromptTokens) {
+    return false;
+  }
+  for (std::size_t index = 0; index < original.messages.size(); ++index) {
+    const auto& message = original.messages[index];
+    if (!message.images.empty() || !message.tool_calls.empty() ||
+        !message.tool_call_id.empty()) {
+      return false;
+    }
+    const bool is_last = (index + 1 == original.messages.size());
+    if (is_last) {
+      if (message.role != tokenization::ChatRole::kUser)
+        return false;
+    } else {
+      if (message.role != tokenization::ChatRole::kSystem &&
+          message.role != tokenization::ChatRole::kDeveloper) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
 std::optional<std::uint64_t> MeminfoAvailableBytes(std::string_view meminfo) {
   std::optional<std::uint64_t> available_kib;
   std::uint64_t cma_free_kib = 0;
@@ -2011,7 +2038,7 @@ TextRunnerPool::Request TextRunnerPool::Acquire(
     const sampling::SamplingConfig& sampling_config,
     const CancellationCheck& is_cancelled,
     std::shared_ptr<const TextPromptContext> context, bool reuse_prompt,
-    std::size_t cache_prefix_tokens, bool stop_at_eos) {
+    std::size_t cache_prefix_tokens, bool stop_at_eos, bool ram_only) {
   sampling_config.Validate();
   if (prompt.empty()) {
     throw std::invalid_argument("text runner prompt must not be empty");
@@ -2028,6 +2055,7 @@ TextRunnerPool::Request TextRunnerPool::Acquire(
       return {};
   }
 
+  const auto disk_store = ram_only ? nullptr : impl_->disk_store;
   const std::span<const std::uint8_t> identity =
       context ? std::span<const std::uint8_t>(context->cache_identity)
               : std::span<const std::uint8_t>{};
@@ -2045,7 +2073,7 @@ TextRunnerPool::Request TextRunnerPool::Acquire(
         text_state.SetStopAtEos(stop_at_eos);
         impl_->validated.runner->SetPromptContext(text_state, context);
       },
-      reuse_prompt, cache_prefix_tokens, input_prefixes);
+      reuse_prompt, cache_prefix_tokens, input_prefixes, ram_only);
   if (!lease) {
     return {};
   }
@@ -2083,11 +2111,11 @@ TextRunnerPool::Request TextRunnerPool::Acquire(
                            prefix.size());
       }
       if (snapshot) {
-        if (impl_->disk_store) {
+        if (disk_store) {
           try {
             const auto prefix_identity =
                 PrefixInputIdentity(identity, input_prefixes, prefix.size());
-            (void)impl_->disk_store->SaveAsync(
+            (void)disk_store->SaveAsync(
                 impl_->validated.runner, {prefix.begin(), prefix.end()},
                 snapshot, {prefix_identity.begin(), prefix_identity.end()});
           } catch (...) {
@@ -2104,11 +2132,11 @@ TextRunnerPool::Request TextRunnerPool::Acquire(
       }
     }
   }
-  if (reuse_prompt && !lease.cache_hit() && impl_->disk_store != nullptr &&
+  if (reuse_prompt && !lease.cache_hit() && disk_store != nullptr &&
       !(is_cancelled && is_cancelled())) {
     const auto restore_start = std::chrono::steady_clock::now();
     try {
-      const auto restored = impl_->disk_store->RestoreLongestPrefix(
+      const auto restored = disk_store->RestoreLongestPrefix(
           *impl_->validated.runner,
           dynamic_cast<TextRunnerState&>(lease.state()), prompt, identity,
           cache_prefix_tokens, input_prefixes);
@@ -2134,10 +2162,10 @@ TextRunnerPool::Request TextRunnerPool::Acquire(
     }
   }
   std::vector<std::size_t> boundaries;
-  if (reuse_prompt && impl_->disk_store != nullptr &&
+  if (reuse_prompt && disk_store != nullptr &&
       !(is_cancelled && is_cancelled())) {
     try {
-      boundaries = impl_->disk_store->SharedPrefixBoundaries(
+      boundaries = disk_store->SharedPrefixBoundaries(
           *impl_->validated.runner, prompt, impl_->shared_prefix_min_tokens,
           impl_->shared_prefix_max_boundaries, identity, input_prefixes);
     } catch (...) {
@@ -2148,9 +2176,9 @@ TextRunnerPool::Request TextRunnerPool::Acquire(
     });
   }
   Request request(std::make_unique<Request::Impl>(
-      impl_->validated.runner, impl_->disk_store, std::move(lease),
-      std::move(prompt), std::move(boundaries), sampling_config,
-      std::move(context), cache_prefix_tokens, impl_->cache.capacity() > 1));
+      impl_->validated.runner, disk_store, std::move(lease), std::move(prompt),
+      std::move(boundaries), sampling_config, std::move(context),
+      cache_prefix_tokens, impl_->cache.capacity() > 1));
   // Prompts that diverge from a retained one after a long common prefix,
   // such as new conversations under one system prompt, publish a checkpoint
   // at the divergence point. Later prompts sharing it restore it exactly

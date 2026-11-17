@@ -4680,7 +4680,8 @@ struct InferenceBackend::Impl {
       std::shared_ptr<const TextPromptContext> context = {},
       bool cache_prompt = true, std::size_t cache_prefix_tokens = 0,
       const std::vector<std::string>& stop_sequences = {},
-      InitialOutputState initial = InitialOutputState::kContent) const {
+      InitialOutputState initial = InitialOutputState::kContent,
+      bool ram_only = false) const {
     Result result;
     result.prompt_tokens = prompt_tokens.size();
     result.client_id = client_id.empty() ? "anonymous" : client_id;
@@ -4703,6 +4704,7 @@ struct InferenceBackend::Impl {
             .cache_prompt = cache_prompt,
             .cache_prefix_tokens = cache_prefix_tokens,
             .stop_sequences = stop_sequences,
+            .ram_only = ram_only,
         });
     ScheduledGenerationRequest generation(std::move(current),
                                           std::move(request), initial);
@@ -5898,11 +5900,12 @@ InferenceBackend::Result InferenceBackend::chat(
     effective_sampling.reasoning_budget =
         state->scheduler->runner().BuildReasoningBudget(
             *request.reasoning.budget_tokens, prompt->tokens);
+  const bool ram_only = IsRamOnlyChatRequest(request, prompt->tokens.size());
   return impl_->GenerateScheduled(
       state, std::move(prompt->tokens), request_start, max_tokens,
       effective_sampling, is_cancelled, on_token, request.client_id,
       std::move(prompt->context), request.cache_prompt,
-      prompt->cache_prefix_tokens, request.stop_sequences, initial);
+      prompt->cache_prefix_tokens, request.stop_sequences, initial, ram_only);
 #else
   (void)request;
   (void)max_tokens;
@@ -5983,6 +5986,7 @@ InferenceBackend::start_chat(const ChatRequest& request, std::size_t max_tokens,
     effective_sampling.reasoning_budget =
         state->scheduler->runner().BuildReasoningBudget(
             *request.reasoning.budget_tokens, prompt->tokens);
+  const bool ram_only = IsRamOnlyChatRequest(request, prompt->tokens.size());
   const std::string client_id =
       request.client_id.empty() ? "anonymous" : request.client_id;
   auto scheduled_request = state->scheduler->Submit(
@@ -5997,6 +6001,7 @@ InferenceBackend::start_chat(const ChatRequest& request, std::size_t max_tokens,
           .cache_prefix_tokens = prompt->cache_prefix_tokens,
           .stop_sequences = request.stop_sequences,
           .return_progress = request.return_progress,
+          .ram_only = ram_only,
       });
   return std::make_shared<Impl::ScheduledGenerationRequest>(
       state, std::move(scheduled_request), initial, tool_format);

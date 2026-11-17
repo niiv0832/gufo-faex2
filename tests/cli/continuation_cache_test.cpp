@@ -1455,7 +1455,247 @@ void TestMissReasonNamesEvictionAndStableBoundary() {
   }
 }
 
+void TestRamOnlyKeepsLongConversation() {
+  using Tokens = std::vector<gufo::server::ContinuationToken>;
+  std::vector<std::size_t> invalidations(4);
+  std::size_t next_id = 0;
+  const auto make_cache = [&](std::size_t capacity, std::size_t bytes,
+                              std::size_t records) {
+    next_id = 0;
+    return std::make_unique<gufo::server::ContinuationCache>(
+        capacity,
+        [&] { return std::make_unique<FakeState>(next_id++, &invalidations); },
+        gufo::server::ContinuationCache::SnapshotSupport{
+            .restore =
+                [](gufo::server::ContinuationState& state,
+                   const gufo::server::ContinuationSnapshot& snapshot) {
+                  dynamic_cast<FakeState&>(state).value =
+                      dynamic_cast<const FakeSnapshot&>(snapshot).value;
+                },
+            .capacity_bytes = [bytes] { return bytes; },
+            .on_event = {},
+        },
+        records);
+  };
+
+  // Record pressure + byte pressure: a 55K-token conversation is never evicted
+  // by repeated aux (ram_only) requests, while aux repeats from RAM when room
+  // remains and yields first when ordinary requests need capacity.
+  {
+    auto cache = make_cache(/*capacity=*/2, /*bytes=*/256, /*records=*/2);
+    Tokens long_prompt(55000, 1);
+    long_prompt[0] = 42;
+    {
+      auto ordinary = cache->Acquire(long_prompt);
+      Expect(ordinary.TryReserveSnapshot(128, long_prompt.size()) &&
+                 ordinary.Commit(long_prompt, std::make_unique<FakeSnapshot>(
+                                                  100, 128)) == 128,
+             "55K ordinary conversation snapshot is retained");
+    }
+    Tokens aux1{7, 1, 2};
+    {
+      auto aux =
+          cache->Acquire(aux1, {}, {}, {}, true, 0, {}, /*ram_only=*/true);
+      Expect(aux.TryReserveSnapshot(64, aux1.size()) &&
+                 aux.Commit(aux1, std::make_unique<FakeSnapshot>(1, 64)) == 64,
+             "aux request fits in remaining RAM record and byte budget");
+    }
+    {
+      auto aux_hit =
+          cache->Acquire(aux1, {}, {}, {}, true, 0, {}, /*ram_only=*/true);
+      Expect(aux_hit.cache_hit() && aux_hit.cached_tokens() == aux1.size(),
+             "aux request repeats from RAM while budget remains");
+      aux_hit.Invalidate();
+    }
+    // A second aux requiring 128 bytes cannot fit alongside the 55K snapshot;
+    // it may evict aux1 (64 bytes) or be skipped, never evicting the 55K entry.
+    for (std::uint32_t tag = 10; tag < 14; ++tag) {
+      Tokens aux_next{tag, 1, 2};
+      auto aux = cache->Acquire(aux_next, {}, {}, {}, true, 0, {},
+                                /*ram_only=*/true);
+      if (aux.TryReserveSnapshot(128, aux_next.size())) {
+        (void)aux.Commit(aux_next, std::make_unique<FakeSnapshot>(tag, 128));
+      } else {
+        aux.Invalidate();
+      }
+      Expect(cache->CachedPrefixTokens(long_prompt) == long_prompt.size(),
+             "aux byte pressure never evicts the 55K ordinary snapshot");
+    }
+    // Record pressure with zero free slots: all 2 records filled by ordinary
+    // snapshots; aux must neither reserve nor evict either ordinary record.
+    Tokens second_ordinary{9, 9, 9};
+    {
+      auto ord2 = cache->Acquire(second_ordinary);
+      Expect(ord2.TryReserveSnapshot(128, second_ordinary.size()) &&
+                 ord2.Commit(second_ordinary,
+                             std::make_unique<FakeSnapshot>(200, 128)) == 128,
+             "ordinary request evicts aux first under byte/record pressure");
+    }
+    Expect(cache->CachedPrefixTokens(long_prompt) == long_prompt.size(),
+           "ordinary eviction spared the older 55K ordinary conversation");
+    {
+      Tokens aux_blocked{8, 8, 8};
+      auto aux = cache->Acquire(aux_blocked, {}, {}, {}, true, 0, {},
+                                /*ram_only=*/true);
+      Expect(!aux.TryReserveSnapshot(64, aux_blocked.size()),
+             "aux cannot displace any ordinary snapshot under record pressure");
+      aux.Invalidate();
+    }
+    Expect(cache->CachedPrefixTokens(long_prompt) == long_prompt.size() &&
+               cache->CachedPrefixTokens(second_ordinary) ==
+                   second_ordinary.size(),
+           "both ordinary snapshots survive blocked aux admission");
+
+    // Continuation, history, retry, and branch-point ordinary protection
+    // against aux.
+    auto continuation_hit = cache->Acquire(long_prompt);
+    Expect(continuation_hit.cache_hit() &&
+               continuation_hit.cached_tokens() == long_prompt.size(),
+           "long conversation resumes warm from RAM after aux series");
+    continuation_hit.Invalidate();
+  }
+
+  // Ordinary request promotes a matching ram_only record, and C4 execution
+  // state selection prefers empty or ram_only slots over an ordinary frontier.
+  {
+    auto cache = make_cache(/*capacity=*/2, /*bytes=*/512, /*records=*/2);
+    Tokens conv{10, 20, 30};
+    {
+      auto ord = cache->Acquire(conv);
+      Expect(ord.TryReserveSnapshot(128, conv.size()) &&
+                 ord.Commit(conv, std::make_unique<FakeSnapshot>(1, 128),
+                            conv) == 128,
+             "ordinary request sets live frontier on slot 0");
+    }
+    // Slot 1 is empty; aux must acquire slot 1 so slot 0 keeps its live
+    // frontier (`restore_bytes == 0` for the next turn of `conv`).
+    Tokens aux_tokens{99, 1};
+    {
+      auto aux = cache->Acquire(aux_tokens, {}, {}, {}, true, 0, {},
+                                /*ram_only=*/true);
+      Expect(aux.TryReserveSnapshot(64, aux_tokens.size()) &&
+                 aux.Commit(aux_tokens, std::make_unique<FakeSnapshot>(2, 64),
+                            aux_tokens) == 64,
+             "aux runs on empty slot 1");
+    }
+    {
+      auto conv_next = cache->Acquire(Tokens{10, 20, 30, 40});
+      Expect(conv_next.cache_hit() && conv_next.cached_tokens() == 3 &&
+                 conv_next.restored_snapshot_bytes() == 0,
+             "aux left ordinary live frontier intact on slot 0");
+      conv_next.Invalidate();
+    }
+    // Ordinary request on `aux_tokens` promotes the snapshot so a later aux
+    // cannot evict it.
+    {
+      auto promote = cache->Acquire(aux_tokens);
+      Expect(promote.cache_hit(), "ordinary request hits aux snapshot");
+      Expect(promote.TryReserveSnapshot(256, aux_tokens.size()) &&
+                 promote.Commit(aux_tokens,
+                                std::make_unique<FakeSnapshot>(3, 256)) == 256,
+             "ordinary request promotes aux prefix");
+    }
+    {
+      Tokens aux_new{77, 77};
+      auto aux =
+          cache->Acquire(aux_new, {}, {}, {}, true, 0, {}, /*ram_only=*/true);
+      Expect(!aux.TryReserveSnapshot(256, aux_new.size()),
+             "aux cannot evict the promoted ordinary snapshot");
+      aux.Invalidate();
+    }
+    Expect(cache->CachedPrefixTokens(aux_tokens) == aux_tokens.size(),
+           "promoted snapshot remains protected from aux");
+  }
+}
+
+void TestRamOnlyAdmissionDoesNotDowngradeOrdinary() {
+  using Tokens = std::vector<gufo::server::ContinuationToken>;
+  std::vector<std::size_t> invalidations(4);
+  std::size_t next_id = 0;
+  auto cache = std::make_unique<gufo::server::ContinuationCache>(
+      2, [&] { return std::make_unique<FakeState>(next_id++, &invalidations); },
+      gufo::server::ContinuationCache::SnapshotSupport{
+          .restore =
+              [](gufo::server::ContinuationState& state,
+                 const gufo::server::ContinuationSnapshot& snapshot) {
+                dynamic_cast<FakeState&>(state).value =
+                    dynamic_cast<const FakeSnapshot&>(snapshot).value;
+              },
+          .capacity_bytes = [] { return 256; },
+          .on_event = {},
+      },
+      /*snapshot_capacity=*/2);
+
+  // Two leases concurrently reserve/publish the same exact tokens: ordinary
+  // commits first, then aux commits; aux must not downgrade ordinary to
+  // ram_only or duplicate it.
+  Tokens shared{1, 2, 3, 4};
+  {
+    auto ord_lease = cache->Acquire(shared);
+    auto aux_lease =
+        cache->Acquire(shared, {}, {}, {}, true, 0, {}, /*ram_only=*/true);
+    Expect(ord_lease.TryReserveSnapshot(128, shared.size()),
+           "ordinary reserves shared prefix");
+    Expect(aux_lease.TryReserveSnapshot(128, shared.size()),
+           "aux reserves concurrently before ordinary commits");
+    Expect(ord_lease.Commit(shared, std::make_unique<FakeSnapshot>(10, 128)) ==
+               128,
+           "ordinary commits first");
+    Expect(
+        aux_lease.Commit(shared, std::make_unique<FakeSnapshot>(20, 128)) == 0,
+        "aux commit skips instead of downgrading or duplicating ordinary");
+    Expect(cache->reserved_snapshot_bytes() == 0 &&
+               cache->retained_snapshot_bytes() == 128,
+           "snapshot accounting stays exact after skipped concurrent aux");
+  }
+  // Verify the retained `shared` snapshot is still ordinary (cannot be evicted
+  // by another aux, and even with reuse_prompt=false exact replacement is
+  // blocked for aux).
+  {
+    auto aux_noreuse =
+        cache->Acquire(shared, {}, {}, {}, /*reuse_prompt=*/false, 0, {},
+                       /*ram_only=*/true);
+    Expect(!aux_noreuse.TryReserveSnapshot(
+               256, shared.size(), false, gufo::server::SnapshotPurpose::kRetry,
+               shared),
+           "aux cannot exact-replace an ordinary snapshot");
+    aux_noreuse.Invalidate();
+  }
+  Expect(cache->CachedPrefixTokens(shared) == shared.size(),
+         "ordinary snapshot survived concurrent aux commit and replacement");
+
+  // Branch-point / redundancy guard: a ram_only extension must not make an
+  // ordinary continuation/branch-point look redundant under ordinary pressure.
+  {
+    Tokens base{1, 2, 3, 4};
+    Tokens aux_ext{1, 2, 3, 4, 5, 6};
+    auto branch_source = cache->Acquire(Tokens{1, 2, 3, 4, 9});
+    branch_source
+        .Invalidate();  // RestoreDiverges already marked base kBranchPoint
+    auto aux_child =
+        cache->Acquire(aux_ext, {}, {}, {}, true, 0, {}, /*ram_only=*/true);
+    Expect(aux_child.TryReserveSnapshot(64, aux_ext.size()) &&
+               aux_child.Commit(aux_ext,
+                                std::make_unique<FakeSnapshot>(30, 64)) == 64,
+           "aux child extension fits in remaining space");
+    // Now ordinary request needs 192 bytes: total is 256, so it must evict
+    // aux_ext (64 bytes), leaving base (128 bytes) intact -> 128 + 192 > 256?
+    // Try 128 bytes: 128 (base) + 128 = 256, evicts aux_ext, keeps base!
+    Tokens other{8, 8, 8};
+    auto ord_other = cache->Acquire(other);
+    Expect(ord_other.TryReserveSnapshot(128, other.size()) &&
+               ord_other.Commit(other,
+                                std::make_unique<FakeSnapshot>(40, 128)) == 128,
+           "ordinary request evicts aux extension rather than ordinary base");
+    Expect(cache->CachedPrefixTokens(base) == base.size() &&
+               cache->CachedPrefixTokens(aux_ext) == base.size(),
+           "ordinary base stays retained while aux extension was evicted");
+  }
+}
+
 int main() {
+  TestRamOnlyKeepsLongConversation();
+  TestRamOnlyAdmissionDoesNotDowngradeOrdinary();
   TestMissReasonNamesEvictionAndStableBoundary();
   TestAppendedImagesReuseOnlyCompatiblePrefixes();
   TestImageIdentityIsolation();

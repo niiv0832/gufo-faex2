@@ -81,6 +81,7 @@ public:
     bool stop_at_eos{true};
     std::vector<std::string> stop_sequences;
     bool return_progress{false};
+    bool ram_only{false};
   };
 
   class Request {

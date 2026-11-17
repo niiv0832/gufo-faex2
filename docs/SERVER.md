@@ -69,6 +69,16 @@ remembered conversations. Checkpoints have separate entry and memory limits;
 see [KV cache](KV-CACHE.md#limits). The scheduler batches ready
 requests when the model runner supports their execution mode.
 
+Short one-shot structured chat requests (`response_format` set, no `tools`,
+no `assistant`/`tool` history or images, optional `system`/`developer`
+instructions followed by a single `user` message, and final prepared prompt length
+at most 1024 tokens) use an automatic RAM-only cache policy. They never read or
+write `--cache-disk` snapshots and cannot evict or downgrade ordinary retained
+RAM checkpoints; if RAM is full of ordinary checkpoints, their snapshot is
+skipped so longer conversations stay warm. Busy execution slots (`--sessions`)
+are never preempted, so under tight session counts an incoming request can
+still reuse an idle execution slot after its RAM checkpoint is saved.
+
 Text serving defaults match llama.cpp for context and generation length:
 
 | Setting | Default |

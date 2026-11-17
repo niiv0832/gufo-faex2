@@ -633,7 +633,7 @@ public:
       const CancellationCheck& is_cancelled = {},
       std::shared_ptr<const TextPromptContext> context = {},
       bool reuse_prompt = true, std::size_t cache_prefix_tokens = 0,
-      bool stop_at_eos = true);
+      bool stop_at_eos = true, bool ram_only = false);
   [[nodiscard]] Request Acquire(std::vector<TextRunnerToken> prompt,
                                 const CancellationCheck& is_cancelled = {});
   /// Longest RAM-retained prefix of prompt that Acquire could reuse, without
@@ -653,6 +653,14 @@ private:
     const ChatRequest& request, const TextModelRunner& runner,
     sampling::SamplingConfig* sampling,
     std::optional<sampling::JsonConstraint::ToolFormat>* tool_format = nullptr);
+
+inline constexpr std::size_t kRamOnlyMaxPromptTokens = 1024;
+
+/// Returns true only for short single-turn structured one-shot requests that
+/// should stay in RAM without using disk persistence or evicting ordinary
+/// conversations.
+[[nodiscard]] bool IsRamOnlyChatRequest(
+    const ChatRequest& original, std::size_t prepared_prompt_tokens) noexcept;
 
 }  // namespace gufo::server
 

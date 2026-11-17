@@ -216,6 +216,7 @@ public:
     std::size_t restored_snapshot_bytes_{0};
     double restore_ms_{0.0};
     bool restored_from_disk_{false};
+    bool ram_only_{false};
     std::size_t reserved_snapshot_bytes_{0};
     SnapshotPurpose snapshot_purpose_{SnapshotPurpose::kContinuation};
     std::size_t prompt_tokens_{0};
@@ -249,7 +250,8 @@ public:
       std::span<const std::uint8_t> input_identity = {},
       const std::function<void(ContinuationState&)>& prepare_state = {},
       bool reuse_prompt = true, std::size_t stable_prefix_tokens = 0,
-      std::span<const ContinuationInputPrefix> input_prefixes = {});
+      std::span<const ContinuationInputPrefix> input_prefixes = {},
+      bool ram_only = false);
 
   /// Longest retained prefix of prompt with a matching input identity,
   /// ignoring stable-prefix fallback rules. Leases nothing.
@@ -284,7 +286,7 @@ private:
       std::size_t source_index, std::size_t snapshot_bytes,
       std::size_t token_count, bool preserve_source, SnapshotPurpose& purpose,
       std::span<const ContinuationToken> replacement_prefix,
-      std::span<const std::uint8_t> input_identity);
+      std::span<const std::uint8_t> input_identity, bool ram_only = false);
   void SkipSnapshot(std::size_t reservation_bytes, SnapshotEventReason reason,
                     std::size_t snapshot_bytes,
                     std::size_t token_count) noexcept;
@@ -297,7 +299,8 @@ private:
       std::vector<std::uint8_t> live_identity, bool release_state = true,
       std::size_t* published_index = nullptr,
       std::size_t stable_prefix_tokens = 0,
-      SnapshotPurpose purpose = SnapshotPurpose::kContinuation);
+      SnapshotPurpose purpose = SnapshotPurpose::kContinuation,
+      bool ram_only = false);
   void Invalidate(std::size_t index, std::size_t reservation_bytes) noexcept;
 
   struct Impl;
