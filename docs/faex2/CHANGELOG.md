@@ -16,7 +16,9 @@
   - `cmake --preset cpu-test && cmake --build --preset pr` — **56/56 tests passed** (включая `http_server_test` 2,35 с, `openai_chat_test`, `serve_cli_test`, `text_model_runner_test`, `text_generation_scheduler_test`, `check_docs_test`);
   - `cmake --preset cpu-sanitizer` (`http_server_test` под ASan + UBSan) — **1/1 Passed** (3,13 с);
   - компиляция `CMakeFiles/gufo.dir/src/cli/serve/inference_backend.cpp.o` с `ENGINE_ENABLE_HIP=ON` (`therock-10.1.0`, `gfx1151`) — **0 ошибок** (и 0 предупреждений в `InferenceBackend::tokenize`).
-- Ещё не выполнено: полная линковка GPU `gufo` и живой HTTP smoke-тест `POST /tokenize` против загруженной модели `Qwen3.6-35B-A3B` (требует согласованного окна остановки рабочего сервера; целесообразно совместить с `T2` `input_tokens`).
+- Проверено живым HTTP smoke-тестом на стенде `faex2` (согласованное окно `14:49:45`–`14:50:20 MSK`, простой рабочего API **35 с**, возврат через `systemctl --user start gufo-faex2.service`, `READY`, `PID 85204`, `/health` OK, `"28+28="` → `"56"`, `journalctl --user` без ошибок):
+  - изолированно собран GPU-бинарник `gufo` (`299/299`, `ENGINE_ENABLE_HIP=ON`, `GUFO_ENABLE_NPU=OFF`, `gfx1151`, `therock-10.1.0`; штатный `004d8fa1`, `~/src/gufo-mk` и `~/src/gufo-faex2` не изменялись);
+  - на порту `127.0.0.1:13345` с загруженной `Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf` проверены: `"28+28="` (`[17, 23, 10, 17, 23, 28]`, 6 ток.), `"<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n"` (`[248045, 846, 198, 5834, 248046, 198, 248045, 74455, 198]`, 9 ток., спецтокены `248045`/`248046`), `"Привет, как дела?"` (7 ток.), `""` (`[]`), явные дефолты (`200`) и 8 негативных кейсов (`400`); совпадение чисел токенов `6`/`9`/`7` с `tokens_evaluated` в `POST /completion` (с `n_predict`) подтверждено дополнительно на `13336` (в первом `smoke.py` использовалось `max_tokens` вместо `n_predict`). Протокол и сырые логи — `LLM_FAEX2/results/2026-11-17-t1-tokenize-smoke/`.
 
 ### Синхронизация `ROADMAP_SPEC_01` (`T16`) и обновление vision-документации `qwen3.6-35b-a3b`
 
