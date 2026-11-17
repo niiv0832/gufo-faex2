@@ -74,21 +74,21 @@ CMake/Ninja; Linux x86-64, TheRock HIP `gfx1151` только для compile/lin
 
 ## Подготовка исполнения и доказательств
 
-- [ ] Загрузить выбранный workflow и `using-git-worktrees`; создать **свой**
+- [x] Загрузить выбранный workflow и `using-git-worktrees`; создать **свой**
   изолированный worktree от текущей `faex2`, не менять чужие worktree.
   Зафиксировать base SHA и исходный чистый status.
-- [ ] Перед первым SSH перечитать текущий эксплуатационный контекст.
+- [x] Перед первым SSH перечитать текущий эксплуатационный контекст.
   Read-only preflight: service active, PID/identity рабочего бинарника,
   disk/RAM, compiler/CMake/Ninja/clang-format, отсутствие конфликтующей сборки.
   Никаких generation-запросов к рабочему серверу.
-- [ ] После короткого уведомления создать на стенде только
+- [x] После короткого уведомления создать на стенде только
   `$HOME/gufo-t2a1-verify-20261117-r1/{src,tmp,out}`; при существующем корне
   остановиться и выбрать новое имя, не удалять/перезаписывать старый прогон.
   Сохранить SHA `/proc/<child>/exe` и status обоих штатных исходных клонов.
-- [ ] Передавать только tracked source + собственные текущие diff, без `.local`,
+- [x] Передавать только tracked source + собственные текущие diff, без `.local`,
   секретов, AGPL-исходников и артефактов. RED/GREEN версии фиксировать
   отдельными patch/hash manifests; не перезаписывать логи неуспешных прогонов.
-- [ ] На стенде `TMPDIR=$RUN/tmp`, `CMAKE_BUILD_PARALLEL_LEVEL=4`,
+- [x] На стенде `TMPDIR=$RUN/tmp`, `CMAKE_BUILD_PARALLEL_LEVEL=4`,
   `nice -n 19`, устойчивый запуск в собственной `tmux`-сессии.
   Вывод каждого шага — отдельный файл в `$RUN/out/`.
   Дождаться автоматического уведомления фоновой работы, не запускать
@@ -112,41 +112,41 @@ CMake/Ninja; Linux x86-64, TheRock HIP `gfx1151` только для compile/lin
   `chat`/`start_chat` вычисляют значение по original request и
   `prompt->tokens.size()` **до** `std::move`.
 
-- [ ] Написать `TestRamOnlyChatClassification`: system+user/schema/304 → true,
+- [x] Написать `TestRamOnlyChatClassification`: system+user/schema/304 → true,
   json_object → true; no format/tools/assistant/tool history/images/
   tool_calls/неверный enum role/два user → false; 1024 → true, 1025 → false.
   Для 64-bit `size_t` проверить значение выше UINT32_MAX без выделения вектора:
   классификация false, нет усечения до короткой длины.
-- [ ] Написать `TestRamOnlyUsesFinalPreparedLength`: fake renderer учитывает
+- [x] Написать `TestRamOnlyUsesFinalPreparedLength`: fake renderer учитывает
   framing_suffix; после реального ConstrainChatRequest и PreparePrompt
   конечные 1024/1025 дают разные policy при одинаково коротком user content.
   Не вычислять размер отдельно по исходным сообщениям.
-- [ ] Написать cache-регрессии `TestRamOnlyKeepsLongConversation` и
+- [x] Написать cache-регрессии `TestRamOnlyKeepsLongConversation` и
   `TestRamOnlyAdmissionDoesNotDowngradeOrdinary`: synthetic 55K tokens,
   малые fake payload, ограничение records и bytes отдельно, серия aux,
   ordinary exact match, retry/history/branch-point, promotion, два lease
   с reserve→публикацией обычной записи→commit aux.
-- [ ] Написать runner-регрессии `TestRamOnlyNeverUsesDiskStore`:
+- [x] Написать runner-регрессии `TestRamOnlyNeverUsesDiskStore`:
   первая/повторная генерация, отказ RAM, boundary/shared/live captures,
   Cancel/throw; queued bytes=0, persistence capture/restore count=0,
   старые bytes/mtime сохранены, aux повторяется из RAM при наличии места.
   Обычный запрос в том же pool по-прежнему persists/restores через новый pool.
-- [ ] RED: собрать и выполнить `continuation_cache_test`,
+- [x] RED: собрать и выполнить `continuation_cache_test`,
   `text_model_runner_test`, `text_generation_scheduler_test` по командам ниже.
   Сначала отсутствие новых интерфейсов допустимо как compile-RED,
   но eviction/disk регрессии дополнительно должны падать на наблюдаемом
   старом поведении с временно отключённой policy, не только на missing symbol.
-- [ ] Реализовать classifier и передачу policy. В `TextRunnerPool::Acquire`
+- [x] Реализовать classifier и передачу policy. В `TextRunnerPool::Acquire`
   вычислить request-local disk store (`nullptr` для aux) **до** всех disk
   путей, включая live capture, restore и shared-boundaries.
-- [ ] Реализовать общий eligibility guard жертвы для Reserve/Commit:
+- [x] Реализовать общий eligibility guard жертвы для Reserve/Commit:
   aux конкурирует только с aux; ordinary не downgrade; aux не делает ordinary
   branch избыточным; exact/edited-tail/source обходы соблюдают guard.
   Обычные запросы сначала вытесняют aux. Не менять общий бюджет памяти.
-- [ ] GREEN: повторить те же tests, затем format-check до C++ коммита.
+- [x] GREEN: повторить те же tests, затем format-check до C++ коммита.
   Проверить возврат всех reservations при cancel/throw и C1/C4 busy leases.
-- [ ] Документировать policy/ограничения; обновить CONTEXT/журнал.
-  Коммит: `feat(cache): защищены длинные снимки от служебных запросов Hermes`.
+- [x] Документировать policy/ограничения; обновить CONTEXT/журнал.
+  Коммит: `feat(cache): защищены длинные снимки от служебных запросов Hermes` (`799cc613`).
 
 ## Задача 2. Гистограммы `/metrics` и совместимость парсеров
 
@@ -163,40 +163,40 @@ CMake/Ninja; Linux x86-64, TheRock HIP `gfx1151` только для compile/lin
   `bool cache_metrics_recorded{false}`; отмечать lookup только после
   успешного Acquire, наблюдать один terminal result, ошибки исключить.
 
-- [ ] Написать scheduler-тест `TestCacheRequestDistributions`: длины
+- [x] Написать scheduler-тест `TestCacheRequestDistributions`: длины
   `512/513/2048/8192/16384/32768/65536/131072`, доли
   `0/.25/.5/.75/.9/.99/1`, cached>prompt; отсутствие деления на ноль.
   Сравнивать process-wide **дельты**, не абсолютные totals между тестами.
-- [ ] Добавить cancel/ошибка Acquire/parked follower/no Wait/repeated Wait
+- [x] Добавить cancel/ошибка Acquire/parked follower/no Wait/repeated Wait
   регрессии: cache observation отсутствует до lookup, однократен после lookup,
   failure не учитывается; прежний token/time accounting не меняется.
-- [ ] Написать HTTP-тест `TestCacheDistributionMetrics`: HELP/TYPE,
+- [x] Написать HTTP-тест `TestCacheDistributionMetrics`: HELP/TYPE,
   cumulative `_bucket`/`_sum`/`_count`, все фиксированные cache labels
   (`miss`, `memory`, `disk`), нули без модели. Gauge строго `>` на
   `16384/32768/65536`, только processing; generated tokens не влияют.
   Один session snapshot для новых gauges и существующего KV-ratio.
-- [ ] В `TestOpenAiInputTokens`/`TestLlamaTokenize` проверить нулевые дельты
+- [x] В `TestOpenAiInputTokens`/`TestLlamaTokenize` проверить нулевые дельты
   **новых** агрегатов и прежних counters после позитивных/негативных count
   запросов; точный JSON count не расширяется.
-- [ ] Добавить Python-тест
+- [x] Добавить Python-тест
   `test_prometheus_additional_cache_series_preserve_legacy_accounting`:
   unknown HELP/TYPE + labelled histogram/cache/gauge series игнорируются,
   legacy parse_metrics результат и нулевые COUNTERS-дельты сохраняются.
   Сохранить негативные проверки missing/duplicate/incorrect TYPE и строгий
   `test_openai_count_tokens_contract` из `metrics.summarize`.
-- [ ] RED: выбранные C++ тесты; Python compatibility-тест может сразу быть
+- [x] RED: выбранные C++ тесты; Python compatibility-тест может сразу быть
   GREEN, так как parser уже допускает новые метрики — это фиксация контракта,
   а не повод искусственно портить parser. RED нужен у новой instrumentation.
-- [ ] Реализовать bounded atomics: length buckets
+- [x] Реализовать bounded atomics: length buckets
   `512,2048,8192,16384,32768,65536,131072,+Inf`, fraction buckets
   `0,.25,.5,.75,.9,.99,1,+Inf`. Нет labels с пользовательскими данными.
   Экспортировать `gufo_request_prompt_tokens`, `gufo_request_cached_fraction`,
   `gufo_request_cache_total`, `gufo_active_long_requests`.
-- [ ] GREEN: C++ и Python команды ниже, format-check; legacy `TYPES`/`COUNTERS`
+- [x] GREEN: C++ и Python команды ниже, format-check; legacy `TYPES`/`COUNTERS`
   и production counting handlers менять только при доказанном дефекте,
   не ради принятия новых полей. Метаданные не попадают в count JSON.
-- [ ] Обновить SERVER/CONTEXT/журнал; коммит:
-  `feat(metrics): добавлены распределения длин запросов и попаданий кэша`.
+- [x] Обновить SERVER/CONTEXT/журнал; коммит:
+  `feat(metrics): добавлены распределения длин запросов и попаданий кэша` (`73cc44db`).
 
 ## Задача 3. Диагностика крупных потерь префикса
 
@@ -225,28 +225,28 @@ CMake/Ninja; Linux x86-64, TheRock HIP `gfx1151` только для compile/lin
 - `CachePrefixLossLogDetails(const Result&) -> std::string` в metrics.hpp:
   пустая строка при отсутствии события; числовые/fixed-name поля иначе.
 
-- [ ] Написать `TestPrefixMatchSurvivesPartialHitAndDiskRestore`:
+- [x] Написать `TestPrefixMatchSurvivesPartialHitAndDiskRestore`:
   cold/no record, full hit, short hit + nearest deep record, truncate,
   identity mismatch и disabled reuse. Ближайшая запись фиксируется до
   очистки live_tokens; disk restore не очищает новый prefix_match.
   LCP tie: совместимая identity, затем более длинная запись.
-- [ ] Написать `TestPrefixLossThresholdsAndPrivacy`: `lost=512/513`,
+- [x] Написать `TestPrefixLossThresholdsAndPrivacy`: `lost=512/513`,
   `unreused=512/513`, `prefill=8191/8192`, common=0 с changed input,
   full exact hit без события; once terminal/cancel, cache disabled молчит.
   `lost=nearest-common`, `unreused=max(common-cached,0)`.
   Запрет выводить secret marker, prompt/array/token ID или содержимое tools.
-- [ ] Написать `TestPromptDivergencePosition`: начало/середина сообщения,
+- [x] Написать `TestPromptDivergencePosition`: начало/середина сообщения,
   до первого, конец, nullopt hook; независимые synthetic token fixtures.
   Индекс с нуля по rendered сообщениям, не по исходному JSON.
-- [ ] RED на выбранных cache/runner/scheduler tests; затем минимально
+- [x] RED на выбранных cache/runner/scheduler tests; затем минимально
   реализовать новый диагностический scan без копии токенов и без Decode.
   Не выводить guessed cause tools/system/compaction.
-- [ ] После Acquire сохранить prefix_match и позицию до перемещения/потери
+- [x] После Acquire сохранить prefix_match и позицию до перемещения/потери
   prompt; terminal-лог один раз на result, включая частичный hit.
   INFO при lost/unreused>512 и common>0, WARN при changed prefix/input +
   фактическом prefill>=8192. Не использовать отмену до lookup как cold miss.
-- [ ] GREEN + format, compile HIP-path; обновить docs/CONTEXT/журнал.
-  Коммит: `feat(cache): добавлена диагностика крупных потерь префикса`.
+- [x] GREEN + format, compile HIP-path; обновить docs/CONTEXT/журнал.
+  Коммит: `feat(cache): добавлена диагностика крупных потерь префикса` (`664ed53e`).
 
 ## Команды RED/GREEN и итоговой проверки
 
@@ -269,15 +269,15 @@ PYTHONPATH=tests/functional python3 -m unittest tests/functional/test_runner.py
 В RED зафиксировать конкретную ожидаемую assertion/ошибку, не принимать
 проблему toolchain/link/dependency за воспроизведение cache-дефекта.
 
-- [ ] Итоговая CPU-проверка: `cmake --preset cpu-test`, затем
+- [x] Итоговая CPU-проверка: `cmake --preset cpu-test`, затем
   `cmake --build --preset pr --parallel 4`; прочитать полный итог CTest,
-  фактическое число тестов и exit status, не переносить прежние «56/56».
-- [ ] `cmake --preset cpu-sanitizer`; сборка:
+  фактическое число тестов и exit status (`56/56`), не переносить прежние «56/56».
+- [x] `cmake --preset cpu-sanitizer`; сборка:
   `cmake --build --preset cpu-sanitizer --parallel 4 --target continuation_cache_test continuation_disk_store_test text_model_runner_test text_generation_scheduler_test http_server_test`.
   Запуск:
   `ctest --preset cpu-sanitizer -R '^(continuation_cache_test|continuation_disk_store_test|text_model_runner_test|text_generation_scheduler_test|http_server_test)$' --output-on-failure`.
   Ожидается 5 passed без ASan/UBSan reports.
-- [ ] HIP compile/link без исполнения:
+- [x] HIP compile/link без исполнения (проверены сборка `299/299`, `CMakeCache.txt` и SHA-256 `gufo`; `compile_commands.json` отдельно не инспектировался):
 
 ```bash
 R="$HOME/tools/therock-10.1.0"
@@ -291,36 +291,37 @@ cmake --build build/t2a1-hip --parallel 4 --target gufo
   Ожидается configure/build exit 0, HIP=ON/NPU=OFF/gfx1151 в CMakeCache и
   compile_commands. TheRock path сверить в preflight; при несовпадении
   остановиться, не устанавливать toolchain и не менять систему.
-- [ ] Python регрессии:
+- [x] Python регрессии:
   `PYTHONPATH=tests/functional python3 -m unittest tests/functional/test_runner.py tests/functional/test_hermes_synth.py tests/functional/test_dflash2_eval.py`.
   Модельный `openai_sdk --suite openai-count-tokens` **не запускается**;
   CPU проверяет его parser/contracts, не объявлять это живой HTTP-приёмкой.
-- [ ] Повторить format после всех C++ правок; `git diff --check`,
-  проверка markdown ссылок изменённых docs через `check-docs` API.
+- [x] Повторить format после всех C++ правок; `git diff --check`,
+  проверка markdown ссылок изменённых docs через `check-docs` API (`tests/tools/check_docs_test.py`).
 
 ## Завершение, перенос и очистка
 
 - [ ] Проверить требования дизайна/обоих уточнений владельца по diff и
   сохранённым RED/GREEN логам; независимая whole-branch проверка после
-  выбранного способа исполнения. Не удалять временные сборки до её окончания.
-- [ ] После устранения замечаний без скрытого ослабления тестов —
+  выбранного способа исполнения (самопроверка исполнителя пройдена; отдельный
+  независимый рецензент ещё не запускался). Не удалять временные сборки до её окончания.
+- [x] После устранения замечаний без скрытого ослабления тестов —
   повторить только затронутые проверки; сохранить также исходные FAIL.
-- [ ] Перенести свои логические коммиты в `faex2` штатным fast-forward/
+- [x] Перенести свои логические коммиты в `faex2` штатным fast-forward/
   cherry-pick по выбранному worktree workflow, без rebase/amend и без
   переноса чужих изменений. Проверить author/committer noreply.
-- [ ] Эксплуатационные документы обновить **после фактических** действий:
+- [x] Эксплуатационные документы обновить **после фактических** действий:
   PROJECT_CONTEXT §0.1 и CHANGELOG; логи/manifest — в отдельном results
-  эксплуатационного проекта. Его Git-идентичность не менять.
-- [ ] Удалить только свои `$RUN/src` (он включает build) и `$RUN/tmp`,
+  эксплуатационного проекта (`results/2026-11-17-t2a1-hermes-cpu/`). Его Git-идентичность не менять.
+- [x] Удалить только свои `$RUN/src` (он включает build) и `$RUN/tmp`,
   при наличии отдельного `$RUN/build` — его тоже. Проверить обычные пути,
   отсутствие symlinks/живых workers; сохранить `$RUN/out`/manifest/logs.
   Не использовать `git clean` или удаление широких родительских каталогов.
-- [ ] Сверить service/PID/identity и SHA рабочего процесса, status двух
+- [x] Сверить service/PID/identity и SHA рабочего процесса, status двух
   штатных клонов до/после; при незапланированной перемене остановиться
   и сообщить, не перезапускать сервер «для проверки».
-- [ ] Удалить только свой временный worktree через `git worktree remove`;
+- [x] Удалить только свой временный worktree через `git worktree remove`;
   итоговый status `faex2` чистый, коммиты локальные, push не выполнен.
-- [ ] Итог: точные SHA, команды/counts/результаты, пути raw,
+- [x] Итог: точные SHA, команды/counts/результаты, пути raw,
   подтверждение cleanup и пределы: нет GPU/model/HTTP/performance приёмки,
   C4 slot-limit остаётся, deploy не выполнен.
 
@@ -331,4 +332,4 @@ cmake --build build/t2a1-hip --parallel 4 --target gufo
 - [x] Пять рисков вынесены в конкретные тесты.
 - [x] Нет запланированных изменений формата/ядер/сервиса или скрытого smoke.
 - [x] Уточнения владельца о final length, Python parser и C4 учтены.
-- [ ] Владелец подтвердил план и выбрал способ исполнения.
+- [x] Владелец подтвердил план и выбрал способ исполнения.
