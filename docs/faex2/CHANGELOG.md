@@ -4,6 +4,22 @@
 
 ## 2026-11-17
 
+### Ручной перенос OpenAI input token counts (`T2`, из апстрима `4ab04ab8`, до живого окна)
+
+- Вручную перенесены маршруты `POST /v1/chat/completions/input_tokens` и `POST /v1/responses/input_tokens` из апстрима `4ab04ab8` без изменения кода моделей/GPU:
+  - [openai_chat.hpp](../../src/cli/serve/openai_chat.hpp) и [openai_chat.cpp](../../src/cli/serve/openai_chat.cpp): добавлены `CountOpenAiInputTokens` (поверх существующего `backend.count_chat_tokens(chat)`, формат ответа `{"object":"response.input_tokens","input_tokens":N}`, ошибки `501`/`400`/`TextGenerationError`) и `HandleOpenAiChatInputTokens`;
+  - [http_server.cpp](../../src/cli/serve/http_server.cpp): общий разбор `OpenAiResponses` вынесен в `ReadOpenAiResponseChat` (сохранена текущая логика нашей ветки без `ParseResponsesLogprobs`), добавлен хэндлер `OpenAiResponsesInputTokens` и регистрация `POST /v1/chat/completions/input_tokens` и `POST /v1/responses/input_tokens` в `HttpServer::register_routes()`;
+  - [docs/SERVER.md](../../docs/SERVER.md): добавлены оба маршрута в таблицу `Text endpoints` и раздел `OpenAI input token counts`;
+  - [http_server_test.cpp](../../tests/cli/http_server_test.cpp): расширен мок `FakeBackend::count_chat_tokens` (`counted_chat`, `count_failure`), добавлен `TestOpenAiInputTokens()` (501/200/400/404, `stream: true` без SSE и без генерации/изменения слотов, совпадение `chat` с последующей генерацией, `tools`/`tool_history`, изображения без отсутствующего в ветке поля `ImageDetail`, `response_format`);
+  - [tests/functional/openai_count_tokens.py](../../tests/functional/openai_count_tokens.py) и интеграция в [openai_sdk.py](../../tests/functional/openai_sdk.py), [metrics.py](../../tests/functional/metrics.py), [run.py](../../tests/functional/run.py), [test_runner.py](../../tests/functional/test_runner.py), [impact.json](../../tests/functional/impact.json), [README.md](../../tests/functional/README.md) (существующие `hermes_synth.py`, `dflash2_eval.py`, `faex2*.py` не изменялись).
+- Проверено без остановки рабочего сервиса `gufo-faex2.service` (сервис оставался `active`; `~/src/gufo-mk` и `~/src/gufo-faex2` не изменялись):
+  - на Mac и в изолированном каталоге `~/gufo-t2-verify-20261117/src` на `faex2`: `PYTHONPATH=tests/functional python3 -m unittest tests/functional/test_runner.py tests/functional/test_hermes_synth.py tests/functional/test_dflash2_eval.py` — **86 tests OK** (в системном Python на `faex2` отсутствует пакет `openai`, что не мешает юнит-тестам, но потребует его установки/туннеля для `openai_count_tokens.py`), `python3 tests/functional/impact.py src/cli/serve/http_server.cpp` — **OK**;
+  - на `faex2`: `python3 tools/ci/check-format.py` (`clang-format 23.1.5`) — **PASS: Checked 727 C++ files**;
+  - на `faex2`: `cmake --preset cpu-test && cmake --build --preset pr` — **56/56 tests passed** (`http_server_test` 2,25 с, `openai_chat_test` 1,61 с, `serve_cli_test` 0,81 с, `check_docs_test` 0,06 с, `text_model_runner_test` 0,11 с, `text_generation_scheduler_test` 2,52 с);
+  - на `faex2`: `cmake --preset cpu-sanitizer` (`http_server_test` под ASan + UBSan) — **1/1 Passed** (3,19 с);
+  - на `faex2`: полная GPU-сборка `gufo` (`299/299`, `ENGINE_ENABLE_HIP=ON`, `GUFO_ENABLE_NPU=OFF`, `gfx1151`, `therock-10.1.0`, SHA-256 `b8182c06…`) — **0 ошибок**, без новых предупреждений в добавленных функциях (`build/cpu-test` и `build/cpu-sanitizer` удалены; бинарник `build/release/gufo` оставлен до решения владельца по окну живого smoke-теста).
+- Ожидает подтверждения владельца: 1–2-минутное окно на `faex2` с остановкой/возвратом `gufo-faex2.service` для живого HTTP smoke-теста обоих маршрутов и `openai_count_tokens.py` на `Qwen3.6-35B-A3B`.
+
 ### Ручной перенос `POST /tokenize` (`T1`, из апстрима `6d793814`)
 
 - Вручную перенесён маршрут `POST /tokenize` из апстрима `6d793814` без механического 3-way патча и без изменения кода моделей/GPU:
