@@ -75,9 +75,10 @@ instructions followed by a single `user` message, and final prepared prompt leng
 at most 1024 tokens) use an automatic RAM-only cache policy. They never read or
 write `--cache-disk` snapshots and cannot evict or downgrade ordinary retained
 RAM checkpoints; if RAM is full of ordinary checkpoints, their snapshot is
-skipped so longer conversations stay warm. Busy execution slots (`--sessions`)
-are never preempted, so under tight session counts an incoming request can
-still reuse an idle execution slot after its RAM checkpoint is saved.
+skipped so longer conversations stay warm. Busy execution slots (`--sessions`) are never preempted; under tight session
+counts, once a prior holder finishes and saves its RAM checkpoint, an incoming
+request can reuse that freed idle execution slot without evicting the prior
+holder's retained checkpoint from RAM.
 
 Text serving defaults match llama.cpp for context and generation length:
 

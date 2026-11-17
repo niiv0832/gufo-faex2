@@ -646,7 +646,8 @@ ContinuationCache::Lease ContinuationCache::Acquire(
       for (const auto& entry : impl_->entries) {
         if (entry->valid)
           consider_prefix(entry->tokens, entry->input_identity);
-        consider_prefix(entry->live_tokens, entry->live_identity);
+        if (entry->available)
+          consider_prefix(entry->live_tokens, entry->live_identity);
       }
     }
     ContinuationLookup lookup;

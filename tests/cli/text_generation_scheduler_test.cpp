@@ -3307,8 +3307,8 @@ void TestCacheRequestDistributions() {
       gufo::server::RecordCacheRequestMetrics(r);
     }
     const auto a_frac = ReadCacheMetrics();
-    Expect(a_frac.prompt_count - b_frac.prompt_count == 9,
-           "zero-prompt direct observation still records prompt_tokens=0");
+    Expect(a_frac.prompt_count - b_frac.prompt_count == 8,
+           "zero-prompt direct observation is ignored across prompt histogram");
     Expect(a_frac.fraction_count - b_frac.fraction_count == 8,
            "zero-prompt request is excluded from cached_fraction histogram");
     const double expected_frac_sum =
@@ -3324,7 +3324,7 @@ void TestCacheRequestDistributions() {
                  expected_frac_cum[i],
              "cached_fraction bucket matches boundary");
     }
-    Expect(a_frac.cache_miss - b_frac.cache_miss == 2 &&
+    Expect(a_frac.cache_miss - b_frac.cache_miss == 1 &&
                a_frac.cache_memory - b_frac.cache_memory == 5 &&
                a_frac.cache_disk - b_frac.cache_disk == 2,
            "cache source counter separates miss, memory, and disk");
