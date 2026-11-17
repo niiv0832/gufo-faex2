@@ -1,9 +1,9 @@
 # ROADMAP_SPEC_01: Единый план доработок, проверок и техническая спецификация `gufo-faex2`
 
-Дата: 2026-11-16  
-Статус: **Черновик рабочей спецификации (ревизия 2 — полный свод с учётом всех документов `docs/faex2/`)**  
+Дата: 2026-11-17  
+Статус: **Черновик рабочей спецификации (ревизия 3 — синхронизировано по итогам Шага 1 `DFlash2` и аудита заимствований `T16`)**  
 Текущий рабочий baseline: **`004d8fa1`** (бинарник `94a09930…`, резерв — `abbfb006`/`e760a663…`, ядро `7.3.4-1-cachyos`).  
-Целевая модель: **Qwen3.6-35B-A3B** (40 слоёв: 30 *Gated DeltaNet* + 10 *Gated Attention*, `16 Q-heads / 2 KV-heads`, `hidden = 2048`; 256 роутируемых экспертов, активны 8 + 1 shared, `expert_ff = 512`) + встроенный **MTP** + **DFlash2** + **Vision Encoder** (`mmproj-BF16.gguf`).  
+Целевая модель: **Qwen3.6-35B-A3B** (40 слоёв: 30 *Gated DeltaNet* + 10 *Gated Attention*, `16 Q-heads / 2 KV-heads`, `hidden = 2048`; 256 роутируемых экспертов, активны 8 + 1 shared, `expert_ff = 512`) + встроенный **MTP** *(рабочий режим `MTP1`; `DFlash2` отклонён на Шаге 1 2026-11-17)* + **Vision Encoder** (`mmproj-BF16.gguf`).  
 Целевое железо: **128 ГБ UMA, AMD `gfx1151`** (стенд FEVM FAEX2; перспектива — Gorgon Halo / исправленный XDNA2 NPU).  
 Клиенты: основной — **Hermes Agent** (семейный чат, русский язык, инструменты, зрение); второй — **OpenCode 2.3.0** (программирование).
 
@@ -25,7 +25,7 @@
 * **Веса в памяти устройства и обход page cache для снимков (Пакет C, `00eddb85`):** анонимная память процесса снижена с 22,5 до 0,19 ГиБ, снимки кэша не вытесняют память GPU.
 * **Ядра K-квантов под LLVM 24 (Пакет A, `92239590`):** фикс spill в IQ4 small-batch, GEMV «строка на warp», маскированный 16-строчный prefill GEMM → короткие дозагрузки длинной истории **+9–22 %**.
 * **Оптимизации MTP1 для 35B-A3B:** память MTP-головы в `FP16` (−2 ГиБ, +11,6..+19 % на 64K–120K, `69aa1d05`), сокращённый словарь 161 074 строки (латиница + кириллица + знаки, +3,9 %, `be728559`), общий проход проекции на словарь для нескольких пользователей (`GUFO_MTP_MOE_MAX_COHORT=4`, +7..+10 % на 2–4 потоках, `2da32906`, `1195d154`), потоковая запись снимков Qwen+MTP через буфер 8 МиБ (`ffc8580a`).
-* **Изоляция рабочих буферов prefill по потоку GPU (`f3e8fc32`, `67007f07`, `d891354f`):** закрыта гонка между сеансами в `LaunchBatchedQuantGEMM`, `Qwen35MoePrefill` и `GetMoeFfnScratch` (+~160 МиБ на сеанс).
+* **Изоляция рабочих буферов prefill по потоку GPU (`f3e8fc32`, `67007f07`, `d891354f`):** закрыта гонка между сеансами в `LaunchBatchedQuantGEMM`, `Qwen35MoePrefill` и `QwenMoeScratch` (в [`executor.hpp`](../../src/models/qwen/hip/executor.hpp#L320), историческое имя `GetMoeFfnScratch`; +~160 МиБ на сеанс).
 
 ---
 
@@ -33,12 +33,12 @@
 
 | Область | Где смотреть | Что у нас сейчас | Что именно проверяем / дорабатываем |
 | --- | --- | --- | --- |
-| **1. Бакетные HIP-графы (`hipGraphExec_t`)** | `gufo-laguna` ([`src/models/laguna/`](../../src/models/laguna/gpu/engine.cpp)), `strixite` | [`HipGraphDecodeExecutor`](../../src/core/hip/detail/hip_graph_decode_executor.hpp) захватывает один граф и отключается при `kSplitKAttentionRequired` (длинный контекст) и `kLogitsNotRequested` ([`execution_policy.hpp`](../../src/models/qwen/hip/execution_policy.hpp)). | Как в `laguna` организованы слоты графов под разные размеры пакета (`T ∈ {1..8}` или бакеты `T ∈ {1, 2, 4, 8}`), как передавать позицию `pos` для split-K через device-память без сброса графа. |
-| **2. MoE-роутинг и верификация черновиков** | `gufo-laguna`, `strixite` | FP32-роутер и `LaunchMoeRouterTopK` ([`moe.hip`](../../src/models/qwen/hip/kernels/moe.hip)). Но при `MTP2`/`MTP3` на 2–4 потоках скорость падает на **5–33 %** ([CONTEXT](CONTEXT.md)). | Проверяем гипотезу «размытия экспертов» при верификации нескольких токенов и устройство grouped/indirect MoE GEMM без лишних чтений всех 256 экспертов. |
-| **3. Контроллер `auto`-спекуляции и стоимость `MTP`/`DFlash2`** | `gufo-laguna`, апстрим `gufo` (`1167a944`, `2caf2a82`) | [`QwenAutoDraftBackend`](../../src/models/qwen/hip/auto_draft.cpp) смотрит только на `tokens_per_second`, а при `temperature > 0` всегда выбирает DFlash2. В [`dflash_policy.hpp`](../../src/models/qwen/dflash_policy.hpp) sampled и смешанные пакеты оцениваются грубо как C1. Порог когорты MTP жёсткий (`GUFO_MTP_MOE_MAX_COHORT=4`). | Переход на оценку стоимости (cost gate) с учётом числа активных потоков, acceptance rate / энтропии и режима `reasoning_effort: medium` (где в одном ответе сначала идёт русская проза рассуждения, а затем JSON tool call). |
-| **4. Ускорение длинного контекста: `GUFO_QWEN_SPARSE_ATTN=1` vs `Q8_0` KV-кэш** | `gufo` ([`attention_sparse.hip`](../../src/models/qwen/hip/kernels/attention_sparse.hip), [DECODE_DEPTH.md](DECODE_DEPTH.md) п. 3) и `tubo` (`Q8_0` KV) | KV-кэш 10 слоёв Attention хранится в `FP16`. На 64K+ чтение KV идёт на ~199 ГБ/с ([DECODE_DEPTH.md](DECODE_DEPTH.md)). При этом в коде **уже готово** ядро `QwenSparseDecodePartialsKernel<8>` (`GUFO_QWEN_SPARSE_ATTN=1`, на 128K даёт ~43 против 24 tok/s без нового кода). | **Сначала** дешёвая проверка уже готового `GUFO_QWEN_SPARSE_ATTN=1` с MTP1 на корректность и качество. Тяжёлая разработка `Q8_0` KV-кэша (требующая CPU-оракула, новых ядер и несовместимая со sparse) — только по решению владельца, если sparse не пройдёт по качеству, а телеметрия подтвердит частые длинные истории. |
-| **5. Раскладка весов и смесь `Q6_K` dense + `UD-Q4_K_XL` experts** | `strixite`, `NinjaPear/Q6dense` | Чтение стандартного GGUF `UD-Q4_K_XL` (большие GEMM идут на 140–225 ГБ/с из ~240 ГБ/с потолка Strix Halo, см. [OPTIMIZATION_BACKLOG.md](OPTIMIZATION_BACKLOG.md)). | Даёт ли перепаковка dense/router/shared в `Q6_K` и выравнивание под `wave32` WMMA измеримый выигрыш в качестве (`ΔNLL`) и утилизации ПСП (особенно для оставшегося зазора до потолка памяти). |
-| **6. API, планировщик и кэш под профиль Hermes Agent** | Апстрим `gufo` ([UPSTREAM_PORT.md](UPSTREAM_PORT.md)), [DFLASH2_EVAL_PLAN](DFLASH2_EVAL_PLAN_2026-11-15.md) | Перенесена 1-я очередь Пакета B (13 коммитов). Qwen работает на старом `ContinuationCache`; Пакет D делает уступки внутри prefill, но не приоритизирует очередь. | 2-я очередь Пакета B (`/tokenize` `6d793814`, `input token counts` `4ab04ab8`), телеметрия реальных длин историй Hermes, приоритет коротких семейных запросов в очереди планировщика и защита кэша от вытеснения служебным `aux_title_request.json` и при сжатии истории Hermes. |
+| **1. Бакетные HIP-графы (`hipGraphExec_t`)** | `gufo-laguna` ([`src/models/laguna/`](../../src/models/laguna/gpu/engine.cpp)), `Q6dense` (MIT); *(в `strixite` графов 0)* | [`HipGraphDecodeExecutor`](../../src/core/hip/detail/hip_graph_decode_executor.hpp) держит один `instance_` только в [`ForwardToken`](../../src/models/qwen/hip/decode.cpp#L50-L108) (одиночный AR `T=1`) и отключается при `kSplitKAttentionRequired` и `kLogitsNotRequested` ([`execution_policy.hpp`](../../src/models/qwen/hip/execution_policy.hpp)). При `MTP1` графов нет вовсе в [`ForwardVerificationBatch`](../../src/models/qwen/hip/batched_decode.cpp#L564), [`ForwardTokenBatch`](../../src/models/qwen/hip/batched_decode.cpp#L236) и [`QwenMtpGpuExecutor::Run`](../../src/models/qwen/hip/mtp/executor.cpp#L232). | Пул графов под длины верификации и бакеты, device-`pos` в обоих split-K ядрах ([`attention_decode_verify_wave64.hip`](../../src/models/qwen/hip/kernels/attention_decode_verify_wave64.hip) с порогом `deep = start_pos + 1 >= 512` и [`attention_decode.hip`](../../src/models/qwen/hip/kernels/attention_decode.hip)), захват `ForwardVerificationBatch` + `QwenMtpGpuExecutor`, разделение `C1` и `C4` (массив per-session позиций), инвалидация графов при `TrimRollback` (урок `Q6dense`) и стартовый прогрев `hipBLASLt`. |
+| **2. MoE-роутинг, grouped/indirect GEMM и просадка `MTP2/3`** | `qfn_mmq` ([`moe_vec.hpp`](../../src/models/qwen/hip/ops/moe_vec.hpp)), `Q6dense` (MIT); *(сторонний роутинг из `laguna`/`strixite`/`tubo` не заимствуем)* | FP32-роутер и `LaunchMoeRouterTopK` ([`moe.hip`](../../src/models/qwen/hip/kernels/moe.hip)); grouped/indirect `gate/up` GEMM и [`QwenMoeScratch`](../../src/models/qwen/hip/executor.hpp#L320) уже работают. Однако при `MTP2`/`MTP3` на 2–4 потоках скорость падает на **5–33 %** ([CONTEXT](CONTEXT.md)), а условие `by_expert` в [`qfn_mmq.hip.cpp`](../../src/models/qwen38_flash_next/kernels/rocm/mmq/qfn_mmq.hip.cpp#L505-L508) (`K == 640 && (Q5_1 \|\| Q8_0)`) выключено для `down_exps` на 35B-A3B (`K = 512`, `Q4_K/Q5_K/Q6_K`). | **Закрыто:** переписывание роутинга с нуля не нужно. **Остаётся открытым:** профилирование просадки `MTP2/3` (включая отсутствие графов на `MTP` и путь внимания внутри `MTP`-головы) и проверка группировки `by_expert` для `down_exps` при `K = 512` (`Q4_K/Q5_K/Q6_K`, образец `Q6dense` MIT). |
+| **3. Cost gate спекуляции (`MTP1 ↔ AR`)** | Апстрим `gufo` (`1167a944` для 27B, `2caf2a82` уже учтён), `Q6dense` (MIT, порог `0.5`), `strixite` (AGPL — только идеи `capture`/`MtpPick`); *(в `gufo-laguna` гейта нет)* | [`QwenAutoDraftBackend`](../../src/models/qwen/hip/auto_draft.cpp) смотрит только на `tokens_per_second`, а порог когорты MTP жёсткий (`GUFO_MTP_MOE_MAX_COHORT=4` в [`mtp/backend.cpp`](../../src/models/qwen/hip/mtp/backend.cpp#L265-L292)). **По итогам Шага 1 ([DFLASH2_STEP1_REPORT_2026-11-17.md](DFLASH2_STEP1_REPORT_2026-11-17.md)) `DFlash2` закрыт для `35B-A3B`.** | В `T7 cost gate` остаётся **только ветка `MTP1 ↔ AR` на `C2–C8`** с учётом активных потоков, acceptance rate, длины контекста, отсечки неуверенных черновиков (`kMinDraftProbability = 0.5`, идея `Q6dense`), маржи top-2 (идея `strixite::MtpPick`) и офлайн-калибровки на телеметрии (идея `strixite::capture`). Ветка `MTP1 → DFlash2` снята. |
+| **4. Ускорение длинного контекста: `GUFO_QWEN_SPARSE_ATTN=1` vs условный `Q8_0` KV-кэш** | Собственный [`attention_sparse.hip`](../../src/models/qwen/hip/kernels/attention_sparse.hip) (`34e61a15`); `Q6dense` (MIT), `tubo` (MIT — только уроки), `strixite` (AGPL — только идея `kv8`) | KV-кэш 10 слоёв Attention хранится в `FP16` (**10,00 ГиБ / 10,74 ГБ** на `4 × 128K`). Готовое ядро `QwenSparseDecodePartialsKernel<8>` (`GUFO_QWEN_SPARSE_ATTN=1`, **0 строк нового кода**) на `MTP1` даёт ориентир **~+26 %** (`25,7 → 32,4 tok/s`; `~43 tok/s` было в `AR + NPU`). | **Первым на Этапе 2:** проверка уже готового `GUFO_QWEN_SPARSE_ATTN=1` с `MTP1` на семантику и качество (набор 50–100 задач). **Строго условно на Этапе 3 (только при отклонении `sparse` и частых >32K по телеметрии):** `Q8_0` KV (`5,31 ГиБ / 5,70 ГБ`, экономия **4,69 ГиБ / 5,03 ГБ**) с уроками `tubo`, базой ядер `Q6dense` и идеями `strixite::kv8`. |
+| **5. Смесь `Q6_K` dense + `UD-Q4_K_XL` experts (`Q6dense`) и `.ghalo` (отложено)** | `Q6dense` (MIT — рецепт GGUF и ядра `qwen36_35b_a3b`), `strixite` (AGPL — только идеи `strixw`/`wmma`) | Стандартный GGUF `UD-Q4_K_XL`. Опыт `Q6dense` показал, что ускорение даёт перепаковка тензоров *при загрузке в память*, а не собственный дисковый формат. | Проверить лицензии HF и `q6dense.types`, сравнить GGUF-рецепт `Q6dense` на `Q1` и скорости (`T14`, 0 строк кода) и при необходимости точечно оценить MIT-ядра `DenseQ6KVec`/`MtpHiddenKernel` (`T14b`). **Формат `.ghalo` отложен.** |
+| **6. API, планировщик, телеметрия и кэш под профиль Hermes Agent** | Апстрим `gufo` (`6d793814`, `4ab04ab8`, проверка `fe2694bc`/`8ab834a5`), `strixite` (AGPL — только идеи: `capture`, `ram_only`, `System/Checkpoint/Turn`, `resume_loss`, `GrammarCache`, `others_decoding`, `MemoryGovernor`) | Перенесена 1-я очередь Пакета B (13 коммитов). Qwen работает на `ContinuationCache`; Пакет D уступает внутри prefill, но не приоритизирует очередь; при `aux_title_request.json` и сжатии истории нет защиты слотов и диагностики потерь префикса. | 2-я очередь Пакета B (`POST /tokenize` `6d793814`, `input_tokens` `4ab04ab8`), телеметрия длин/токенов (идея `capture`), приоритет коротких семейных запросов + уменьшение чанков при `others_decoding`, защита 55K-префикса (`ram_only` для `aux_title_request.json`, `System/Checkpoint`, `resume_loss`, `GrammarCache`, проверка `fe2694bc`/`8ab834a5`). |
 
 ---
 
@@ -69,13 +69,13 @@
    * **Практический набор оценок качества семейного чата (50–100 фиксированных примеров):** контракт `Q1` проверяет численную близость prefill к `G1`, но без собственного набора прикладных задач (русские инструкции, школа, OCR/таблицы, цепочки инструментов Hermes) любое приближение (`GUFO_QWEN_SPARSE_ATTN`, `Q8_0` KV, `Q6_K`) нельзя оценить на реальную полезность ответов.
 
 ### Б. Спекуляция (MTP / DFlash2) и нагрузка Hermes Agent
-5. **Не проведены стендовые шаги 1–2 оценки DFlash2 против MTP1 ([DFLASH2_EVAL_PLAN_2026-11-15.md](DFLASH2_EVAL_PLAN_2026-11-15.md)):**
-   * Шаг 0 выполнен (записаны 15 реальных запросов Hermes Agent v0.22.2 в `tests/functional/fixtures/hermes_synth/` + `aux_title_request.json`).
-   * Вскрылись особенности Hermes: **(а)** огромный постоянный префикс ~55 тыс. символов (17K системный промпт + 37,5K описания 20 инструментов) — критична скорость тёплого кэша префикса; **(б)** `reasoning_effort: medium` (сначала проза рассуждений, затем JSON), что снижает долю чистого JSON для DFlash2; **(в)** служебный запрос заголовка со строгой JSON-схемой (`response_format: json_schema`, `reasoning_effort: none`); **(г)** `speculative-corpus.py` не принимает `tools` напрямую.
-6. **Условный техдолг DFlash2 (вступает в силу, только если пройден порог 15 % на шаге 2):**
-   * Потоковая запись снимков (`StreamPersistent` с лимитом ≤16 MiB) сделана только для Qwen+MTP; **DFlash2 и `auto` используют старый fallback с полной аллокацией вектора в RAM** ([SNAPSHOT_STREAMING_PLAN.md](SNAPSHOT_STREAMING_PLAN.md)).
-   * Таблицы стоимости в `dflash_policy.hpp` оценивают sampled и смешанные пакеты как C1.
-7. **Просадка `MTP2`/`MTP3` при 2–4 потоках (−5…−33 % на `004d8fa1`)** и отсутствие собственного wave64-ядра для внимания внутри самой MTP-головы (сейчас она читает свой KV в `FP32`/`FP16` отдельным путём, см. [DECODE_DEPTH.md](DECODE_DEPTH.md)).
+5. **Оценка DFlash2 против MTP1 завершена на Шаге 1 ([DFLASH2_EVAL_PLAN_2026-11-15.md](DFLASH2_EVAL_PLAN_2026-11-15.md), [DFLASH2_STEP1_REPORT_2026-11-17.md](DFLASH2_STEP1_REPORT_2026-11-17.md)):**
+   * Шаг 0 выполнен (15 реальных запросов Hermes Agent v0.22.2 в `tests/functional/fixtures/hermes_synth/` + `aux_title_request.json`).
+   * **Шаг 1 выполнен 2026-11-17 на стенде `faex2` (`004d8fa1`, `C1`, `temperature = 0`):** на классе `tool` `DFlash2` оказался медленнее `MTP1` (−8,76 % в Проходе 1, −16,13 % в Проходе 2, −13,86 % по `decode tok/s`), а по всему эпизоду медленнее на −10,95 % / −13,00 % при принятии черновиков 48,7–52,7 % против 83,2–91,8 % у `MTP1`. По критерию отказа **тема `DFlash2` для `Qwen3.6-35B-A3B` закрыта окончательно, Шаг 2 не нужен**.
+   * Подтверждённые особенности Hermes (влияют на Этап 1): **(а)** постоянный префикс ~55 тыс. символов (~12 288 токенов) попадает в кэш со второго запроса, сокращая `TTFT` на `MTP1` с 4899 до 151–529 мс; **(б)** `reasoning_effort: medium` (рассуждение + JSON); **(в)** служебный запрос заголовка `aux_title_request.json` (`response_format: json_schema`, `reasoning_effort: none`) отработал валидно и не вытеснил 12K-префикс в `C1`.
+6. **~~Условный техдолг DFlash2~~ (СНЯТ 2026-11-17 по итогам Шага 1):**
+   * Потоковая запись снимков (`StreamPersistent` с лимитом ≤16 MiB) для `QwenDFlashDraftSnapshot` / `QwenAutoDraftBackend` и калибровка таблиц `dflash_policy.hpp` для sampled/mixed пакетов больше не требуются (остаются историческим ограничением неактивного режима `dflash2`).
+7. **Просадка `MTP2`/`MTP3` при 2–4 потоках (−5…−33 % на `004d8fa1`):** отсутствуют HIP-графы на шаге MTP, есть собственное чтение KV внутри MTP-головы ([DECODE_DEPTH.md](DECODE_DEPTH.md)), а в [`qfn_mmq.hip.cpp`](../../src/models/qwen38_flash_next/kernels/rocm/mmq/qfn_mmq.hip.cpp#L505-L508) не срабатывает группировка `by_expert` на `down_exps` при `K = 512` и `Q4_K/Q5_K/Q6_K`.
 
 ### В. Кэш, память, планировщик и эксплуатация
 8. **Незакрытые проверки текущего рабочего бинарника `004d8fa1` («вариант Б»):**
@@ -92,7 +92,7 @@
     * **Очередь записи при стресс-тесте малого дискового кэша (16 ГиБ против штатных 64 ГиБ):** в диагностическом прогоне `r3-earlyskip` (где объём дискового кэша намеренно зажимался до 16 ГиБ для провокации постоянного LRU-вытеснения) `staging_used_bytes` вырастал до ~10,2 ГиБ даже с правилом раннего отказа `min_step` (на штатных 64 ГиБ с правилом — 0 ГиБ).
     * **Паузы под давлением памяти (`EXP-N`, Пакет C):** до 6 пауз >1 с в первые 40 с под искусственным давлением.
     * **Единичное зависание MTP-сервера (выход с кодом 75 по таймауту 120 с на `r138` из ~3800 запросов, [INVESTIGATION_RESULT.md](INVESTIGATION_RESULT.md) §Д):** причина не установлена; автоперезапуск `gufo-faex2.service` после реальной аварии и реальной перезагрузки машины ещё не проверен в бою; нет квалификации 24/7.
-    * **Устаревшая документация модели и клиентские памятки:** в `docs/models/qwen3.6-35b-a3b/README.md` всё ещё указано, что изображения не поддерживаются; на клиентской стороне OpenCode (вне репозитория движка) остаётся открытым вопрос глобального правила русского языка в `~/.config/opencode/AGENTS.md`.
+    * **Устаревшая документация модели и клиентские памятки:** в [`docs/models/qwen3.6-35b-a3b/README.md`](../models/qwen3.6-35b-a3b/README.md) описание vision актуализировано (2026-11-17); на клиентской стороне OpenCode (вне репозитория движка) остаётся открытым вопрос глобального правила русского языка в `~/.config/opencode/AGENTS.md`.
 11. **Телеметрия реальной нагрузки, приоритеты планировщика и кэш-политика под Hermes Agent (План Б из [DFLASH2_EVAL_PLAN](DFLASH2_EVAL_PLAN_2026-11-15.md#L57)):**
     * **Отсутствие телеметрии распределения длин историй на рабочем сервере:** неизвестно, какую долю реальных запросов семейного чата составляют истории >32K–64K токенов.
     * **Отсутствие приоритизации очереди в планировщике (`text_generation_scheduler.cpp`):** Пакет D (`SetPrefillYield`) дал послойные уступки уже идущим декодерам, но новый короткий семейный запрос в очереди может ждать начала/прохода длинного агентского запроса; кроме того, сценарий позднего прихода общего префикса (`late_shared_prefix`, находки **№3** и **I7**), хотя и проверен функционально по HTTP в `gates2`, имеет неквалифицированную цену по времени (`wait=0`, чтение префикса самим участником).
@@ -103,9 +103,11 @@
 
 ## 3. Техническая спецификация целевых доработок
 
-### 3.1. Бинарный формат весов (`.ghalo` / кэшируемая перепаковка)
+### 3.1. Бинарный формат весов (`.ghalo` — ОТЛОЖЕНО; приоритет у проверки `Q6dense` при загрузке)
 
-Текущий движок читает стандартный GGUF (`UD-Q4_K_XL`), перекодируя при загрузке только отдельные тензоры (например, `Q6_K` → `Q8_0` в части путей и `BF16` → `Q8_0` в DFlash2). Для достижения потолка ПСП и повышения точности роутера/dense-слоёв вводится опциональный предвыровненный образ **`.ghalo`** (либо кэш-файл перепаковки рядом с GGUF).
+> **Статус (решение по `T16` / `BORROW_EVAL_2026-11-17.md` §6):** собственный дисковый контейнер **`.ghalo` отложен**. Опыт `Q6dense` (MIT) показывает, что основной прирост на 64K–131K дают GGUF-схема точности (`Q6_K` dense + `UD-Q4_K_XL` experts) и перепаковка/раскладка весов *при загрузке в память*, а не новый формат файла. Архитектурная спецификация ниже сохранена как справочный задел.
+
+Текущий движок читает стандартный GGUF (`UD-Q4_K_XL`), перекодируя при загрузке только отдельные тензоры (например, `Q6_K` → `Q8_0` в части путей и `BF16` → `Q8_0` в DFlash2). Для будущего сравнения смешанной точности без потери совместимости с GGUF сначала проверяется рецепт `Q6dense` (Этап 4); ниже приведена сохранённая спецификация опционального предвыровненного образа **`.ghalo`**.
 
 #### Смешанная схема точности
 * **Router (`ffn_gate_inp`) и `shared_expert` gate:** строго **`FP32` или `BF16`** (квантованный роутер запрещён коммитом `355b1d86`, логиты роутера считаются в `FP32`).
@@ -150,33 +152,36 @@ Offset  Size  Field              Description
 
 1. **Состояния 30 слоёв Gated DeltaNet (`recurrent_bytes`):**
    * Нерастущий буфер (`conv_state` в `FP32` + `ssm_state` в `FP32` или `BF16`), парный буфер отката + `replay_log` на 16 шагов (` AllocateSsmReplayLog` атомарен по всем 4 буферам с коммита `d81c883e`).
-2. **Ускорение чтения памяти истории на длинном контексте (`GUFO_QWEN_SPARSE_ATTN` vs `Q8_0` KV-кэш):**
-   * **Вариант А (проверяется первым, 0 строк нового C++/HIP кода):** включение существующего `GUFO_QWEN_SPARSE_ATTN=1` ([`attention_sparse.hip`](../../src/models/qwen/hip/kernels/attention_sparse.hip), `QwenSparseDecodePartialsKernel<8>`). После 8192 токенов модель читает только наиболее важные блоки истории (в исходных замерах на 128K даёт ~43 против 24 tok/s, т.е. ~+55..80 %). Это приближение: требует проверки совместной работы с MTP1 и оценки на собственном прикладном наборе задач (50–100 примеров).
-   * **Вариант Б (условный, по явному решению владельца, только если Вариант А не устроит по качеству, а телеметрия подтвердит частые истории >32K):** расширение `enum class QwenKvCacheStorage`:
+2. **Ускорение чтения памяти истории на длинном контексте (`GUFO_QWEN_SPARSE_ATTN` vs условный `Q8_0` KV-кэш):**
+   * **Вариант А (проверяется первым на Этапе 2, 0 строк нового C++/HIP кода):** включение существующего `GUFO_QWEN_SPARSE_ATTN=1` ([`attention_sparse.hip`](../../src/models/qwen/hip/kernels/attention_sparse.hip), `QwenSparseDecodePartialsKernel<8>`). После порога `sparse_min_context = 8192` (дефолт старта прореживания — `290` блоков = `18 560` токенов) модель читает только наиболее важные блоки истории; на рабочем **`MTP1`** ориентир по архиву составляет **~+26 %** (`25,7 → 32,4 tok/s`; исторические `43,2 tok/s` относились к связке `AR + NPU`). Это приближение: требует проверки совместной работы с `MTP1` (`A1`) и оценки на прикладном наборе задач (`A2`, 50–100 примеров).
+   * **Вариант Б (условный, по явному решению владельца на Этапе 3, только если `GUFO_QWEN_SPARSE_ATTN=1` не устроит по качеству, а телеметрия подтвердит частые истории >32K):** расширение `enum class QwenKvCacheStorage`:
      ```cpp
      enum class QwenKvCacheStorage : std::uint8_t {
        kFp32,
        kFp16,   // текущий production default
        kQ8_0,   // условный: 34 байта на 32 элемента (fp16 scale + 32 x int8)
-       kTurbo6, // опция для сверхдлинных контекстов >128K после валидации Q8_0
+       kTurbo6, // далёкий резерв для >262K после валидации Q8_0 (риск compute-bound на verify)
      };
      ```
-   * **Граничные условия и ограничения `kQ8_0`:**
-     * квантование `K` и `V` в `kQ8_0`/`kTurbo6` выполняется на **GPU** в fused-эпилоге `QK-norm + RoPE + KV-write`;
-     * деквантование `Q8_0` встраивается напрямую в wave64 split-K ядро `QwenDecodeSplitKAttentionHalfPartialsKernel` (вариант «16 голов запроса на 2 головы памяти» из `6bcf0c3b`);
+   * **Граничные условия, уроки `tubo` (MIT) и идеи `strixite::kv8` (AGPL — только идеи) для `kQ8_0`:**
+     * enum `QwenKvCacheStorage` дописывать **только в конец** с немедленным поднятием precision-bound в [`arena.cpp`](../../src/models/qwen/hip/arena.cpp#L252-L256); при смешанной точности использовать per-layer таблицу (`QwenKvLayerFormat`) и единую функцию расчёта смещения блока для writer и reader;
+     * квантование `K` и `V` в `kQ8_0` выполняется на **GPU** в fused-эпилоге `QK-norm + RoPE + KV-write`;
+     * чтение/деквантование `Q8_0` встраивается в wave64 split-K ядро [`QwenVerifySplitKAttentionHalfPartialsWave64Kernel<8>`](../../src/models/qwen/hip/kernels/attention_decode_verify_wave64.hip) (и split-K / prefill-пути, с опорой на FP64-тесты и ядра `Q6dense` MIT, но **без дубля `FP16`**; на prefill учитывать предупреждение `strixite::kv8` о `2,7×` замедлении при распаковке внутри WMMA-цикла — использовать staging; [`DequantizeQ8_0ToBf16Kernel`](../../src/models/qwen/hip/kernels/prefill_gemm.hip#L382) непригодно, так как выдаёт `BF16`, а внимание работает в `FP16`);
+     * рассмотреть идею `strixite::kv8` с поканальной шкалой `K` (−42 % ошибки после RoPE) и точным несжатым хвостом `< 32` строк (`exact_from` для независимости от размера чанка prefill);
      * **явная несовместимость `kQ8_0` + `GUFO_QWEN_SPARSE_ATTN=1`:** оба режима одновременно не включаются (`QwenSparseDecodePartialsKernel` работает с `FP16` KV);
-     * **требования к приёмке `kQ8_0`:** независимый CPU-оракул формата `Q8_0` KV, включение `QwenKvCacheStorage` в `Fingerprint()` и `numerics=...`, оценка по схеме «сравнительная таблица (G16 / GS / G8 / O) → независимое прочтение ответов на наборе из 50–100 задач → решение владельца», плюс не менее суток наблюдения на штатном `4 × 131072` до любых разговоров о `262144`.
-3. **Ограничение памяти при записи и чтении снимков (`Snapshot Streaming`):**
-   * При сохранении DFlash2/auto в проекте — реализовать `IDraftBackendSnapshot::StreamPersistent` для `QwenDFlashDraftSnapshot` и `QwenAutoDraftBackend` через scratch ≤16 MiB (закрытие ограничения из [SNAPSHOT_STREAMING_PLAN.md](SNAPSHOT_STREAMING_PLAN.md)).
-   * Для восстановления с диска (`Restore`) — переход от полной аллокации `ReadImage` к потоковому чтению чанками по 8–16 МиБ с двухфазной проверкой контрольной суммы до публикации состояния в слот.
+     * **требования к приёмке `kQ8_0`:** независимый CPU-оракул формата `Q8_0` KV, включение `QwenKvCacheStorage` в `Fingerprint()` и `numerics=...`, оценка по схеме «сравнительная таблица (`FP16` / `sparse` / `Q8_0` / `llama.cpp`) → независимое прочтение ответов на наборе из 50–100 задач → решение владельца», плюс не менее суток наблюдения на штатном `4 × 131072` до любых разговоров о `262144`.
+3. **Потоковое чтение/запись снимков (`Snapshot Streaming` / `Restore`) и экономия памяти (`MEMTRIM`):**
+   * Потоковая запись `StreamPersistent` (scratch 8 MiB) работает для рабочего Qwen+MTP; перенос на `DFlash2`/`auto` снят вместе с отказом от `DFlash2`.
+   * Для восстановления с диска (`Restore`) — переход от полной аллокации `ReadImage` к потоковому чтению чанками 8–16 МиБ с двухфазной проверкой контрольной суммы до публикации в слот, с заимствованием zero-copy переноса из MIT `tubo` (`snapshot_copy.hip`, `hipHostGetDevicePointer` / `CopyAlignedSnapshot`) и переиспользуемого буфера (идея `strixite::HostBuffer`, плюс идея `strixite::MemoryGovernor` против гонок `EXP-N`).
+   * Для разбора зазора `+4..7,5 ГиБ` к `llama.cpp` — рассмотреть инкрементальное выделение 2-МиБ KV-клеток по образцу MIT `tubo` (`GUFO_DEV_MEMTRIM_9`) вместо резервации всего буфера в конструкторе [`arena.cpp`](../../src/models/qwen/hip/arena.cpp).
 
 #### Бюджет памяти на 128 ГБ UMA (4 сессии × 131 072 токена)
-* **Веса (`UD-Q4_K_XL` или `.ghalo` `Q6_K` dense + `Q4_K` experts):** 22,0 – 23,5 ГБ (в памяти устройства, Пакет C).
-* **MTP-head (`FP16` KV) + DFlash2 (`Q8_0`) + Vision (`BF16`):** ~1,8 ГБ + ~0,9 ГБ.
+* **Веса (`UD-Q4_K_XL` или `Q6dense` `Q6_K` dense + `Q4_K` experts):** 22,0 – 23,5 ГБ (`~21,5 ГиБ` для `UD-Q4_K_XL` в памяти устройства, Пакет C).
+* **MTP-head (`FP16` KV) + Vision (`BF16`):** ~1,8 ГБ + ~0,9 ГБ *(опциональные веса `DFlash2` `Q8_0` не загружаются в рабочем профиле `MTP1`)*.
 * **DeltaNet state (30 слоёв, 4 сессии, с резервом отката):** ~1,6 ГБ.
-* **KV-кэш Attention (10 слоёв, 4 × 128K):**
-  * сейчас в `FP16`: ~10,5 ГБ (при 4 × 262K — ~21 ГБ; вся GPU-память с буферами — ~55,2 ГБ, см. [BASELINE.md](BASELINE.md));
-  * в `Q8_0`: **~5,6 ГБ** на 4 × 128K (экономия ~5 ГБ на 128K и ~10 ГБ на 262K + почти двукратное снижение трафика чтения KV в decode).
+* **KV-кэш Attention (10 слоёв × 2 KV-головы × `head_dim = 256`, профиль `4 × 128K = 524 288` токенов):**
+  * сейчас в `FP16` (`20 480 Б/токен`): **10,00 ГиБ (10,74 ГБ)** (при `4 × 262K` — **20,00 ГиБ / 21,47 ГБ**; вся GPU-память с буферами — ~55,2 ГБ, см. [BASELINE.md](BASELINE.md));
+  * условный `Q8_0` (`10 880 Б/токен`): **5,31 ГиБ (5,70 ГБ)** на `4 × 128K` — экономия **4,69 ГиБ (5,03 ГБ)** на 128K (и **9,38 ГиБ / 10,07 ГБ** на 262K) при почти двукратном снижении трафика чтения KV в decode.
 * **Пер-поточные буферы prefill/MoE (4 сессии):** ~0,64 ГБ (`4 × 160 МиБ`).
 * **RAM-кэш снимков продолжений:** 16 ГиБ в ОЗУ; **штатный дисковый кэш — 64 ГиБ** (мимо page cache; значение 16 ГиБ для диска использовалось только в стресс-тесте вытеснения `r3-earlyskip`, см. §2.10).
 
@@ -200,15 +205,16 @@ Offset  Size  Field              Description
 
 ### 3.4. Спецификация захваченных HIP-графов (`hipGraphExec_t`)
 
-Расширение [`HipGraphDecodeExecutor`](../../src/core/hip/detail/hip_graph_decode_executor.hpp) и [`ResolveQwenGraphRejections`](../../src/models/qwen/hip/execution_policy.hpp):
+Расширение [`HipGraphDecodeExecutor`](../../src/core/hip/detail/hip_graph_decode_executor.hpp) и [`ResolveQwenGraphRejections`](../../src/models/qwen/hip/execution_policy.hpp) *(переписано по итогам аудита `T16`)*:
 
-1. **Пул графов под фактические длины верификации (`T ∈ {1..8}` или бакеты `T ∈ {1, 2, 4, 8}`):**
-   * *Сверка с кодом:* в [`dflash_policy.hpp`](../../src/models/qwen/dflash_policy.hpp) `DFlashLengthController::kMaxDraftTokens = 7` (в [BASELINE.md](BASELINE.md) профиль называется `DFlash adaptive 7`), а метод `ChooseMoe()` в адаптивном режиме возвращает любую длину черновика `0..7` — то есть пакет верификации (1 целевой + $K$ черновых токенов) принимает значения **`T ∈ {1..8}`** (а не фиксированное `T = 6` для $K=5$). Для встроенного MTP в MoE глубина составляет `1..3` (`T ∈ {2..4}`, рабочий профиль `MTP1` — это `T = 2`).
-   * **Решение:** вместо одного экземпляра `hipGraphExec_t` в `QwenGpuExecutor` хранится таблица графов по ключу `(workload_identity, T)` (до 8 слотов для одиночной сессии `T ∈ {1..8}`, по аналогии с пулом из 17 слотов графов в [`src/models/laguna/`](../../src/models/laguna/gpu/engine.cpp), либо `ChooseMoe` ограничивается сеткой бакетов `T ∈ {1, 2, 4, 8}`).
-   * Все буферы внутри `QwenGpuArena` выделяются один раз под верхнюю границу (`kArenaMoeDecodeRows = 64` уже покрывает до 8 сессий × `T = 8`); переключение длины верификации на лету выбирает готовый `hipGraphExec_t` **без перезахвата и переинстанциирования графа (`hipGraphInstantiate`)**.
-2. **Снятие отказа `kSplitKAttentionRequired`:**
-   * Сейчас при длине истории выше порога `kSplitKDecodeAttentionMinContext` граф отключается (`ResolveQwenGraphRejections` выставляет `kSplitKAttentionRequired`).
-   * **Решение:** ядра `QwenDecodeSplitKAttentionHalfPartialsKernel` и `ReduceKernel` читают текущую позицию `pos` и границы разбиения из закреплённого device-буфера (`d_decode_step_params`), обновляемого асинхронно перед запуском графа (аналогично [`attention_decode_graph.hip`](../../src/models/qwen/hip/kernels/attention_decode_graph.hip)), при фиксированной сетке `max_splits`. Это сохраняет захват HIP-графа на длинном контексте вплоть до 128K–256K.
+1. **Захват реальных горячих путей `MTP1` и разделение `C1`/`C4`:**
+   * Сейчас единственный `instance_` в `HipGraphDecodeExecutor` используется только в [`ForwardToken`](../../src/models/qwen/hip/decode.cpp#L50-L108) (одиночный `AR`-декод `T = 1`) и **вообще не исполняется при `MTP1`**.
+   * **Этап `T4` (пул графов + урок `TrimRollback` из MIT `Q6dense`):** хранение таблицы слотов `hipGraphExec_t` по ключу `(workload_identity, T, deep)` (где для рабочего `MTP1` `T = 2`, а бакеты/слоты могут покрывать и другие длины пакетов), а также обязательное уничтожение захваченных verifier-графов при уменьшении буферов отката или изменении `RecurrentIoIdentity` (`TrimRollback`, чтобы replay не обращался к освобождённой памяти).
+   * **Этап `T5.1` (`C1`, одна сессия):** захват [`ForwardVerificationBatch`](../../src/models/qwen/hip/batched_decode.cpp#L564) для `items.size() == 1` (`pos + row`) **и** захват шага черновика [`QwenMtpGpuExecutor::Run`](../../src/models/qwen/hip/mtp/executor.cpp#L232).
+   * **Этап `T5.2` (`C4`, мультисеансы, `items.size() > 1`):** поддержка [`ForwardVerificationBatch`](../../src/models/qwen/hip/batched_decode.cpp#L564) и [`ForwardTokenBatch`](../../src/models/qwen/hip/batched_decode.cpp#L236) с массивом per-session device-позиций и указателей арен сеансов (целевой фикс всплесков `27–39 мс` при `C4`). Захват на 2-м прогоне конфигурации с тихим fallback при ошибке без повторных попыток.
+2. **Снятие отказа `kSplitKAttentionRequired` для обоих split-K ядер и порог `512`:**
+   * Сейчас при длине истории выше `kSplitKDecodeAttentionMinContext` граф отключается (`ResolveQwenGraphRejections` выставляет `kSplitKAttentionRequired`). Кроме того, по [`LaunchSplitKAttentionHalfPartials`](../../src/models/qwen/hip/kernels/attention_decode.hip#L923-L956) при `deep = start_pos + 1 >= 512` запускается главное wave64-ядро 35B-A3B [`QwenVerifySplitKAttentionHalfPartialsWave64Kernel<8>`](../../src/models/qwen/hip/kernels/attention_decode_verify_wave64.hip#L24-L29), а при `128 <= seq_len < 512` — [`QwenDecodeSplitKAttentionHalfPartialsKernel`](../../src/models/qwen/hip/kernels/attention_decode.hip#L620-L627).
+   * **Решение:** перевести скаляр `pos` на `const uint32_t*` в **обоих** ядрах (`attention_decode_verify_wave64.hip` и `attention_decode.hip`) и явно включать `deep = start_pos + 1 >= 512` в ключ графа (либо захватывать split-K графы только при `deep == true`), чтобы граф на `200` токенах не запекал более медленный 32-lane путь навсегда. Для передачи позиций **создать новый** pinned host + device-буфер `d_decode_step_params` по образцу `d_pos` в [`WriteKVCachePtrKernel`](../../src/models/qwen/hip/kernels/attention_decode_graph.hip#L14-L32). (`QwenDecodeSplitKAttentionReduceKernel` не принимает `pos`, а `SplitKDecodePartition` уже `__device__ __forceinline__` — их менять не нужно.)
 3. **Предварительный прогрев `hipBLASLt` и MoE:**
    * На старте сервера до приёма первого HTTP-запроса принудительно прогревать планы `hipBLASLt` и `WarmMoeDecode`, чтобы убрать позднюю загрузку ELF-модуля (3,6 МиБ) и двухрежимную паузу 265/315 мс на первом запросе (находка этапа 3 третьего круга).
 
@@ -216,13 +222,11 @@ Offset  Size  Field              Description
 
 ### 3.5. Адаптивная спекуляция под профиль Hermes Agent и OpenCode
 
-С учётом данных записи Hermes Agent v0.22.2 ([DFLASH2_EVAL_PLAN_2026-11-15.md](DFLASH2_EVAL_PLAN_2026-11-15.md)) и Пакета E ([UPSTREAM_PORT.md](UPSTREAM_PORT.md)):
+По итогам Шага 1 ([DFLASH2_STEP1_REPORT_2026-11-17.md](DFLASH2_STEP1_REPORT_2026-11-17.md)) **`DFlash2` закрыт для `Qwen3.6-35B-A3B`** (`tool` медленнее `MTP1` на 8,76–16,13 % по времени хода и на 13,86 % по `decode tok/s`; Шаг 2 отменён). Ветка переключения `MTP1 (</think>) → DFlash2 (JSON/tools)` снята.
 
-1. **Двухфазная природа ответа Hermes (`reasoning_effort: medium`):**
-   * Фаза 1 — русское рассуждение (`<think>...</think>`, проза): здесь DFlash2 проигрывает, оптимален **MTP1**.
-   * Фаза 2 — вызов инструмента (строгий JSON) или `response_format: json_schema` (`aux_title_request.json`): низкая энтропия, предсказуемая структура. Если на шаге 2 оценки DFlash2 покажет выигрыш ≥15 %, контроллер `QwenAutoDraftBackend` переключается на DFlash2 **на границе выхода из `</think>` или при входе в JSON-constraint**, а не вслепую по среднему `tok/s`.
-2. **Защита от размытия экспертов MoE при многопоточности (Cost Gate, Пакет E п. 2):**
-   * При числе активных сеансов `active_slots >= 2` глубина спекуляции жёстко ограничивается `K = 1` (`MTP1`), а решение «включать черновик или делать `target-only` шаг» принимается по измеренной стоимости пакета (замена статического порога `GUFO_MTP_MOE_MAX_COHORT=4`).
+**Целевая задача `T7` (Cost Gate для `MTP1 ↔ AR` на `C2–C8`):**
+* Вместо статического порога `GUFO_MTP_MOE_MAX_COHORT=4` ([`mtp/backend.cpp`](../../src/models/qwen/hip/mtp/backend.cpp#L265-L292)) при числе активных сеансов `active_slots >= 2` контроллер принимает решение «включать `MTP1` или делать `target-only` (`AR`) шаг» по измеренной стоимости пакета и реальному acceptance rate.
+* Усиления при реализации `T7`: проверить порог отсечки неуверенных черновиков (`kMinDraftProbability = 0.5F` по образцу MIT `Q6dense`), рассмотреть чтение маржи top-2 (идея `strixite::MtpPick`) и калибровать пороги офлайн на собранной телеметрии `T2a` + собственной калибровке 35B (без копирования чужих констант `kMtpCycleMilliseconds`).
 
 ---
 
@@ -231,45 +235,50 @@ Offset  Size  Field              Description
 Работы выполняются строго последовательно от закрытия долгов корректности к архитектурным ускорениям. Каждый стендовый шаг — только в согласованное с владельцем окно с сохранённым путём отката на `004d8fa1` / `abbfb006`.
 
 ### Этап 0. Закрытие эксплуатационного и тестового долга `004d8fa1`
-1. **Стендовый отсев DFlash2 против MTP1 на нагрузке Hermes Agent ([DFLASH2_EVAL_PLAN_2026-11-15.md](DFLASH2_EVAL_PLAN_2026-11-15.md)):**
-   * Шаг 1: быстрый отсев `AR vs MTP1 vs DFlash2` на `hermes_synth` (1 поток, greedy; адаптация подачи `tools`). Если DFlash2 на классе `tool` не быстрее MTP1 на ≥15 % — **закрыть тему DFlash2 для 35B** и не тратить время на его доработку.
-   * Шаг 2 (только при успехе шага 1): узкое HTTP-сравнение на C1 и C4 с семейным sampler, раздельным замером холодного/тёплого префикса (~55 тыс. символов), токенов рассуждения и JSON, а также проверкой `aux_title_request.json` (`json_schema`).
+1. **Стендовый отсев DFlash2 против MTP1 на нагрузке Hermes Agent ([DFLASH2_EVAL_PLAN_2026-11-15.md](DFLASH2_EVAL_PLAN_2026-11-15.md)) — ЗАВЕРШЕНО (2026-11-17):**
+   * Шаг 1 выполнен (`004d8fa1`, `C1`, `temperature = 0`, `hermes_synth` + `aux_title_request.json`, отчёт — [DFLASH2_STEP1_REPORT_2026-11-17.md](DFLASH2_STEP1_REPORT_2026-11-17.md)). `DFlash2` уступил `MTP1` на всех 5 случаях `tool` (−8,76 % в Проходе 1, −16,13 % в Проходе 2) и по полному эпизоду (−10,95 % / −13,00 %).
+   * **Итог:** по критерию отказа **тема `DFlash2` для `35B-A3B` закрыта, Шаг 2 не нужен**.
 2. **Доводка квалификации `004d8fa1`:**
-   * Независимое ревью коммитов варианта Б (`158711ad`, `004d8fa1`), удаление недостижимой ветки в `767c6018`, обновление устаревшего `docs/models/qwen3.6-35b-a3b/README.md`.
+   * Синхронизация `ROADMAP_SPEC_01.md` (`T16`) и обновление устаревшего [`docs/models/qwen3.6-35b-a3b/README.md`](../models/qwen3.6-35b-a3b/README.md) выполнены 2026-11-17.
+   * Независимое ревью коммитов варианта Б (`158711ad`, `004d8fa1`), удаление недостижимой ветки в `767c6018`.
    * По решению владельца: часовой прогон памяти на ядре `7.3.4` и проверка реального автозапуска `gufo-faex2.service` при плановой перезагрузке.
 
 ### Этап 1. Телеметрия Hermes, набор оценок качества (50–100 примеров), зрение и API
 1. **Телеметрия реальной нагрузки и прикладной набор качества (План Б развития из [DFLASH2_EVAL_PLAN](DFLASH2_EVAL_PLAN_2026-11-15.md#L57)):**
-   * Включить сбор распределения длин историй, долей рассуждений/вызовов инструментов и попаданий префикса на рабочем сервере под Hermes Agent.
+   * Включить сбор распределения длин историй, долей рассуждений/вызовов инструментов и попаданий префикса на рабочем сервере под Hermes Agent (`T2a`, идея `strixite::capture` — без кода AGPL).
    * Собрать фиксированный набор из **50–100 прикладных задач семейного чата** (русские инструкции, школьные объяснения, таблицы/OCR, многошаговые инструменты Hermes), чтобы оценивать приближения (`sparse`, `Q8_0`, `Q6_K`) по реальной полезности ответов, а не только по `ΔNLL` prefill.
-2. **Приоритеты планировщика и кэш-политика под Hermes:**
-   * В `text_generation_scheduler.cpp` дать приоритет коротким интерактивным запросам перед длинным агентским prefill; изолировать служебный запрос заголовка `aux_title_request.json` от вытеснения длинной сессии; проверить сохранение попаданий в системный префикс (~55 тыс. символов) после сжатия истории самим Hermes.
+2. **Приоритеты планировщика и кэш-политика под Hermes (`T2a`):**
+   * В [`text_generation_scheduler.cpp`](../../src/cli/serve/text_generation_scheduler.cpp) дать приоритет коротким интерактивным запросам перед длинным агентским prefill и уменьшать чанк prefill при активных декодерах (идея `strixite::others_decoding`).
+   * Изолировать служебный запрос заголовка `aux_title_request.json` от записи на диск/вытеснения длинной сессии (идея `strixite::ram_only`), удерживать 55K-префикс при сжатии истории (идея `System`/`Checkpoint` + проверка апстрим-правок `fe2694bc`/`8ab834a5`), логировать обрыв DeltaNet-совпадения (идея `strixite::resume_loss`), кэшировать JSON-схемы (идея `strixite::GrammarCache`).
 3. **Решение по контракту точности `Q1` и падающему тесту `model-vision-serving-mtp`:**
    * Согласовать с владельцем реалистичные допуски `Q1` (с учётом собственного шума арифметики `0,003–0,005`) и устранить расхождение между холодным чтением изображения и продолжением из кэша (35/36 → **36/36 PASS**).
-4. **Крупный текст на изображениях (48–96 pt) и Пакет B (2-я очередь):**
+4. **Крупный текст на изображениях (48–96 pt) и Пакет B (2-я очередь, `T1`/`T2`):**
    * Проверить опциональный даунскейл крупных плашек в предобработке зрения без поломки мелкого экранного текста (`faex2_vision_probes.py`).
-   * Перенести `/tokenize` (`6d793814`) и `input token counts` (`4ab04ab8`) из [UPSTREAM_PORT.md](UPSTREAM_PORT.md).
+   * Перенести вручную `POST /tokenize` (`6d793814`, `T1`) и `input token counts` (`4ab04ab8`, `T2`) из [UPSTREAM_PORT.md](UPSTREAM_PORT.md).
 
 ### Этап 2. Дешёвая проверка `GUFO_QWEN_SPARSE_ATTN=1`, пул HIP-графов и Cost Gate спекуляции
-1. **Проверка готового разреженного внимания (`GUFO_QWEN_SPARSE_ATTN=1`, [DECODE_DEPTH.md](DECODE_DEPTH.md) п. 3):**
-   * Проверить корректность `QwenSparseDecodePartialsKernel<8>` в связке с `MTP1`, замерить скорость на длинах 16K–128K (включая повторное сравнение с `llama.cpp` после `6bcf0c3b`) и оценить ответы на прикладном наборе из 50–100 задач.
-2. **Снятие `kSplitKAttentionRequired` и пул графов `T ∈ {1..8}` (или `T ∈ {1, 2, 4, 8}`) в `HipGraphDecodeExecutor`:**
-   * Перевести параметры split-K (`pos`, `partition`) в device-память для работы графа на длинном контексте; прогревать `hipBLASLt` на старте сервера, чтобы убрать двухрежимную паузу 27–39 мс / 315 мс на первом запросе и в C4.
-3. **Адаптивный контроллер спекуляции (Cost Gate Пакета E):**
-   * Заменить жёсткий порог `GUFO_MTP_MOE_MAX_COHORT` на оценку стоимости; если DFlash2 прошёл Этап 0 — добавить переключение `MTP1 (в <think>) → DFlash2 (в JSON/tool call)` и потоковую запись снимков `StreamPersistent` (≤16 MiB) для DFlash2.
+1. **Проверка готового разреженного внимания (`T15`, `GUFO_QWEN_SPARSE_ATTN=1`, [DECODE_DEPTH.md](DECODE_DEPTH.md) п. 3, 0 строк нового кода):**
+   * Проверить семантику `QwenSparseDecodePartialsKernel<8>` с `MTP1` (`A1`: rollback/границы `8192` и `290` блоков), замерить скорость на 16K–128K (`A2`, ориентир в рабочем `MTP1` **~+26 %**, включая повторное сравнение с `llama.cpp` после `6bcf0c3b`) и оценить ответы на прикладном наборе 50–100 задач.
+2. **Снятие `kSplitKAttentionRequired`, пул графов и профиль `MTP2/3` (`T3–T5b`):**
+   * `T3`: device-`pos` (`d_decode_step_params` по образцу `d_pos` в `WriteKVCachePtrKernel`) для **обоих** split-K ядер (`attention_decode_verify_wave64.hip` с порогом `deep = start_pos + 1 >= 512` и `attention_decode.hip`).
+   * `T4` + `T5a`: пул графов с учётом `deep` и `TrimRollback` (MIT `Q6dense`) + прогрев `hipBLASLt` и `WarmMoeDecode` на старте.
+   * `T5`: раздельно `T5.1` (`C1`: `ForwardVerificationBatch` + `QwenMtpGpuExecutor`) и `T5.2` (`C4`: `ForwardVerificationBatch` + `ForwardTokenBatch` с per-session device-позициями).
+   * `T5b`: профилирование просадки `MTP2/3` на 2–4 потоках (−5..−33 %) и проверка группировки `by_expert` на `down_exps` при `K = 512` (`Q4_K/Q5_K/Q6_K`).
+3. **Адаптивный контроллер спекуляции (`T7`, Cost Gate Пакета E):**
+   * Заменить жёсткий порог `GUFO_MTP_MOE_MAX_COHORT` на динамическую оценку стоимости **`MTP1 ↔ AR` на `C2–C8`** (учитывая отсечку `0.5` из `Q6dense` и идею `MtpPick`/`capture` из `strixite`). Переключение на `DFlash2` и `StreamPersistent` для `DFlash2` сняты.
 
 ### Этап 3 (Условный, по решению владельца). Блочный KV-кэш `Q8_0` и потоковое чтение снимков (`Restore`)
-1. **Потоковое восстановление снимков с диска (`Restore`) и разбор зазора памяти (+4..7,5 ГиБ к `llama.cpp`):**
-   * Убрать чтение полного файла снимка (2,7+ ГиБ) в один буфер RAM при `Restore`.
-2. **Внедрение `QwenKvCacheStorage::kQ8_0` (начинать только если телеметрия подтвердила частые длинные истории, а `GUFO_QWEN_SPARSE_ATTN=1` на Этапе 2 отклонён по качеству):**
-   * Независимый CPU-оракул формата `Q8_0` KV, явный запрет `Q8_0 + sparse`, квантование `K`/`V` на GPU при записи + поддержка `Q8_0` в wave64 split-K ядре (`16 голов на 2`).
+1. **Потоковое восстановление снимков с диска (`Restore`) и разбор зазора памяти (+4..7,5 ГиБ к `llama.cpp`, `T12a`):**
+   * Убрать чтение полного файла снимка (2,7+ ГиБ) в один буфер RAM при `Restore` (zero-copy перенос `snapshot_copy.hip` из MIT `tubo` + идеи `strixite::HostBuffer`/`MemoryGovernor`), изучить `GUFO_DEV_MEMTRIM_9` (инкрементальные 2-МиБ клетки вместо резервации всех `10,00 ГиБ` сразу).
+2. **Внедрение `QwenKvCacheStorage::kQ8_0` (`T8–T12`, начинать только если телеметрия подтвердила частые >32K, а `GUFO_QWEN_SPARSE_ATTN=1` на Этапе 2 отклонён по качеству):**
+   * Ожидаемая экономия на `4 × 131 072`: **4,69 ГиБ (5,03 ГБ)** (`10,00 → 5,31 ГиБ`). Независимый CPU-оракул, `enum` в конец + precision-bound + per-layer таблица (`tubo`), запрет `Q8_0 + sparse`, квантование `K`/`V` на GPU + чтение `Q8_0` в `QwenVerifySplitKAttentionHalfPartialsWave64Kernel<8>` (опора на MIT `Q6dense` без дубля `FP16`, staging на prefill по уроку `strixite::kv8`).
    * Приёмка по процедуре: сравнительная таблица (`FP16` / `sparse` / `Q8_0` / `llama.cpp`) → слепое/независимое прочтение ответов на наборе 50–100 задач → решение владельца → сутки наблюдения на `4 × 131072`.
 
-### Этап 4. Смешанное квантование `Q6_K` dense + `UD-Q4_K_XL` experts и формат `.ghalo`
-1. **Эксперимент точности и скорости `Q6_K` dense/shared + `FP32/BF16` router + `UD-Q4_K_XL` experts (`NinjaPear` / `strixite`):**
-   * Сравнить `ΔNLL`/KL (по методике `Q1`) и скорость prefill/decode против текущего `UD-Q4_K_XL`.
-2. **Кэшируемая перепаковка `.ghalo`:**
-   * Выравнивание тензоров по 128 байтам под `wave32` WMMA и 128-битные загрузки `float4`/`uint4`.
+### Этап 4. Смешанное квантование `Q6_K` dense + `UD-Q4_K_XL` experts (`T14`/`T14b`; `.ghalo` отложено)
+1. **Эксперимент точности и скорости `Q6_K` dense/shared + `FP32/BF16` router + `UD-Q4_K_XL` experts (`T14` GGUF-рецепт + опционально `T14b` MIT-ядра `Q6dense`):**
+   * После проверки лицензий HF и `q6dense.types` сравнить `ΔNLL`/KL (по методике `Q1`), `hermes_synth`, 50–100 задач и скорость prefill/decode против текущего `UD-Q4_K_XL`.
+2. **~~Кэшируемая перепаковка `.ghalo`~~ (ОТЛОЖЕНО по итогам `T16`):**
+   * Не делать до появления профиля, доказывающего нехватку перепаковки при загрузке в память.
 
 ### Этап 5. Гибридный GPU + NPU Prefill (только при закрытии платформенного бага Strix Halo)
 1. При появлении стабильной прошивки без зависания MC28 (или на новом железе Gorgon Halo) — добавить автоотключение при non-finite logits (`649824af`), включить fingerprint `.xclbin` в идентичность кэша и провести безопасный ретест по чек-листу [NPU_MAP.md](NPU_MAP.md) §7.
@@ -284,7 +293,7 @@ Offset  Size  Field              Description
 | --- | --- | --- |
 | **Корректность и тесты** | Набор GPU/CPU/model проверок (`r3-tests`) | **36 из 36 PASS** (включая `model-vision-serving-mtp` после закрытия Этапа 1); 0 ошибок в журнале ядра (`dmesg`/`journalctl`). |
 | **Численное и прикладное качество** | `ΔNLL` / Perplexity, контракт `Q1` и прикладной набор (50–100 задач) | При оптимизациях без смены формата весов — побитовое совпадение либо `Δppl < 0.03 %`; для приближённого prefill — ворота `Q1`; для приближений контекста/весов (`GUFO_QWEN_SPARSE_ATTN`, `Q8_0` KV, `Q6_K`) — CPU-оракул + слепая сверка ответов на наборе из 50–100 семейных/Hermes задач и явное решение владельца. |
-| **Основной клиент (Hermes Agent)** | Набор `hermes_synth` (15 случаев + `aux_title_request.json`) | 100 % валидных вызовов инструментов и JSON-схем; для принятия DFlash2 — сокращение полного времени эпизода **≥ 15 %** на C1 и C4 при прозе не хуже **−5 %**. |
+| **Основной клиент (Hermes Agent)** | Набор `hermes_synth` (15 случаев + `aux_title_request.json`) | 100 % валидных вызовов инструментов и JSON-схем; критерий принятия `DFlash2` (≥ 15 % на `tool` / эпизоде) проверен на Шаге 1 (`DFlash2` закрыт, рабочим остаётся `MTP1`). |
 | **Второй клиент (OpenCode 2.3.0)** | Изолированный `opencode_agent.py` (`tools`, `edit`, `verify`, `mcp`) | **4 из 4 PASS**, `ELIGIBLE`, 100 % настоящих цепочек `вызов → результат → следующий запрос`, 0 утечек служебной разметки. |
 | **Скорость (Prefill / Decode / TTFT)** | Парное сравнение `контроль ↔ кандидат` (2+2 или 4+4 с чередованием) | В каждой затронутой ячейке/фазе: не хуже контроля более чем на **5 % и 3 мс** одновременно (без усреднения запросов). На длинной истории (64K–128K) от `Q8_0` KV и HIP-графов — измеримый прирост `decode tok/s` на C1 и C4. |
 | **Память и 24/7 стабильность** | Часовой прогон `compose --duration 3600` (отсчёт раз в 1 с) | Рост максимума и медианы **RSS, GTT, VRAM и GTT+VRAM ≤ 1 ГиБ** между первыми и последними 20 минутами; 0 потерь активных сеансов при отменах (`cancel`); проверенный возврат на запасной бинарник без пересборки за < 60 с. |

@@ -4,6 +4,15 @@
 
 ## 2026-11-17
 
+### Синхронизация `ROADMAP_SPEC_01` (`T16`) и обновление vision-документации `qwen3.6-35b-a3b`
+
+- [ROADMAP_SPEC_01.md](ROADMAP_SPEC_01.md) обновлён до ревизии 3 по задачам **`T16`** ([BORROW_PLAN_2026-11-17.md](BORROW_PLAN_2026-11-17.md)) и результатам Шага 1 ([DFLASH2_STEP1_REPORT_2026-11-17.md](DFLASH2_STEP1_REPORT_2026-11-17.md)):
+  - по `DFlash2`: в Этапе 0 п. 1, §1.2 п. 3, §2.Б п. 5–6, §3.5 и §4 зафиксировано закрытие `DFlash2` для `35B-A3B` и отмена Шага 2; условный техдолг `DFlash2` снят; в `T7 cost gate` остаётся только `MTP1 ↔ AR` на `C2–C8`;
+  - по HIP-графам (§1.2 п. 1, §3.4): убрана `strixite`, добавлена MIT `Q6dense`, указаны `attention_decode_verify_wave64.hip`, порог `deep = start_pos + 1 >= 512`, `ForwardVerificationBatch` + `QwenMtpGpuExecutor`, разделение `C1`/`C4`, инвалидация при `TrimRollback` и создание `d_decode_step_params` по образцу `d_pos` в `WriteKVCachePtrKernel`;
+  - по MoE, кэшу, `.ghalo` и sparse: закрыта переписка роутинга с нуля при сохранении диагностики `MTP2/3` и `by_expert` при `K = 512`; `.ghalo` отмечен отложенным (§3.1); в §1.2 п. 6 и §3.2 внесены идеи `strixite` (AGPL — только идеи с нуля) и уроки MIT `tubo` (`snapshot_copy.hip`, `GUFO_DEV_MEMTRIM_9`, `enum`/per-layer/offset); выровнены единицы `Q8_0` KV (`10,00 → 5,31 ГиБ`, экономия `4,69 ГиБ / 5,03 ГБ`) и ориентир `GUFO_QWEN_SPARSE_ATTN=1` (~`+26 %` в `MTP1`).
+- В [docs/models/qwen3.6-35b-a3b/README.md](../models/qwen3.6-35b-a3b/README.md) (хвост Этапа 0 п. 2) заменено устаревшее утверждение об отсутствии поддержки изображений: описаны `--mmproj mmproj-BF16.gguf`, fused BF16 WMMA attention (`GUFO_VISION_ATTENTION=tiled`) и открытый статус теста `model-vision-serving-mtp` (35/36).
+- Код C++/HIP и стенд `faex2` не затрагивались; относительные markdown-ссылки в изменённых документах проверены.
+
 ### Шаг 1 оценки DFlash2 против MTP1 на `hermes_synth`: DFlash2 закрыт для `35B-A3B`
 
 - В согласованном окне стенда (`13:27:55`–`13:33:54 MSK`, простой штатного API 359 с, возврат через `systemctl --user start gufo-faex2.service`, READY, `004d8fa1`) выполнен Шаг 1 [DFLASH2_EVAL_PLAN_2026-11-15.md](DFLASH2_EVAL_PLAN_2026-11-15.md) (Этап 0 п. 1 [ROADMAP_SPEC_01.md](ROADMAP_SPEC_01.md)). Код движка не менялся и не пересобирался.

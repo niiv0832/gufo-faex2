@@ -1,8 +1,9 @@
 # Qwen3.6 35B-A3B
 
-Mixture-of-experts text model (256 experts, 8 routed plus a gated shared expert,
+Mixture-of-experts text and vision model (256 experts, 8 routed plus a gated shared expert,
 30 linear-attention and 10 full-attention layers) on gfx1151. The tested weights
-are **UD-Q4_K_XL** (21.5 GiB). Images are not supported by the loader.
+are **UD-Q4_K_XL** (21.5 GiB). Images are supported with the matching `mmproj-BF16.gguf`
+passed via `--mmproj` (see the [Vision section](#vision)).
 
 [Benchmarks](BENCHMARKS.md) · [Quality](QUALITY.md)
 
@@ -14,7 +15,7 @@ nix develop -c hf download unsloth/Qwen3.6-35B-A3B-MTP-GGUF \
 nix build
 MODEL=models/qwen3.6-35b/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf
 ./result/bin/gufo chat --model "$MODEL"
-./result/bin/gufo serve llm --model "$MODEL" --speculative mtp --mtp-model embedded
+./result/bin/gufo serve llm --model "$MODEL" --speculative mtp --mtp-model embedded --mmproj models/qwen3.6-35b/mmproj-BF16.gguf
 ```
 
 | Mode | Selection | Behavior |
@@ -39,6 +40,17 @@ DFlash2, the draft that reports its proposal distribution.
   top-k routing, quantized expert vector kernels and the gated shared expert.
 - **Verification** of drafted tokens batches up to 64 rows through the same
   expert kernels.
+
+## Vision
+
+Pass the matching `mmproj-BF16.gguf` explicitly with `--mmproj` to enable image
+inputs (`qwen35moe.embedding_length == 2048`; without `--mmproj` the vision
+encoder is not loaded). The vision tower runs non-causal fused BF16 WMMA
+attention (16 heads × 72, padded to 80; fallback `GUFO_VISION_ATTENTION=tiled`
+uses hipBLAS BF16 scores). Known limitation in the current baseline: the
+acceptance test `model-vision-serving-mtp` (35/36 suite) still reports a mismatch
+between cached image continuation and cold prefill; see
+[DESIGN.md](../../faex2/DESIGN.md#4-зрение).
 
 ## Block-sparse attention (opt-in)
 
