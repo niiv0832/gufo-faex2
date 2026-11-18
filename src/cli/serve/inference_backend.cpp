@@ -1623,16 +1623,7 @@ public:
   void StreamPersistentSnapshot(const TextRunnerSnapshot& snapshot,
                                 const SnapshotSink& sink) const override {
     const auto expected_bytes = PersistentSnapshotPayloadBytes(snapshot);
-    // Defensive only: PersistentSnapshotPayloadBytes above already rejects a
-    // foreign snapshot with the same exception, so this branch is not reached
-    // today. It keeps the cast checked if that call ever changes.
-    const auto* qwen_snapshot =
-        dynamic_cast<const QwenTextRunnerSnapshot*>(&snapshot);
-    if (qwen_snapshot == nullptr) {
-      throw std::invalid_argument(
-          "Qwen persistent snapshot does not belong to this runner");
-    }
-    const auto& qwen = *qwen_snapshot;
+    const auto& qwen = dynamic_cast<const QwenTextRunnerSnapshot&>(snapshot);
     const auto target_bytes = qwen.snapshot->CompactPayloadBytes();
     const auto verifier_bytes =
         qwen.verifier_snapshot != nullptr
