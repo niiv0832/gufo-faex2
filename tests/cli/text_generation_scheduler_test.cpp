@@ -3917,10 +3917,11 @@ void TestShortPromptPriorityResetsAfterCancelledLongHead() {
   control->ReleaseAdvance();
   control->WaitForPrefill(3);
 
-  // While short_b holds slot 0 in Prefill, cancel queued long_a so short_c
-  // becomes queue head; short_c must admit naturally and reset bypasses.
+  // While short_b holds slot 0 in Prefill, mark queued long_a cancelled
+  // without waiting (the single scheduler thread completes cancellation once
+  // Prefill is released); short_c becomes queue head, admits naturally, and
+  // resets the bypass counter.
   long_a.Cancel();
-  (void)long_a.Wait();
   {
     const std::lock_guard<std::mutex> lock(control->mutex);
     control->block_advance_label = 4;
@@ -3939,6 +3940,7 @@ void TestShortPromptPriorityResetsAfterCancelledLongHead() {
 
   control->ReleaseAdvance();
   (void)active.Wait();
+  (void)long_a.Wait();
   (void)short_b.Wait();
   (void)short_c.Wait();
   (void)long_d.Wait();

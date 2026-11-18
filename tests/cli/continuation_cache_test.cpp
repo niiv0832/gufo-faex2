@@ -2067,12 +2067,12 @@ void TestExactReplacementPreservesInferredBranchPoint() {
          "inferred branch point preserved across exact replacement outlives "
          "non-branch continuations");
 
-  // Explicit kBranchPoint must remain protected across exact replacement even
-  // when a deeper kBranchPoint exists in the same family (IsBranchPoint alone
-  // clears learned=false when superseded by a deeper branch point).
+  // Inferred branch point must preserve kBranchPoint across an exact
+  // replacement even when fits() == true during ReserveSnapshot and a
+  // concurrent request evicts one of the diverging children before Commit.
   {
-    ContinuationCache explicit_cache(
-        1,
+    ContinuationCache race_cache(
+        2,
         [&] { return std::make_unique<FakeState>(next_id++, &invalidations); },
         ContinuationCache::SnapshotSupport{
             .restore =
@@ -2086,63 +2086,66 @@ void TestExactReplacementPreservesInferredBranchPoint() {
         },
         8);
     const Tokens sys{10, 20};
-    const Tokens deep{10, 20, 30, 40};
+    const Tokens child_a{10, 20, 30};
+    const Tokens child_b{10, 20, 40};
     const Tokens filler{50, 51};
-    {
-      auto ls = explicit_cache.Acquire(sys);
-      Expect(ls.TryReserveSnapshot(64, sys.size(), false,
-                                   SnapshotPurpose::kBranchPoint) &&
-                 ls.Commit(sys, std::make_unique<FakeSnapshot>(1, 64)) == 64,
-             "explicit shallow kBranchPoint cached");
-      auto ld = explicit_cache.Acquire(deep);
-      Expect(ld.TryReserveSnapshot(64, deep.size(), false,
-                                   SnapshotPurpose::kBranchPoint) &&
-                 ld.Commit(deep, std::make_unique<FakeSnapshot>(2, 64)) == 64,
-             "deeper kBranchPoint cached");
-    }
-    {
-      auto rep = explicit_cache.Acquire(sys, {}, {}, {}, false);
-      Expect(rep.TryReserveSnapshot(64, sys.size(), false,
-                                    SnapshotPurpose::kContinuation, sys) &&
-                 rep.Commit(sys, std::make_unique<FakeSnapshot>(3, 64)) == 64,
-             "exact replacement of explicit branch point succeeds while deeper "
-             "kBranchPoint is present");
-    }
-    // Pressure 192 bytes leaves 64 bytes; sys (now explicit kBranchPoint, rank
-    // 3) stays after filler or newer unbranched eviction when competing
-    // cleanly, verify sys retains branch priority by replacing deep first
-    // (ancestor? No, fill with 2 more 64-byte continuations so deep is
-    // older/replaced): Wait: both sys and deep are rank 3; rep has newer clock
-    // than deep (so sys outlives deep; check sys has kBranchPoint by evicting a
-    // rank 2 continuation first: add leaf {10, 20, 99} -> deep stays untouched?
-    // Better: publish child of filler {50, 51, 52} -> filler drops to rank 2,
-    // then pressure 128 bytes evicts filler & deep before sys).
-    const Tokens filler_child{50, 51, 52};
-    {
-      auto lf = explicit_cache.Acquire(filler);
-      Expect(lf.TryReserveSnapshot(64, filler.size()) &&
-                 lf.Commit(filler, std::make_unique<FakeSnapshot>(4, 64)) == 64,
-             "filler cached");
-      auto lc = explicit_cache.Acquire(filler_child);
-      Expect(lc.TryReserveSnapshot(64, filler_child.size()) &&
-                 lc.Commit(filler_child,
-                           std::make_unique<FakeSnapshot>(5, 64)) == 64,
-             "filler_child demotes filler to rank 2");
-    }
-    // Now 256 bytes used: sys(rank 3, clock 4), deep(rank 3, clock 2),
-    // filler(rank 2), filler_child(rank 3, clock 6). A 192-byte request evicts
-    // filler (rank 2) + deep (rank 3, clock 2) + sys? Try 128-byte request ->
-    // evicts filler (rank 2) + deep (rank 3, oldest clock), keeping sys!
+    const Tokens filler_tail{50, 51, 52};
     const Tokens big{88, 89};
     {
-      auto lb = explicit_cache.Acquire(big);
-      Expect(lb.TryReserveSnapshot(128, big.size()) &&
-                 lb.Commit(big, std::make_unique<FakeSnapshot>(6, 128)) == 128,
-             "pressure evicts demoted filler and oldest deep branch");
+      auto ls = race_cache.Acquire(sys);
+      Expect(ls.TryReserveSnapshot(64, sys.size(), false,
+                                   SnapshotPurpose::kContinuation) &&
+                 ls.Commit(sys, std::make_unique<FakeSnapshot>(1, 64)) == 64,
+             "sys continuation cached");
+      auto lb = race_cache.Acquire(child_b);
+      Expect(
+          lb.TryReserveSnapshot(64, child_b.size()) &&
+              lb.Commit(child_b, std::make_unique<FakeSnapshot>(2, 64)) == 64,
+          "child_b cached");
+      auto la = race_cache.Acquire(child_a);
+      Expect(
+          la.TryReserveSnapshot(64, child_a.size()) &&
+              la.Commit(child_a, std::make_unique<FakeSnapshot>(3, 64)) == 64,
+          "child_a cached");
     }
-    Expect(explicit_cache.CachedPrefixTokens(sys) == sys.size(),
-           "explicit kBranchPoint stays retained when replaced under deeper "
-           "kBranchPoint");
+    // Now sys=64, child_b=64, child_a=64 (192/256 used). Reserve exact
+    // replacement of sys while fits()==true: ReserveSnapshot upgrades its
+    // purpose to kBranchPoint immediately.
+    auto rep = race_cache.Acquire(sys, {}, {}, {}, false);
+    Expect(rep.TryReserveSnapshot(64, sys.size(), false,
+                                  SnapshotPurpose::kContinuation, sys),
+           "exact replacement reserves while fits()==true");
+    // Before rep commits (reserved=64 -> used=256), concurrent request takes
+    // 64 bytes: evicts oldest rank-3 leaf child_b, leaving only child_a!
+    {
+      auto lf = race_cache.Acquire(filler);
+      Expect(lf.TryReserveSnapshot(64, filler.size()) &&
+                 lf.Commit(filler, std::make_unique<FakeSnapshot>(4, 64)) == 64,
+             "concurrent request evicts one diverging child before Commit");
+    }
+    Expect(
+        rep.Commit(sys, std::make_unique<FakeSnapshot>(5, 64)) == 64,
+        "exact replacement commits kBranchPoint even after child_b eviction");
+    // Now sys(64, kBranchPoint), child_a(64), filler(64): total 192. Extend
+    // filler -> filler_tail(64), then commit big(128) -> must evict rank-2
+    // filler and older leaves before sys!
+    {
+      auto lft = race_cache.Acquire(filler_tail);
+      Expect(lft.TryReserveSnapshot(64, filler_tail.size()) &&
+                 lft.Commit(filler_tail,
+                            std::make_unique<FakeSnapshot>(6, 64)) == 64,
+             "filler_tail fills remaining 64 bytes");
+    }
+    {
+      auto lbig = race_cache.Acquire(big);
+      Expect(
+          lbig.TryReserveSnapshot(128, big.size()) &&
+              lbig.Commit(big, std::make_unique<FakeSnapshot>(7, 128)) == 128,
+          "big commits under pressure");
+    }
+    Expect(race_cache.CachedPrefixTokens(sys) == sys.size(),
+           "sys branch point preserved between ReserveSnapshot and Commit "
+           "outlives leaves under pressure");
   }
 }
 

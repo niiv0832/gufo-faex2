@@ -2484,14 +2484,15 @@ void TestGrammarCachesUseLruAndRetain24ToolSchemas() {
                                    false, false, Format::kQwen) != toolsets[1]);
 
   // TokenConstraint::masks_ uses 16-entry LRU while always keeping
-  // initial_state_. Create 16 distinct enum choices ("a00".."p15") so each
-  // prefix after opening quote + first letter has a distinct
+  // initial_state_. Create 16 distinct enum choices ("a0".."p15") inside an
+  // object root so each prefix after {"v":" + first letter has a distinct
   // CanonicalMaskState.
-  auto enum_schema = parse(R"({"type":"string","enum":[]})");
+  auto enum_schema = parse(
+      R"({"type":"object","properties":{"v":{"type":"string","enum":[]}},"required":["v"],"additionalProperties":false})");
   for (int i = 0; i < 16; ++i) {
     const std::string tag =
         std::string(1, static_cast<char>('a' + i)) + std::to_string(i);
-    enum_schema["enum"].push_back(tag);
+    enum_schema["properties"]["v"]["enum"].push_back(tag);
   }
   TokenConstraint binding;
   binding.grammar = JsonConstraint::Compile(enum_schema, true);
@@ -2502,7 +2503,11 @@ void TestGrammarCachesUseLruAndRetain24ToolSchemas() {
       });
   const auto initial = binding.grammar->Start();
   const auto initial_mask = binding.Allowed(initial);
-  const auto quote_state = binding.grammar->Advance(initial, '"');
+  auto quote_state = initial;
+  for (const unsigned char byte : std::string_view(R"({"v":")")) {
+    quote_state = binding.grammar->Advance(quote_state, byte);
+    assert(!quote_state.empty());
+  }
   std::vector<JsonConstraint::State> states;
   std::vector<std::shared_ptr<const std::vector<std::uint8_t>>> masks;
   for (int i = 0; i < 16; ++i) {
