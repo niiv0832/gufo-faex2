@@ -1543,18 +1543,12 @@ void TestLayeredPrefillKeepsCheckpointAfterSharedArrival() {
     }
     const auto events = control->Events();
     const auto first_pass = EventIndex(events, EventKind::kPrefill, 1);
-    const auto second_pass = EventIndex(events, EventKind::kPrefill, 1, 2048);
-    const std::size_t first_pass_yields =
-        first_pass < second_pass && second_pass < events.size()
-            ? static_cast<std::size_t>(std::count_if(
-                  events.begin() + first_pass, events.begin() + second_pass,
-                  [](const Event& event) {
-                    return event.kind == EventKind::kYield && event.label == 1;
-                  }))
-            : 0;
-    Expect(first_pass != events.size() && second_pass != events.size() &&
+    const auto first_yield = EventIndex(events, EventKind::kYield, 1);
+    const auto second_pass = EventIndex(events, EventKind::kPrefill, 1, 1);
+    Expect(first_pass != events.size() && first_yield < second_pass &&
                events[first_pass].index == 0 &&
-               events[first_pass].count == 2048 && first_pass_yields == 7 &&
+               events[first_pass].count == 2048 &&
+               events[first_yield].count == 8 &&
                (shared_arrival ? leader_result.max_prefill_layer_groups >= 8
                                : leader_result.max_prefill_layer_groups == 8),
            "the original pass finishes at the planned 2048-token checkpoint");
