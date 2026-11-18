@@ -1220,7 +1220,8 @@ void TestSystemPrefixBoundaryReportedForPromptCaching() {
       {.name = "read_file",
        .description = "Read file bytes.",
        .parameters_json =
-           R"({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]})"},
+           R"({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]})",
+       .definition_json = {}},
   };
   ChatTemplateOptions options;
   options.add_generation_prompt = true;
