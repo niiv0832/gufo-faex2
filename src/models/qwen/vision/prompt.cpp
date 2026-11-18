@@ -254,10 +254,11 @@ Prompt Prepare(const tokenization::QwenTokenizer& tokenizer,
   std::vector<std::size_t> offsets;
   std::vector<tokenization::ContentSpan> content_spans;
   std::size_t stable_prefix_bytes = 0;
+  std::size_t system_prefix_bytes = 0;
   std::string error;
   const auto rendered = tokenization::QwenChatTemplate::Render(
       messages, tools, options, &error, &offsets, &stable_prefix_bytes,
-      &content_spans);
+      &content_spans, &system_prefix_bytes);
   if (!rendered)
     throw std::invalid_argument(error);
   Prompt prompt;
@@ -322,6 +323,17 @@ Prompt Prepare(const tokenization::QwenTokenizer& tokenizer,
       !std::ranges::equal(suffix, std::span(prompt.tokens).last(suffix.size())))
     throw std::logic_error("Qwen stable prefix is not a token boundary");
   prompt.stable_prefix_tokens = prompt.tokens.size() - suffix.size();
+  if (system_prefix_bytes > 0 &&
+      (offsets.empty() || system_prefix_bytes <= offsets.front())) {
+    const auto sys_tokens = tokenization::QwenChatTemplate::EncodeRendered(
+        tokenizer, *rendered, 0, system_prefix_bytes, content_spans,
+        tok_options);
+    if (sys_tokens.size() <= prompt.tokens.size() &&
+        std::ranges::equal(sys_tokens,
+                           std::span(prompt.tokens).first(sys_tokens.size()))) {
+      prompt.system_prefix_tokens = sys_tokens.size();
+    }
+  }
   prompt.rope.Validate(max_context);
   if (!prompt.images.empty()) {
     const auto digest = identity.Finish();

@@ -635,7 +635,7 @@ void TestInPassFailureRetainsOnlyCompletedCheckpoints() {
   new_branch.Invalidate();
 }
 
-class PersistentSnapshotRunner final : public SnapshotRunner {
+class PersistentSnapshotRunner : public SnapshotRunner {
 public:
   std::function<void()> before_serialize;
   PersistentSnapshotRunner(std::shared_ptr<FakeStats> stats,
@@ -2913,20 +2913,216 @@ void TestPromptDivergencePosition() {
   }
 }
 
+class LargeContextSnapshotRunner final : public PersistentSnapshotRunner {
+public:
+  using PersistentSnapshotRunner::PersistentSnapshotRunner;
+  bool enable_in_pass{false};
+
+  [[nodiscard]] TextRunnerDescriptor Descriptor() const override {
+    auto d = PersistentSnapshotRunner::Descriptor();
+    d.capabilities.in_pass_checkpoint = enable_in_pass;
+    return d;
+  }
+
+  std::optional<std::size_t> PrefillCheckpointBytes(
+      const TextRunnerState&, std::span<const TextRunnerToken> prompt,
+      std::size_t offset, std::size_t budget,
+      std::size_t boundary) const override {
+    if (!enable_in_pass || boundary <= offset ||
+        boundary >= std::min(prompt.size(), offset + budget))
+      return std::nullopt;
+    return sizeof(FakeSnapshot);
+  }
+
+  TextPrefillStep PrefillThrough(
+      TextRunnerState& state, std::span<const TextRunnerToken> prompt,
+      std::size_t offset, std::size_t budget, std::size_t boundary,
+      std::unique_ptr<TextRunnerSnapshot>* checkpoint, bool) const override {
+    ++stats_->snapshot_captures;
+    *checkpoint = std::make_unique<FakeSnapshot>(boundary, 0, 90);
+    auto step =
+        PersistentSnapshotRunner::Prefill(state, prompt, offset, budget);
+    step.checkpoint_ms = 2;
+    return step;
+  }
+};
+
+void TestSystemPrefixRetainedAsRamBranchPointAndSurvivesCompaction() {
+  TemporaryDirectory directory;
+  const TextRunnerDiskCacheOptions disk_cache{
+      .directory = directory.path(),
+      .capacity_bytes = 64 * 1024,
+      .staging_capacity_bytes = 8192,
+      .shared_prefix_min_tokens = 128,
+      .shared_prefix_max_boundaries = 4,
+      .min_checkpoint_step_tokens = 0,
+  };
+  // Tight RAM budget fits 2 FakeSnapshots: Turn 1 captures [sys(600), turn1],
+  // then Turn 2 extends turn1 -> [turn1(rank 2), sys(rank 3)]. Under 2-slot
+  // capacity, Turn 2 must keep sys(600) (kBranchPoint) instead of evicting it
+  // as redundant kHistory, so the subsequent compacted turn hits 600 tokens.
+  // Single cold start must also NOT persist sys(600) to disk (shared == false).
+  auto stats = std::make_shared<FakeStats>();
+  auto runner = std::make_shared<LargeContextSnapshotRunner>(
+      stats, "sys-branch-v1", 2 * sizeof(FakeSnapshot), 4096);
+  TextRunnerPool pool(runner, 1, disk_cache);
+
+  constexpr std::size_t kSysLen = 600;
+  std::vector<TextRunnerToken> sys(kSysLen);
+  for (std::size_t i = 0; i < kSysLen; ++i)
+    sys[i] = static_cast<TextRunnerToken>(1000 + i);
+
+  std::vector<TextRunnerToken> turn1 = sys;
+  for (std::size_t i = 0; i < 120; ++i)
+    turn1.push_back(static_cast<TextRunnerToken>(2000 + i));
+
+  std::uint64_t shared_disk_writes = 0;
+  {
+    auto req1 = pool.Acquire(turn1, {}, {}, {}, /*reuse_prompt=*/true,
+                             /*cache_prefix_tokens=*/0, /*stop_at_eos=*/true,
+                             /*ram_only=*/false,
+                             /*system_prefix_tokens=*/kSysLen);
+    while (!req1.prefill_complete())
+      (void)req1.Prefill(4096);
+    const auto metrics = req1.Commit();
+    shared_disk_writes += metrics.shared_prefix_snapshots;
+  }
+  Expect(shared_disk_writes == 0,
+         "single cold start does not persist system_prefix checkpoint to disk");
+  Expect(pool.CachedPrefixTokens(turn1, nullptr) == turn1.size(),
+         "cold start retains turn1 in RAM");
+
+  // Turn 2 extends turn1 in the same 2-snapshot budget, forcing eviction of
+  // either sys(600) or turn1(720). kBranchPoint(sys) must survive turn1.
+  std::vector<TextRunnerToken> turn2 = turn1;
+  for (std::size_t i = 0; i < 60; ++i)
+    turn2.push_back(static_cast<TextRunnerToken>(3000 + i));
+  {
+    auto req2 = pool.Acquire(turn2, {}, {}, {}, true, 0, true, false, kSysLen);
+    while (!req2.prefill_complete())
+      (void)req2.Prefill(4096);
+    (void)req2.Commit();
+  }
+
+  // Compaction request replaces dialogue after kSysLen while keeping system
+  // block.
+  std::vector<TextRunnerToken> compacted = sys;
+  for (std::size_t i = 0; i < 80; ++i)
+    compacted.push_back(static_cast<TextRunnerToken>(90000 + i));
+  auto req_compacted =
+      pool.Acquire(compacted, {}, {}, {}, true, 0, true, false, kSysLen);
+  Expect(req_compacted.cache_hit() &&
+             req_compacted.cached_prompt_tokens() == kSysLen,
+         "compacted dialogue restores system kBranchPoint after turn eviction");
+  req_compacted.Invalidate();
+}
+
+void TestSystemPrefixCoincidentWithSnapshotPositionAndRamOnlyExclusion() {
+  constexpr std::size_t kSysLen = 600;
+  std::vector<TextRunnerToken> sys(kSysLen);
+  for (std::size_t i = 0; i < kSysLen; ++i)
+    sys[i] = static_cast<TextRunnerToken>(100 + i);
+
+  std::vector<TextRunnerToken> prompt = sys;
+  for (std::size_t i = 0; i < 20; ++i)
+    prompt.push_back(static_cast<TextRunnerToken>(5000 + i));
+
+  // Case 1 & 2: system_prefix_tokens == cache_prefix_tokens (snapshot_position)
+  // both with and without in_pass_checkpoint retains kBranchPoint priority.
+  for (const bool in_pass : {false, true}) {
+    auto stats = std::make_shared<FakeStats>();
+    auto runner = std::make_shared<LargeContextSnapshotRunner>(
+        stats, "coincident-v1", 2 * sizeof(FakeSnapshot), 4096);
+    runner->enable_in_pass = in_pass;
+    TextRunnerPool pool(runner, 1);
+
+    auto r1 =
+        pool.Acquire(prompt, {}, {}, {}, true, kSysLen, true, false, kSysLen);
+    while (!r1.prefill_complete())
+      (void)r1.Prefill(4096);
+    (void)r1.Commit();
+
+    // Publish an unrelated prompt occupying slot 2 (1 slot stays free? 2 total:
+    // r1 had prompt+sys merged into snapshot_position kSysLen plus full prompt,
+    // wait: budget is 2*FakeSnapshot, so inserting 1 unrelated prompt leaves
+    // kBranchPoint(kSysLen) protected ahead of r1's kRetry tail).
+    std::vector<TextRunnerToken> other{7, 8, 9, 10};
+    auto r2 = pool.Acquire(other);
+    (void)r2.Prefill(64);
+    (void)r2.Commit();
+
+    std::vector<TextRunnerToken> compacted = sys;
+    compacted.push_back(9999);
+    auto r3 =
+        pool.Acquire(compacted, {}, {}, {}, true, 0, true, false, kSysLen);
+    Expect(r3.cache_hit() && r3.cached_prompt_tokens() == kSysLen,
+           in_pass ? "coincident in_pass system checkpoint retains kBranchPoint"
+                   : "coincident StartPromptSnapshot system checkpoint retains "
+                     "kBranchPoint");
+    r3.Invalidate();
+  }
+
+  // Case 3: ram_only request must NOT retain a kBranchPoint at system_prefix.
+  {
+    auto stats = std::make_shared<FakeStats>();
+    auto runner = std::make_shared<LargeContextSnapshotRunner>(
+        stats, "ram-only-sys-v1", 2 * sizeof(FakeSnapshot), 4096);
+    TextRunnerPool pool(runner, 1);
+    auto r_aux = pool.Acquire(prompt, {}, {}, {}, true, 0, true,
+                              /*ram_only=*/true, kSysLen);
+    while (!r_aux.prefill_complete())
+      (void)r_aux.Prefill(4096);
+    (void)r_aux.Commit();
+
+    // Ordinary request needs 2 slots? Even 1 ordinary request evicts ram_only
+    // or at least r_aux must never promote kSysLen as an ordinary kBranchPoint.
+    std::vector<TextRunnerToken> ord{42, 43, 44};
+    auto r_ord = pool.Acquire(ord);
+    (void)r_ord.Prefill(64);
+    (void)r_ord.Commit();
+    auto r_ord2 = pool.Acquire(std::vector<TextRunnerToken>{52, 53, 54});
+    (void)r_ord2.Prefill(64);
+    (void)r_ord2.Commit();
+
+    std::vector<TextRunnerToken> compacted = sys;
+    compacted.push_back(8888);
+    Expect(pool.CachedPrefixTokens(compacted, nullptr) == 0,
+           "ram_only request does not leave protected ordinary system branch");
+  }
+
+  // Case 4: HostSnapshotLimits matches legacy single-value helpers.
+  const auto limits = gufo::server::HostSnapshotLimits();
+  Expect(
+      limits.budget_bytes == static_cast<std::size_t>(std::min<std::uint64_t>(
+                                 limits.available_bytes / 2,
+                                 std::numeric_limits<std::size_t>::max())),
+      "HostSnapshotLimits computes half of available_bytes");
+  const std::uint64_t expected_ceiling =
+      limits.available_bytes > gufo::server::kHostSnapshotHeadroomBytes
+          ? limits.available_bytes - gufo::server::kHostSnapshotHeadroomBytes
+          : 0;
+  Expect(limits.ceiling_bytes ==
+             static_cast<std::size_t>(std::min<std::uint64_t>(
+                 expected_ceiling, std::numeric_limits<std::size_t>::max())),
+         "HostSnapshotLimits computes ceiling minus headroom");
+}
+
 }  // namespace
 
 int main() {
+  // Log assertions match plain "[INFO]" / "[WARN]" text captured from a
+  // redirected sink; a TTY stderr tints it on the first Logger call.
+  ::setenv("NO_COLOR", "1", 1);
   TestPrefixMatchSurvivesDiskRestore();
   TestPromptDivergencePosition();
+  TestSystemPrefixRetainedAsRamBranchPointAndSurvivesCompaction();
+  TestSystemPrefixCoincidentWithSnapshotPositionAndRamOnlyExclusion();
   TestRamOnlyChatClassification();
   TestRamOnlyUsesFinalPreparedLength();
   TestRamOnlyNeverUsesDiskStore();
   TestPromptCountingValidatesCapabilitiesBeforeInference();
   TestServerInstructionsAreFraming();
   TestPreparedConstraintVocabularyKeepsGrammarBehavior();
-  // The cache warning assertion in this binary matches the plain "[WARN]
-  // [cache]" text captured from a redirected sink; a TTY stderr tints it.
-  ::setenv("NO_COLOR", "1", 1);
   TestInPassStableCheckpoint();
   TestInPassFailureRetainsOnlyCompletedCheckpoints();
   TestNewImageGetsAStableCheckpoint();

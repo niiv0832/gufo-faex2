@@ -616,11 +616,13 @@ std::optional<std::string> QwenChatTemplate::Render(
     std::span<const ChatMessage> messages, std::span<const ChatTool> tools,
     const ChatTemplateOptions& options, std::string* error_msg,
     std::vector<std::size_t>* image_offsets, std::size_t* stable_prefix_bytes,
-    std::vector<ContentSpan>* content_spans) {
+    std::vector<ContentSpan>* content_spans, std::size_t* system_prefix_bytes) {
   if (image_offsets != nullptr)
     image_offsets->clear();
   if (content_spans != nullptr)
     content_spans->clear();
+  if (system_prefix_bytes != nullptr)
+    *system_prefix_bytes = 0;
   if (messages.empty()) {
     if (error_msg != nullptr) {
       *error_msg = "No messages provided";
@@ -735,6 +737,8 @@ std::optional<std::string> QwenChatTemplate::Render(
       for (const auto& span : system_spans)
         content_spans->push_back({prefix_offset + span.offset, span.size});
     }
+    if (system_prefix_bytes != nullptr)
+      *system_prefix_bytes = output.size();
   }
 
   std::size_t last_user_index = messages.size();

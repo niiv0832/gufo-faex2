@@ -250,7 +250,8 @@ public:
       const ChatTemplateOptions& options = {}, std::string* error_msg = nullptr,
       std::vector<std::size_t>* image_offsets = nullptr,
       std::size_t* stable_prefix_bytes = nullptr,
-      std::vector<ContentSpan>* content_spans = nullptr);
+      std::vector<ContentSpan>* content_spans = nullptr,
+      std::size_t* system_prefix_bytes = nullptr);
 
   /// Formats messages and tokenizes the rendered prompt with the given
   /// tokenizer.

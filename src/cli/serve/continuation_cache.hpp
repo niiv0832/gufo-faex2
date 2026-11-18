@@ -119,6 +119,13 @@ struct ContinuationPrefixMatch {
   bool input_matches{false};
 };
 
+struct HostMemoryStatus {
+  std::uint64_t available_bytes{0};
+  std::uint64_t headroom_bytes{0};
+};
+
+using HostMemoryProbe = std::function<std::optional<HostMemoryStatus>()>;
+
 /// Bounded exact-prefix cache over opaque model continuation states.
 ///
 /// The first deployment uses one entry. Supporting a bounded entry count here
@@ -136,6 +143,7 @@ public:
     SnapshotRestore restore;
     SnapshotCapacity capacity_bytes;
     SnapshotEventSink on_event;
+    HostMemoryProbe host_memory;
   };
 
   class Lease {

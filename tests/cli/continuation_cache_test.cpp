@@ -1853,6 +1853,221 @@ void TestPrefixMatchSurvivesPartialHitAndDiskRestore() {
   }
 }
 
+void TestMemoryGovernorAdaptsWithoutDoubleCountingRetained() {
+  using namespace gufo::server;
+  using Tokens = std::vector<ContinuationToken>;
+  std::vector<std::size_t> invalidations(4);
+  std::size_t next_id = 0;
+
+  // 1. Empty cache (retained == 0) matches HostSnapshotCeilingBytes:
+  //    safe_total = available - headroom.
+  {
+    HostMemoryStatus mem{.available_bytes = 500, .headroom_bytes = 400};
+    ContinuationCache cache(
+        1,
+        [&] { return std::make_unique<FakeState>(next_id++, &invalidations); },
+        ContinuationCache::SnapshotSupport{
+            .restore =
+                [](ContinuationState& state,
+                   const ContinuationSnapshot& snapshot) {
+                  dynamic_cast<FakeState&>(state).value =
+                      dynamic_cast<const FakeSnapshot&>(snapshot).value;
+                },
+            .capacity_bytes = [] { return std::size_t{1000}; },
+            .on_event = {},
+            .host_memory = [&mem] { return std::optional{mem}; },
+        },
+        4);
+    auto over_empty = cache.Acquire(Tokens{3, 4});
+    Expect(!over_empty.TryReserveSnapshot(101, 2),
+           "empty cache rejects reservation exceeding effective ceiling");
+    over_empty.Invalidate();
+
+    auto fit = cache.Acquire(Tokens{1, 2});
+    Expect(fit.TryReserveSnapshot(100, 2) &&
+               fit.Commit(Tokens{1, 2},
+                          std::make_unique<FakeSnapshot>(1, 100)) == 100,
+           "empty cache admits up to available - headroom (100 bytes)");
+    // After committing 100 bytes, real host available drops by 100 -> 400.
+    mem.available_bytes = 400;
+    auto over_full = cache.Acquire(Tokens{5, 6});
+    Expect(!over_full.TryReserveSnapshot(101, 2),
+           "reservation exceeding safe_total cannot fit even by evicting "
+           "100-byte entry");
+    over_full.Invalidate();
+  }
+
+  // 2. Non-shrinking check when available_bytes > headroom + delta:
+  //    retained=500 is already reflected in available=450, so safe_total =
+  //    (450 + 500) - 400 = 550 allows a delta=40 addition without evicting the
+  //    existing 500-byte snapshot.
+  // 3. Under genuine pressure (available drops to 350 < headroom=400), one
+  //    probe before eviction computes effective_capacity=490 and evicts LRU.
+  {
+    HostMemoryStatus mem{.available_bytes = 1200, .headroom_bytes = 400};
+    std::size_t probe_count = 0;
+    std::vector<SnapshotEvent> events;
+    ContinuationCache cache(
+        1,
+        [&] { return std::make_unique<FakeState>(next_id++, &invalidations); },
+        ContinuationCache::SnapshotSupport{
+            .restore =
+                [](ContinuationState& state,
+                   const ContinuationSnapshot& snapshot) {
+                  dynamic_cast<FakeState&>(state).value =
+                      dynamic_cast<const FakeSnapshot&>(snapshot).value;
+                },
+            .capacity_bytes = [] { return std::size_t{1000}; },
+            .on_event =
+                [&](const SnapshotEvent& event) { events.push_back(event); },
+            .host_memory = [&]() -> std::optional<HostMemoryStatus> {
+              ++probe_count;
+              return mem;
+            },
+        },
+        6);
+
+    const Tokens p1{10, 11};
+    const Tokens p2{20, 21};
+    {
+      auto l1 = cache.Acquire(p1);
+      Expect(l1.TryReserveSnapshot(250, p1.size()) &&
+                 l1.Commit(p1, std::make_unique<FakeSnapshot>(10, 250)) == 250,
+             "first retained chunk admitted");
+      auto l2 = cache.Acquire(p2);
+      Expect(l2.TryReserveSnapshot(250, p2.size()) &&
+                 l2.Commit(p2, std::make_unique<FakeSnapshot>(20, 250)) == 250,
+             "second retained chunk admitted");
+    }
+
+    // available=450 > headroom(400) + delta(40): must NOT evict p1 or p2.
+    mem = {.available_bytes = 450, .headroom_bytes = 400};
+    probe_count = 0;
+    const Tokens p3{30, 31};
+    {
+      auto l3 = cache.Acquire(p3);
+      Expect(l3.TryReserveSnapshot(40, p3.size()),
+             "delta=40 fits under safe_total = 450 + 500 - 400 = 550");
+      Expect(probe_count == 1, "ReserveSnapshot probes host memory once");
+      Expect(l3.Commit(p3, std::make_unique<FakeSnapshot>(30, 40)) == 40,
+             "small addition commits under adjusted host headroom");
+    }
+    Expect(cache.CachedPrefixTokens(p1) == p1.size() &&
+               cache.CachedPrefixTokens(p2) == p2.size() &&
+               cache.CachedPrefixTokens(p3) == p3.size(),
+           "no retained snapshots evicted when available > headroom + delta");
+
+    // Host drops below headroom: available=350, retained=540 -> safe_total=490.
+    // Reserving 100 bytes needs used <= 390, so one 250-byte entry (p1) must
+    // be evicted (540 -> 290, leaving 290+100=390 <= 490) in one probe.
+    mem = {.available_bytes = 350, .headroom_bytes = 400};
+    probe_count = 0;
+    const Tokens p4{40, 41};
+    {
+      auto l4 = cache.Acquire(p4);
+      Expect(l4.TryReserveSnapshot(100, p4.size()),
+             "reservation succeeds after dynamic pressure eviction");
+      Expect(probe_count == 1,
+             "host memory probed once per ReserveSnapshot eviction loop");
+      Expect(l4.Commit(p4, std::make_unique<FakeSnapshot>(40, 100)) == 100,
+             "new snapshot commits within dynamically lowered capacity");
+    }
+    Expect(
+        cache.CachedPrefixTokens(p1) == 0 &&
+            cache.CachedPrefixTokens(p2) == p2.size() &&
+            cache.CachedPrefixTokens(p3) == p3.size() &&
+            cache.CachedPrefixTokens(p4) == p4.size(),
+        "pressure evicts only oldest snapshot needed to stay under headroom");
+    bool reported_dynamic_cap = false;
+    for (const auto& e : events) {
+      if (e.capacity_bytes == 490)
+        reported_dynamic_cap = true;
+    }
+    Expect(reported_dynamic_cap,
+           "eviction event records effective dynamic capacity");
+  }
+}
+
+void TestExactReplacementPreservesInferredBranchPoint() {
+  using namespace gufo::server;
+  using Tokens = std::vector<ContinuationToken>;
+  std::vector<std::size_t> invalidations(4);
+  std::size_t next_id = 0;
+  // Tight 256-byte pool with 8 record slots so RemovalPriority decides
+  // eviction: base=64, branch_a=64, branch_b=64, non_branch=64 (total 256).
+  ContinuationCache cache(
+      2, [&] { return std::make_unique<FakeState>(next_id++, &invalidations); },
+      ContinuationCache::SnapshotSupport{
+          .restore =
+              [](ContinuationState& state,
+                 const ContinuationSnapshot& snapshot) {
+                dynamic_cast<FakeState&>(state).value =
+                    dynamic_cast<const FakeSnapshot&>(snapshot).value;
+              },
+          .capacity_bytes = [] { return std::size_t{256}; },
+          .on_event = {},
+      },
+      8);
+
+  const Tokens base{1, 2, 3};
+  const Tokens branch_a{1, 2, 3, 4};
+  const Tokens branch_b{1, 2, 3, 5};
+  const Tokens non_branch{9, 9};
+
+  // Publish base as kContinuation, then create two diverging children so
+  // IsBranchPoint(base) is inferred true even before an explicit kBranchPoint.
+  {
+    auto l = cache.Acquire(base);
+    Expect(l.TryReserveSnapshot(64, base.size(), false,
+                                SnapshotPurpose::kContinuation) &&
+               l.Commit(base, std::make_unique<FakeSnapshot>(1, 64)) == 64,
+           "base retained");
+  }
+  {
+    auto la = cache.Acquire(branch_a);
+    Expect(la.TryReserveSnapshot(64, branch_a.size()) &&
+               la.Commit(branch_a, std::make_unique<FakeSnapshot>(2, 64)) == 64,
+           "branch_a retained");
+    auto lb = cache.Acquire(branch_b);
+    Expect(lb.TryReserveSnapshot(64, branch_b.size()) &&
+               lb.Commit(branch_b, std::make_unique<FakeSnapshot>(3, 64)) == 64,
+           "branch_b retained");
+  }
+  // Exact uncached replacement of base while branch_a and branch_b diverge at
+  // it must promote base to SnapshotPurpose::kBranchPoint.
+  {
+    auto rep = cache.Acquire(base, {}, {}, {}, /*reuse_prompt=*/false);
+    Expect(rep.TryReserveSnapshot(64, base.size(), false,
+                                  SnapshotPurpose::kContinuation, base) &&
+               rep.Commit(base, std::make_unique<FakeSnapshot>(4, 64)) == 64,
+           "exact replacement commits base");
+  }
+  // Fill remaining 64 bytes with non_branch (priority 2 continuation), then
+  // evict one leaf (branch_a) via incoming request {7,7} so base has only one
+  // child remaining yet stays kBranchPoint (priority 3 vs non_branch priority
+  // 2).
+  {
+    auto lnb = cache.Acquire(non_branch);
+    Expect(
+        lnb.TryReserveSnapshot(64, non_branch.size()) &&
+            lnb.Commit(non_branch, std::make_unique<FakeSnapshot>(5, 64)) == 64,
+        "non_branch fills 256-byte budget");
+  }
+  // Incoming 128-byte entry must evict branch_a and branch_b / non_branch
+  // before touching the promoted base branch point.
+  const Tokens intruder{7, 7, 7};
+  {
+    auto li = cache.Acquire(intruder);
+    Expect(
+        li.TryReserveSnapshot(128, intruder.size()) &&
+            li.Commit(intruder, std::make_unique<FakeSnapshot>(6, 128)) == 128,
+        "intruder commits under byte pressure");
+  }
+  Expect(cache.CachedPrefixTokens(base) == base.size(),
+         "inferred branch point preserved across exact replacement outlives "
+         "non-branch continuations");
+}
+
 int main() {
   TestPrefixMatchSurvivesPartialHitAndDiskRestore();
   TestRamOnlyKeepsLongConversation();
@@ -1889,6 +2104,8 @@ int main() {
   TestReplacedSourceDoesNotEvictAnotherBranchTail();
   TestCacheCandidateDetailIsDebugTierOnly();
   TestWaitingAcquireReportsCandidateSkips();
+  TestMemoryGovernorAdaptsWithoutDoubleCountingRetained();
+  TestExactReplacementPreservesInferredBranchPoint();
   std::cout << "All continuation cache tests passed\n";
   return 0;
 }

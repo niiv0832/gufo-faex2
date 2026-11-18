@@ -968,8 +968,31 @@ bool ContinuationCache::ReserveSnapshot(
     return impl_->VictimRank(candidate, ram_only, incoming, input_identity,
                              max_priority);
   };
+  const std::optional<HostMemoryStatus> host_memory =
+      impl_->snapshot_support.host_memory
+          ? impl_->snapshot_support.host_memory()
+          : std::nullopt;
   {
     const std::lock_guard<std::mutex> lock(impl_->mutex);
+    std::size_t effective_capacity = impl_->snapshot_capacity_bytes;
+    if (host_memory.has_value()) {
+      const std::uint64_t retained =
+          static_cast<std::uint64_t>(impl_->retained_snapshot_bytes);
+      const std::uint64_t total_with_retained =
+          host_memory->available_bytes <=
+                  std::numeric_limits<std::uint64_t>::max() - retained
+              ? host_memory->available_bytes + retained
+              : std::numeric_limits<std::uint64_t>::max();
+      const std::uint64_t safe_total_u64 =
+          total_with_retained > host_memory->headroom_bytes
+              ? total_with_retained - host_memory->headroom_bytes
+              : 0;
+      const std::size_t safe_total =
+          safe_total_u64 > std::numeric_limits<std::size_t>::max()
+              ? std::numeric_limits<std::size_t>::max()
+              : static_cast<std::size_t>(safe_total_u64);
+      effective_capacity = std::min(effective_capacity, safe_total);
+    }
     const auto make_event = [&](SnapshotEventAction action,
                                 SnapshotEventReason reason, std::size_t bytes,
                                 std::size_t tokens) {
@@ -980,14 +1003,14 @@ bool ContinuationCache::ReserveSnapshot(
           .token_count = tokens,
           .retained_snapshot_bytes = impl_->retained_snapshot_bytes,
           .reserved_snapshot_bytes = impl_->reserved_snapshot_bytes,
-          .capacity_bytes = impl_->snapshot_capacity_bytes,
+          .capacity_bytes = effective_capacity,
       };
     };
     const auto fits = [&] {
       const std::size_t used =
           impl_->retained_snapshot_bytes + impl_->reserved_snapshot_bytes;
-      return snapshot_bytes != 0 && used <= impl_->snapshot_capacity_bytes &&
-             snapshot_bytes <= impl_->snapshot_capacity_bytes - used;
+      return snapshot_bytes != 0 && used <= effective_capacity &&
+             snapshot_bytes <= effective_capacity - used;
     };
 
     // Publishing a retained prefix again replaces that copy, so reclaim it
@@ -1076,9 +1099,8 @@ bool ContinuationCache::ReserveSnapshot(
 
       const bool can_fit_after_eviction =
           snapshot_bytes != 0 &&
-          impl_->reserved_snapshot_bytes <= impl_->snapshot_capacity_bytes &&
-          snapshot_bytes <=
-              impl_->snapshot_capacity_bytes - impl_->reserved_snapshot_bytes;
+          impl_->reserved_snapshot_bytes <= effective_capacity &&
+          snapshot_bytes <= effective_capacity - impl_->reserved_snapshot_bytes;
       const auto remove = [&](std::size_t target, SnapshotEventReason reason) {
         auto& entry = *impl_->entries[target];
         const std::size_t removed_bytes = entry.snapshot_bytes;
@@ -1096,7 +1118,7 @@ bool ContinuationCache::ReserveSnapshot(
       };
       while (can_fit_after_eviction && !fits()) {
         if (exact < impl_->entries.size() && impl_->entries[exact]->valid) {
-          if (impl_->entries[exact]->purpose == SnapshotPurpose::kBranchPoint)
+          if (!ram_only && impl_->IsBranchPoint(exact))
             purpose = SnapshotPurpose::kBranchPoint;
           remove(exact, SnapshotEventReason::kExactReplacement);
           continue;
@@ -1345,10 +1367,10 @@ std::size_t ContinuationCache::Commit(
         if (retain_snapshot && target != no_entry) {
           auto& snapshot_entry = *impl_->entries[target];
           // Republishing the same prefix, as an uncached request for exactly
-          // a learned branch point does, keeps the learned divergence.
+          // a branch point does, keeps the divergence marked as a branch point
+          // unless the replacement comes from a ram_only request.
           const bool learned =
-              exact_replacement &&
-              snapshot_entry.purpose == SnapshotPurpose::kBranchPoint;
+              exact_replacement && !ram_only && impl_->IsBranchPoint(target);
           if (snapshot_entry.snapshot != nullptr) {
             const std::size_t removed_bytes = snapshot_entry.snapshot_bytes;
             const std::size_t removed_tokens = snapshot_entry.tokens.size();

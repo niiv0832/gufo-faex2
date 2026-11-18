@@ -194,22 +194,28 @@ namespace {
 
 /// Host RAM still available, after cgroup limits. Unified-memory device
 /// allocations draw from the same RAM, so HIP's device capacity is not used.
-std::uint64_t HostAvailableBytes() {
+std::optional<std::uint64_t> ProbeHostAvailableBytes() {
+  std::optional<std::uint64_t> available;
   const long pages = sysconf(_SC_AVPHYS_PAGES);
   const long page_size = sysconf(_SC_PAGESIZE);
-  if (pages <= 0 || page_size <= 0)
-    return 0;
-  std::uint64_t available = std::uint64_t(pages) * page_size;
+  if (pages > 0 && page_size > 0)
+    available = std::uint64_t(pages) * page_size;
   std::ifstream meminfo("/proc/meminfo");
   std::ostringstream meminfo_text;
   meminfo_text << meminfo.rdbuf();
   if (const auto parsed = MeminfoAvailableBytes(meminfo_text.str()))
     available = *parsed;
+  if (!available.has_value())
+    return std::nullopt;
   std::ifstream membership("/proc/self/cgroup");
   std::ostringstream membership_text;
   membership_text << membership.rdbuf();
   return CgroupAvailableBytes("/sys/fs/cgroup", membership_text.str(),
-                              available);
+                              *available);
+}
+
+std::uint64_t HostAvailableBytes() {
+  return ProbeHostAvailableBytes().value_or(0);
 }
 
 std::size_t ClampToSize(std::uint64_t bytes) {
@@ -219,15 +225,23 @@ std::size_t ClampToSize(std::uint64_t bytes) {
 
 }  // namespace
 
+HostSnapshotMemoryLimits HostSnapshotLimits() {
+  const auto available = HostAvailableBytes();
+  return {
+      .budget_bytes = ClampToSize(available / 2),
+      .ceiling_bytes = ClampToSize(available > kHostSnapshotHeadroomBytes
+                                       ? available - kHostSnapshotHeadroomBytes
+                                       : 0),
+      .available_bytes = available,
+  };
+}
+
 std::size_t HostSnapshotBudgetBytes() {
-  return ClampToSize(HostAvailableBytes() / 2);
+  return HostSnapshotLimits().budget_bytes;
 }
 
 std::size_t HostSnapshotCeilingBytes() {
-  const auto available = HostAvailableBytes();
-  return ClampToSize(available > kHostSnapshotHeadroomBytes
-                         ? available - kHostSnapshotHeadroomBytes
-                         : 0);
+  return HostSnapshotLimits().ceiling_bytes;
 }
 
 namespace {
@@ -239,6 +253,7 @@ struct ValidatedRunner {
   std::vector<TextExecutionPlan> plans;
   std::size_t snapshot_automatic_bytes{0};
   std::size_t snapshot_max_bytes{0};
+  bool monitor_host_memory{false};
 };
 
 std::optional<std::size_t> PerStateReservationBytes(
@@ -592,6 +607,8 @@ ContinuationCache::SnapshotSupport MakeSnapshotSupport(
                 TextRunnerRamCacheOptions::kAutomaticMaxBytes, automatic);
             validated->snapshot_max_bytes =
                 resources.retained_snapshot_ceiling_bytes.value_or(automatic);
+            validated->monitor_host_memory =
+                resources.retained_snapshot_ceiling_bytes.has_value();
             if (options.capacity_bytes == 0)
               return validated->snapshot_automatic_bytes;
             // An explicit limit is the operator's choice to trade headroom
@@ -600,6 +617,17 @@ ContinuationCache::SnapshotSupport MakeSnapshotSupport(
                             validated->snapshot_max_bytes);
           },
       .on_event = EmitSnapshotEvent,
+      .host_memory = [validated]() -> std::optional<HostMemoryStatus> {
+        if (!validated->monitor_host_memory)
+          return std::nullopt;
+        const auto available = ProbeHostAvailableBytes();
+        if (!available.has_value())
+          return std::nullopt;
+        return HostMemoryStatus{
+            .available_bytes = *available,
+            .headroom_bytes = kHostSnapshotHeadroomBytes,
+        };
+      },
   };
 }
 
@@ -854,7 +882,8 @@ struct TextRunnerPool::Request::Impl {
        std::vector<std::size_t> shared_prefix_boundaries,
        const sampling::SamplingConfig& sampling_config,
        std::shared_ptr<const TextPromptContext> prompt_context,
-       std::size_t cache_prefix_tokens, bool overlap_snapshots)
+       std::size_t cache_prefix_tokens, bool overlap_snapshots,
+       std::size_t system_prefix_tokens = 0)
       : runner(std::move(model_runner)),
         disk_store(std::move(persistent_store)),
         lease(std::move(state_lease)),
@@ -924,6 +953,20 @@ struct TextRunnerPool::Request::Impl {
             !lease.HasSnapshotFor(
                 std::span<const TextRunnerToken>(prompt).first(position)))
           checkpoints.push_back(position);
+      }
+      if (system_prefix_tokens >= Request::kSystemCheckpointMinTokens &&
+          system_prefix_tokens > prefill_offset &&
+          system_prefix_tokens < prompt.size() &&
+          !lease.HasSnapshotFor(std::span<const TextRunnerToken>(prompt).first(
+              system_prefix_tokens))) {
+        system_checkpoint = system_prefix_tokens;
+        if (system_prefix_tokens != snapshot_tokens.size() &&
+            system_prefix_tokens != stable_prefix_position &&
+            !std::ranges::binary_search(checkpoints, system_prefix_tokens)) {
+          checkpoints.insert(
+              std::ranges::upper_bound(checkpoints, system_prefix_tokens),
+              system_prefix_tokens);
+        }
       }
     }
   }
@@ -1031,14 +1074,17 @@ struct TextRunnerPool::Request::Impl {
 
     retain_snapshot = false;
     try {
+      const auto purpose =
+          snapshot_tokens.size() == system_checkpoint
+              ? SnapshotPurpose::kBranchPoint
+              : (retain_fallback && snapshot_tokens.size() == prompt.size()
+                     ? SnapshotPurpose::kRetry
+                     : SnapshotPurpose::kContinuation);
       retain_snapshot = lease.TryReserveSnapshot(
           snapshot_bytes, snapshot_tokens.size(),
           retain_fallback && (fallback_position == 0 ||
                               snapshot_tokens.size() == prompt.size()),
-          retain_fallback && snapshot_tokens.size() == prompt.size()
-              ? SnapshotPurpose::kRetry
-              : SnapshotPurpose::kContinuation,
-          snapshot_tokens);
+          purpose, snapshot_tokens);
     } catch (...) {
       return;
     }
@@ -1283,6 +1329,8 @@ struct TextRunnerPool::Request::Impl {
   std::vector<std::size_t> checkpoints;
   /// Checkpoints shared with other requests, retained like continuations.
   std::vector<std::size_t> shared_checkpoints;
+  /// Dedicated system-prompt boundary retained as kBranchPoint on cold start.
+  std::size_t system_checkpoint{0};
   /// End of the prefill pass now executing; zero between passes. A position
   /// inside the pass can no longer become a boundary of its own.
   std::size_t executing_end{0};
@@ -1527,10 +1575,13 @@ TextPrefillStep TextRunnerPool::Request::Prefill(std::size_t max_input_tokens,
         state, impl_->prompt, impl_->prefill_offset, max_input_tokens,
         snapshot_position);
     if (bytes) {
+      const auto purpose = snapshot_position == impl_->system_checkpoint
+                               ? SnapshotPurpose::kBranchPoint
+                               : SnapshotPurpose::kContinuation;
       in_pass = impl_->lease.TryReserveSnapshot(
           *bytes, snapshot_position,
-          impl_->retain_fallback && impl_->fallback_position == 0,
-          SnapshotPurpose::kContinuation, impl_->snapshot_tokens);
+          impl_->retain_fallback && impl_->fallback_position == 0, purpose,
+          impl_->snapshot_tokens);
       if (in_pass) {
         impl_->snapshot_bytes = *bytes;
         impl_->retain_snapshot = true;
@@ -1638,9 +1689,12 @@ TextPrefillStep TextRunnerPool::Request::Prefill(std::size_t max_input_tokens,
       history &&
       std::ranges::find(impl_->shared_checkpoints, impl_->prefill_offset) !=
           impl_->shared_checkpoints.end();
+  const bool is_system_checkpoint =
+      history && impl_->system_checkpoint != 0 &&
+      impl_->prefill_offset == impl_->system_checkpoint;
   if ((history || shared) && impl_->prefill_offset != snapshot_position)
     impl_->CaptureBoundarySnapshot(impl_->prefill_offset, history, shared,
-                                   shared_with_peers
+                                   (shared_with_peers || is_system_checkpoint)
                                        ? SnapshotPurpose::kBranchPoint
                                        : SnapshotPurpose::kHistory);
   return step;
@@ -2044,7 +2098,8 @@ TextRunnerPool::Request TextRunnerPool::Acquire(
     const sampling::SamplingConfig& sampling_config,
     const CancellationCheck& is_cancelled,
     std::shared_ptr<const TextPromptContext> context, bool reuse_prompt,
-    std::size_t cache_prefix_tokens, bool stop_at_eos, bool ram_only) {
+    std::size_t cache_prefix_tokens, bool stop_at_eos, bool ram_only,
+    std::size_t system_prefix_tokens) {
   sampling_config.Validate();
   if (prompt.empty()) {
     throw std::invalid_argument("text runner prompt must not be empty");
@@ -2054,6 +2109,8 @@ TextRunnerPool::Request TextRunnerPool::Acquire(
   }
   if (cache_prefix_tokens > prompt.size())
     throw std::invalid_argument("cache prefix exceeds prompt length");
+  if (system_prefix_tokens > prompt.size())
+    throw std::invalid_argument("system prefix exceeds prompt length");
 
   std::unique_lock admission(impl_->admission_mutex, std::defer_lock);
   while (!admission.try_lock_for(std::chrono::milliseconds(10))) {
@@ -2184,7 +2241,8 @@ TextRunnerPool::Request TextRunnerPool::Acquire(
   Request request(std::make_unique<Request::Impl>(
       impl_->validated.runner, disk_store, std::move(lease), std::move(prompt),
       std::move(boundaries), sampling_config, std::move(context),
-      cache_prefix_tokens, impl_->cache.capacity() > 1));
+      cache_prefix_tokens, impl_->cache.capacity() > 1,
+      (reuse_prompt && !ram_only) ? system_prefix_tokens : 0));
   // Prompts that diverge from a retained one after a long common prefix,
   // such as new conversations under one system prompt, publish a checkpoint
   // at the divergence point. Later prompts sharing it restore it exactly

@@ -41,6 +41,8 @@ struct TextPreparedPrompt {
   std::shared_ptr<const TextPromptContext> context;
   /// Snapshot before mutable assistant framing. Zero uses the complete prompt.
   std::size_t cache_prefix_tokens{0};
+  /// Token boundary after the rendered system block (and tools), when present.
+  std::size_t system_prefix_tokens{0};
 };
 
 struct TextRunnerRamCacheOptions {
@@ -94,6 +96,15 @@ inline constexpr std::uint64_t kHostSnapshotHeadroomBytes = std::uint64_t{4}
 /// Most an explicit --cache-ram-bytes may claim: available host RAM minus
 /// kHostSnapshotHeadroomBytes.
 [[nodiscard]] std::size_t HostSnapshotCeilingBytes();
+
+struct HostSnapshotMemoryLimits {
+  std::size_t budget_bytes{0};
+  std::size_t ceiling_bytes{0};
+  std::uint64_t available_bytes{0};
+};
+
+/// Reads host RAM and cgroup headroom once and derives both snapshot limits.
+[[nodiscard]] HostSnapshotMemoryLimits HostSnapshotLimits();
 
 enum class TextExecutionPlanKind : std::uint8_t {
   kSerial,
@@ -577,6 +588,9 @@ public:
     /// can already restore before it waits for a peer or captures an extra
     /// checkpoint for later requests. Shorter gaps cost less to prefill again.
     static constexpr std::size_t kSharedPrefixMinTokens = 512;
+    /// System prompt + tools shorter than this are cheap enough to re-prefill
+    /// on compaction without holding a dedicated RAM branch point.
+    static constexpr std::size_t kSystemCheckpointMinTokens = 512;
 
     void PrepareBatchExecution();
     /// With `yield`, a runner that advertises layered prefill splits the pass
@@ -639,7 +653,8 @@ public:
       const CancellationCheck& is_cancelled = {},
       std::shared_ptr<const TextPromptContext> context = {},
       bool reuse_prompt = true, std::size_t cache_prefix_tokens = 0,
-      bool stop_at_eos = true, bool ram_only = false);
+      bool stop_at_eos = true, bool ram_only = false,
+      std::size_t system_prefix_tokens = 0);
   [[nodiscard]] Request Acquire(std::vector<TextRunnerToken> prompt,
                                 const CancellationCheck& is_cancelled = {});
   /// Longest RAM-retained prefix of prompt that Acquire could reuse, without

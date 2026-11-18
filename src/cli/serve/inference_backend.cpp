@@ -136,8 +136,9 @@ TextPreparedPrompt PrepareQwenPrompt(
           encoder && has_images ? encoder->identity() : std::string_view{},
           max_context));
   const auto cache_prefix = prompt->stable_prefix_tokens;
+  const auto system_prefix = prompt->system_prefix_tokens;
   if (prompt->images.empty())
-    return {std::move(prompt->tokens), {}, cache_prefix};
+    return {std::move(prompt->tokens), {}, cache_prefix, system_prefix};
   if (!encoder)
     throw std::invalid_argument(
         "image input requires a matching --mmproj BF16 sidecar");
@@ -149,7 +150,7 @@ TextPreparedPrompt PrepareQwenPrompt(
         {image.grid.offset, {identity.begin(), identity.end()}});
   }
   context->prompt = prompt;
-  return {prompt->tokens, std::move(context), cache_prefix};
+  return {prompt->tokens, std::move(context), cache_prefix, system_prefix};
 }
 
 std::shared_ptr<const models::qwen::vision::Prompt> QwenPrompt(
@@ -1165,8 +1166,9 @@ public:
     // Snapshot buffers are device allocations, but on a unified-memory APU
     // they are carved from the same RAM as every host allocation, and HIP's
     // free figure does not see host pressure. Cap them by the host budget too.
-    std::size_t snapshot_capacity = HostSnapshotBudgetBytes();
-    std::size_t snapshot_ceiling = HostSnapshotCeilingBytes();
+    const auto host_limits = HostSnapshotLimits();
+    std::size_t snapshot_capacity = host_limits.budget_bytes;
+    std::size_t snapshot_ceiling = host_limits.ceiling_bytes;
     if (hipMemGetInfo(&free_bytes, &total_bytes) == hipSuccess) {
       snapshot_capacity = std::min(snapshot_capacity, free_bytes);
       snapshot_ceiling = std::min(snapshot_ceiling, free_bytes);
@@ -4687,6 +4689,7 @@ struct InferenceBackend::Impl {
       std::string client_id,
       std::shared_ptr<const TextPromptContext> context = {},
       bool cache_prompt = true, std::size_t cache_prefix_tokens = 0,
+      std::size_t system_prefix_tokens = 0,
       const std::vector<std::string>& stop_sequences = {},
       InitialOutputState initial = InitialOutputState::kContent,
       bool ram_only = false) const {
@@ -4711,6 +4714,7 @@ struct InferenceBackend::Impl {
             .prompt_context = std::move(context),
             .cache_prompt = cache_prompt,
             .cache_prefix_tokens = cache_prefix_tokens,
+            .system_prefix_tokens = system_prefix_tokens,
             .stop_sequences = stop_sequences,
             .ram_only = ram_only,
         });
@@ -5869,7 +5873,7 @@ InferenceBackend::Result InferenceBackend::complete(
   return impl_->GenerateScheduled(
       state, std::move(prompt_tokens), request_start, max_tokens,
       sampling_config, is_cancelled, on_token, std::string(client_id), {},
-      cache_prompt, 0, stop_sequences);
+      cache_prompt, 0, 0, stop_sequences);
 #else
   (void)cache_prompt;
   (void)client_id;
@@ -5913,7 +5917,8 @@ InferenceBackend::Result InferenceBackend::chat(
       state, std::move(prompt->tokens), request_start, max_tokens,
       effective_sampling, is_cancelled, on_token, request.client_id,
       std::move(prompt->context), request.cache_prompt,
-      prompt->cache_prefix_tokens, request.stop_sequences, initial, ram_only);
+      prompt->cache_prefix_tokens, prompt->system_prefix_tokens,
+      request.stop_sequences, initial, ram_only);
 #else
   (void)request;
   (void)max_tokens;
@@ -6007,6 +6012,7 @@ InferenceBackend::start_chat(const ChatRequest& request, std::size_t max_tokens,
           .prompt_context = std::move(prompt->context),
           .cache_prompt = request.cache_prompt,
           .cache_prefix_tokens = prompt->cache_prefix_tokens,
+          .system_prefix_tokens = prompt->system_prefix_tokens,
           .stop_sequences = request.stop_sequences,
           .return_progress = request.return_progress,
           .ram_only = ram_only,

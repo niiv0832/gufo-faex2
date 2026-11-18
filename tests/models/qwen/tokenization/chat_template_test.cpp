@@ -1194,6 +1194,94 @@ void TestStableBoundaryPrecedesReplacedFinalUserTurn() {
          "opening turn keeps the boundary before the generation prompt");
 }
 
+void TestSystemPrefixBoundaryReportedForPromptCaching() {
+  using gufo::tokenization::ChatMessage;
+  using gufo::tokenization::ChatRole;
+  using gufo::tokenization::ChatTemplateOptions;
+  using gufo::tokenization::ChatTool;
+  using gufo::tokenization::QwenChatTemplate;
+
+  std::vector<std::string> vocab;
+  for (int i = 0; i < 256; ++i)
+    vocab.emplace_back(1, static_cast<char>(i));
+  vocab.emplace_back(kImStart);
+  vocab.emplace_back(kImEnd);
+  std::unordered_map<std::string, gufo::tokenization::TokenId> specials = {
+      {std::string(kImStart), 256},
+      {std::string(kImEnd), 257},
+  };
+  std::string tok_err;
+  const auto tokenizer =
+      gufo::tokenization::QwenTokenizer::CreateFromVocabulary(
+          vocab, {}, specials, &tok_err);
+  Expect(tokenizer != nullptr,
+         "System prefix test tokenizer initialized: " + tok_err);
+  const std::vector<ChatTool> tools = {
+      {.name = "read_file",
+       .description = "Read file bytes.",
+       .parameters_json =
+           R"({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]})"},
+  };
+  ChatTemplateOptions options;
+  options.add_generation_prompt = true;
+
+  std::size_t sys_bytes_a = 0;
+  std::size_t sys_bytes_b = 0;
+  const std::vector<ChatMessage> conv_a = {
+      {ChatRole::kSystem, "Follow project rules."},
+      {ChatRole::kUser, "Summarize module A."},
+  };
+  const std::vector<ChatMessage> conv_b = {
+      {ChatRole::kSystem, "Follow project rules."},
+      {ChatRole::kUser, "Compacted summary of earlier work."},
+      {ChatRole::kAssistant, "Ready."},
+      {ChatRole::kUser, "Continue with module B."},
+  };
+  const auto rendered_a = QwenChatTemplate::Render(
+      conv_a, tools, options, nullptr, nullptr, nullptr, nullptr, &sys_bytes_a);
+  const auto rendered_b = QwenChatTemplate::Render(
+      conv_b, tools, options, nullptr, nullptr, nullptr, nullptr, &sys_bytes_b);
+  Expect(rendered_a.has_value() && rendered_b.has_value(),
+         "conversations with system and tools render");
+  Expect(sys_bytes_a > 0 && sys_bytes_a == sys_bytes_b &&
+             sys_bytes_a < rendered_a->size() &&
+             rendered_a->substr(0, sys_bytes_a) ==
+                 rendered_b->substr(0, sys_bytes_b) &&
+             rendered_a->compare(sys_bytes_a, 12, "<|im_start|>") == 0,
+         "system_prefix_bytes covers identical system+tools header right "
+         "before user turn");
+
+  const auto prepared_a = gufo::models::qwen::vision::Prepare(
+      *tokenizer, conv_a, tools, options, {}, 4096);
+  const auto prepared_b = gufo::models::qwen::vision::Prepare(
+      *tokenizer, conv_b, tools, options, {}, 4096);
+  Expect(
+      prepared_a.system_prefix_tokens > 0 &&
+          prepared_a.system_prefix_tokens == prepared_b.system_prefix_tokens &&
+          prepared_a.system_prefix_tokens < prepared_a.tokens.size() &&
+          std::ranges::equal(std::span(prepared_a.tokens)
+                                 .first(prepared_a.system_prefix_tokens),
+                             std::span(prepared_b.tokens)
+                                 .first(prepared_b.system_prefix_tokens)),
+      "vision::Prepare matches system_prefix_tokens across compacted history");
+
+  // Without a system prompt, tools, or injected reasoning instruction,
+  // system_prefix_bytes and tokens stay zero.
+  std::size_t no_sys_bytes = 99;
+  ChatTemplateOptions no_sys_options = options;
+  no_sys_options.enable_thinking = false;
+  const std::vector<ChatMessage> no_sys = {{ChatRole::kUser, "Hello"}};
+  const auto rendered_no_sys =
+      QwenChatTemplate::Render(no_sys, {}, no_sys_options, nullptr, nullptr,
+                               nullptr, nullptr, &no_sys_bytes);
+  Expect(rendered_no_sys.has_value() && no_sys_bytes == 0,
+         "render without system block reports zero system_prefix_bytes");
+  const auto prepared_no_sys = gufo::models::qwen::vision::Prepare(
+      *tokenizer, no_sys, {}, no_sys_options, {}, 4096);
+  Expect(prepared_no_sys.system_prefix_tokens == 0,
+         "vision::Prepare reports zero system_prefix_tokens when absent");
+}
+
 }  // namespace
 
 int main() {
@@ -1218,6 +1306,7 @@ int main() {
   TestToolReplayPreservesGeneratedPrefix();
   TestEmptyReasoningReplayChangesThinkingSuffixTokens();
   TestStableBoundaryPrecedesReplacedFinalUserTurn();
+  TestSystemPrefixBoundaryReportedForPromptCaching();
   std::cout << "All QwenChatTemplate tests passed successfully!\n";
   return 0;
 }
