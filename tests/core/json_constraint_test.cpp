@@ -2417,6 +2417,57 @@ void TestQwenFrameNewlineIsNotACloser() {
   }
 }
 
+void TestGrammarCachesUseLruAndRetain24ToolSchemas() {
+  using Format = JsonConstraint::ToolFormat;
+  // ToolParameters holds up to 64 entries so a Hermes-sized tool list (> 16
+  // tools) does not thrash on every request.
+  std::vector<gufo::json::Value> tool_schemas;
+  std::vector<std::shared_ptr<const JsonConstraint>> tool_grammars;
+  for (int i = 0; i < 24; ++i) {
+    auto schema = parse(R"({"type":"object","properties":{},
+      "additionalProperties":false})");
+    schema["properties"]["tool_lru_arg_" + std::to_string(i)] =
+        parse(R"({"type":"string"})");
+    tool_grammars.push_back(
+        JsonConstraint::ToolParameters(schema, false, Format::kQwen));
+    tool_schemas.push_back(std::move(schema));
+  }
+  for (int i = 0; i < 24; ++i) {
+    assert(JsonConstraint::ToolParameters(tool_schemas[i], false,
+                                          Format::kQwen) == tool_grammars[i]);
+  }
+
+  // Compile keeps 16 entries with true LRU eviction (touching index 0 moves it
+  // to MRU so inserting index 16 evicts index 1 rather than index 0).
+  std::vector<gufo::json::Value> schemas;
+  std::vector<std::shared_ptr<const JsonConstraint>> compiled;
+  for (int i = 0; i <= 16; ++i) {
+    const std::string field = "compile_lru_" + std::to_string(i);
+    auto schema = parse(R"({"type":"object","properties":{},
+      "additionalProperties":false})");
+    schema["properties"][field] = parse(R"({"type":"integer"})");
+    schema["required"] = gufo::json::Value::array();
+    schema["required"].push_back(field);
+    schemas.push_back(std::move(schema));
+  }
+  for (int i = 0; i < 16; ++i)
+    compiled.push_back(JsonConstraint::Compile(schemas[i], true));
+  assert(JsonConstraint::Compile(schemas[0], true) == compiled[0]);
+  const auto g16 = JsonConstraint::Compile(schemas[16], true);
+  assert(g16 != nullptr);
+  assert(JsonConstraint::Compile(schemas[0], true) == compiled[0]);
+  assert(JsonConstraint::Compile(schemas[1], true) != compiled[1]);
+
+  // WithReasoning also uses 16-entry LRU keyed on base grammar.
+  std::vector<std::shared_ptr<const JsonConstraint>> reasoned;
+  for (int i = 0; i < 16; ++i)
+    reasoned.push_back(JsonConstraint::WithReasoning(compiled[i]));
+  assert(JsonConstraint::WithReasoning(compiled[0]) == reasoned[0]);
+  (void)JsonConstraint::WithReasoning(g16);
+  assert(JsonConstraint::WithReasoning(compiled[0]) == reasoned[0]);
+  assert(JsonConstraint::WithReasoning(compiled[1]) != reasoned[1]);
+}
+
 int main(int argc, char** argv) {
   // Batch probes for the independent Python JSON Schema validator. This
   // exercises the production byte matcher without requiring model weights.
@@ -2476,6 +2527,7 @@ int main(int argc, char** argv) {
   TestNativeToolSchemaMatrix();
   TestLlamaCppToolGrammarGoldens();
   TestQwenFrameNewlineIsNotACloser();
+  TestGrammarCachesUseLruAndRetain24ToolSchemas();
   std::cout << "JSON constraints: language, schema, Unicode and sampler checks "
                "passed\n";
 }

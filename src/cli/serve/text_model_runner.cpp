@@ -792,10 +792,14 @@ struct TextRunnerPool::Impl {
 std::shared_ptr<const sampling::TokenConstraint>
 TextModelRunner::BindConstraint(
     std::shared_ptr<const sampling::JsonConstraint> grammar) const {
+  constexpr std::size_t kMaxBoundConstraints = 16;
   const std::lock_guard lock(constraint_mutex_);
-  for (const auto& binding : constraints_)
-    if (binding->grammar == grammar)
-      return binding;
+  for (auto it = constraints_.begin(); it != constraints_.end(); ++it) {
+    if ((*it)->grammar == grammar) {
+      std::rotate(it, it + 1, constraints_.end());
+      return constraints_.back();
+    }
+  }
   if (!constraint_vocabulary_)
     constraint_vocabulary_ = BuildConstraintVocabulary();
   if (!constraint_vocabulary_)
@@ -803,7 +807,7 @@ TextModelRunner::BindConstraint(
   auto binding = std::make_shared<sampling::TokenConstraint>();
   binding->grammar = std::move(grammar);
   binding->vocabulary = constraint_vocabulary_;
-  if (constraints_.size() >= 4)
+  if (constraints_.size() >= kMaxBoundConstraints)
     constraints_.erase(constraints_.begin());
   constraints_.push_back(binding);
   return binding;

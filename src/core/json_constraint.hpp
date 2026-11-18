@@ -141,11 +141,14 @@ struct TokenConstraint {
       const JsonConstraint::State& state) const;
 
 private:
+  struct MaskEntry {
+    std::shared_ptr<const std::vector<std::uint8_t>> mask;
+    std::uint64_t last_used{0};
+  };
   mutable std::mutex mutex_;
+  mutable std::uint64_t mask_clock_{0};
   mutable JsonConstraint::State initial_state_;
-  mutable std::map<JsonConstraint::State,
-                   std::shared_ptr<const std::vector<std::uint8_t>>>
-      masks_;
+  mutable std::map<JsonConstraint::State, MaskEntry> masks_;
 };
 
 }  // namespace gufo::sampling

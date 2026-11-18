@@ -3107,6 +3107,46 @@ void TestSystemPrefixCoincidentWithSnapshotPositionAndRamOnlyExclusion() {
          "HostSnapshotLimits computes ceiling minus headroom");
 }
 
+void TestBindConstraintUses16EntryLru() {
+  class VocabFakeRunner final : public FakeRunner {
+  public:
+    using FakeRunner::FakeRunner;
+    [[nodiscard]] std::shared_ptr<const gufo::sampling::ConstraintVocabulary>
+    BuildConstraintVocabulary() const override {
+      return std::make_shared<gufo::sampling::ConstraintVocabulary>(
+          256, [](std::uint32_t id) {
+            return gufo::sampling::ConstraintVocabulary::Piece{
+                std::string(1, static_cast<char>(id)), false};
+          });
+    }
+  };
+  auto stats = std::make_shared<FakeStats>();
+  const VocabFakeRunner runner(stats, 64, 256, 256);
+
+  std::vector<std::shared_ptr<const gufo::sampling::JsonConstraint>> grammars;
+  std::vector<std::shared_ptr<const gufo::sampling::TokenConstraint>> bound;
+  for (int i = 0; i <= 16; ++i) {
+    const std::string field = "bind_lru_" + std::to_string(i);
+    auto schema = gufo::json::parse(
+        R"({"type":"object","properties":{},"additionalProperties":false})");
+    schema["properties"][field] = gufo::json::parse(R"({"type":"string"})");
+    schema["required"] = gufo::json::Value::array();
+    schema["required"].push_back(field);
+    grammars.push_back(gufo::sampling::JsonConstraint::Compile(schema, true));
+  }
+  for (int i = 0; i < 16; ++i)
+    bound.push_back(runner.BindConstraint(grammars[i]));
+  // Refresh grammars[0] to MRU; inserting grammars[16] must evict grammars[1]
+  // while keeping grammars[0] bound without rebuilding.
+  Expect(runner.BindConstraint(grammars[0]) == bound[0],
+         "16 distinct bound grammars stay cached without eviction");
+  const auto b16 = runner.BindConstraint(grammars[16]);
+  Expect(b16 != nullptr && runner.BindConstraint(grammars[0]) == bound[0],
+         "LRU keeps refreshed first binding across 17th grammar");
+  Expect(runner.BindConstraint(grammars[1]) != bound[1],
+         "17th binding evicts least-recently-used binding");
+}
+
 }  // namespace
 
 int main() {
@@ -3117,6 +3157,7 @@ int main() {
   TestPromptDivergencePosition();
   TestSystemPrefixRetainedAsRamBranchPointAndSurvivesCompaction();
   TestSystemPrefixCoincidentWithSnapshotPositionAndRamOnlyExclusion();
+  TestBindConstraintUses16EntryLru();
   TestRamOnlyChatClassification();
   TestRamOnlyUsesFinalPreparedLength();
   TestRamOnlyNeverUsesDiskStore();

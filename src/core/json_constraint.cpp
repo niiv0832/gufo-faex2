@@ -6,6 +6,7 @@
 #include <charconv>
 #include <cmath>
 #include <deque>
+#include <list>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -26,6 +27,48 @@ constexpr std::size_t kMaxDepth = 16;
 constexpr std::size_t kMaxStates = 8192;
 constexpr std::size_t kMaxStack = 16384;
 constexpr std::size_t kMaxWork = 2000000;
+constexpr std::size_t kGrammarCacheEntries = 16;
+constexpr std::size_t kToolParametersCacheEntries = 64;
+
+template<typename Key, typename Value>
+class BoundedLruCache {
+public:
+  explicit BoundedLruCache(std::size_t capacity) : capacity_(capacity) {}
+
+  [[nodiscard]] Value Find(const Key& key) {
+    const auto found = index_.find(key);
+    if (found == index_.end())
+      return {};
+    order_.splice(order_.begin(), order_, found->second);
+    return found->second->second;
+  }
+
+  Value Insert(const Key& key, Value value) {
+    if (const auto found = index_.find(key); found != index_.end()) {
+      order_.splice(order_.begin(), order_, found->second);
+      return found->second->second;
+    }
+    if (capacity_ == 0)
+      return value;
+    while (order_.size() >= capacity_) {
+      index_.erase(order_.back().first);
+      order_.pop_back();
+    }
+    order_.emplace_front(key, std::move(value));
+    try {
+      index_.emplace(key, order_.begin());
+    } catch (...) {
+      order_.pop_front();
+      throw;
+    }
+    return order_.front().second;
+  }
+
+private:
+  std::size_t capacity_;
+  std::list<std::pair<Key, Value>> order_;
+  std::map<Key, typename std::list<std::pair<Key, Value>>::iterator> index_;
+};
 
 [[noreturn]] void Invalid(std::string_view message) {
   throw std::invalid_argument("JSON Schema: " + std::string(message));
@@ -1769,18 +1812,17 @@ std::shared_ptr<const JsonConstraint> JsonConstraint::Compile(
     Invalid("maximum schema size is 2 MiB");
   // Bounded cache; compile outside the lock so unrelated HTTP requests proceed.
   static std::mutex mutex;
-  static std::map<std::string, std::shared_ptr<const JsonConstraint>> cache;
+  static BoundedLruCache<std::string, std::shared_ptr<const JsonConstraint>>
+      cache(kGrammarCacheEntries);
   {
     const std::lock_guard lock(mutex);
-    if (const auto found = cache.find(key); found != cache.end())
-      return found->second;
+    if (auto hit = cache.Find(key))
+      return hit;
   }
   auto grammar = JsonConstraintCompiler(schema, strict, false, open_objects)
                      .Compile(false);
   const std::lock_guard lock(mutex);
-  if (cache.size() >= 16)
-    cache.erase(cache.begin());
-  return cache.emplace(key, std::move(grammar)).first->second;
+  return cache.Insert(key, std::move(grammar));
 }
 
 std::shared_ptr<const JsonConstraint> JsonConstraint::Object() {
@@ -1798,14 +1840,15 @@ std::shared_ptr<const JsonConstraint> JsonConstraint::ToolParameters(
   // schemas or injecting a second protocol into the model's chat template.
   using Key = std::tuple<std::string, bool, ToolFormat>;
   static std::mutex mutex;
-  static std::map<Key, std::shared_ptr<const JsonConstraint>> cache;
+  static BoundedLruCache<Key, std::shared_ptr<const JsonConstraint>> cache(
+      kToolParametersCacheEntries);
   const Key key{schema.dump(), strict, format};
   if (std::get<0>(key).size() > kMaxSchemaBytes)
     Invalid("maximum schema size is 2 MiB");
   {
     const std::lock_guard lock(mutex);
-    if (const auto found = cache.find(key); found != cache.end())
-      return found->second;
+    if (auto hit = cache.Find(key))
+      return hit;
   }
   const auto* properties = schema.find("properties");
   const auto* additional = schema.find("additionalProperties");
@@ -1885,9 +1928,7 @@ std::shared_ptr<const JsonConstraint> JsonConstraint::ToolParameters(
     }
   }
   const std::lock_guard lock(mutex);
-  if (cache.size() >= 16)
-    cache.erase(cache.begin());
-  return cache.emplace(key, std::move(grammar)).first->second;
+  return cache.Insert(key, std::move(grammar));
 }
 
 std::shared_ptr<const JsonConstraint> JsonConstraint::OpenToolParameters(
@@ -1913,13 +1954,13 @@ std::shared_ptr<const JsonConstraint> JsonConstraint::WithReasoning(
   // model or cache: the normal grammar stack carries it through sampler copies,
   // draft rejection and request restart.
   static std::mutex mutex;
-  static std::map<std::shared_ptr<const JsonConstraint>,
-                  std::shared_ptr<const JsonConstraint>>
-      cache;
+  static BoundedLruCache<std::shared_ptr<const JsonConstraint>,
+                         std::shared_ptr<const JsonConstraint>>
+      cache(kGrammarCacheEntries);
   {
     const std::lock_guard lock(mutex);
-    if (const auto found = cache.find(answer); found != cache.end())
-      return found->second;
+    if (auto hit = cache.Find(answer))
+      return hit;
   }
   auto grammar = std::shared_ptr<JsonConstraint>(new JsonConstraint(*answer));
   grammar->reasoning_rules_ = static_cast<std::uint32_t>(answer->rules_.size());
@@ -1943,9 +1984,7 @@ std::shared_ptr<const JsonConstraint> JsonConstraint::WithReasoning(
     grammar->root_ = grammar->rules_.size();
     grammar->rules_.push_back(std::move(roots));
     const std::lock_guard lock(mutex);
-    if (cache.size() >= 16)
-      cache.erase(cache.begin());
-    return cache.emplace(std::move(answer), std::move(grammar)).first->second;
+    return cache.Insert(answer, std::move(grammar));
   }
   constexpr std::string_view end = "</think>";
   const auto base = static_cast<std::uint32_t>(grammar->rules_.size());
@@ -1977,11 +2016,7 @@ std::shared_ptr<const JsonConstraint> JsonConstraint::WithReasoning(
   }
   grammar->root_ = base;
   const std::lock_guard lock(mutex);
-  if (const auto found = cache.find(answer); found != cache.end())
-    return found->second;
-  if (cache.size() >= 16)
-    cache.erase(cache.begin());
-  return cache.emplace(std::move(answer), std::move(grammar)).first->second;
+  return cache.Insert(answer, std::move(grammar));
 }
 
 std::shared_ptr<const JsonConstraint> JsonConstraint::WithTools(
@@ -1992,12 +2027,13 @@ std::shared_ptr<const JsonConstraint> JsonConstraint::WithTools(
   using Key = std::tuple<std::shared_ptr<const JsonConstraint>,
                          std::vector<Tool>, bool, bool, ToolFormat>;
   static std::mutex mutex;
-  static std::map<Key, std::shared_ptr<const JsonConstraint>> cache;
+  static BoundedLruCache<Key, std::shared_ptr<const JsonConstraint>> cache(
+      kGrammarCacheEntries);
   const Key key{answer, tools, required, parallel, format};
   {
     const std::lock_guard lock(mutex);
-    if (const auto found = cache.find(key); found != cache.end())
-      return found->second;
+    if (auto hit = cache.Find(key))
+      return hit;
   }
   const bool plain_answer = !answer;
   auto grammar = std::shared_ptr<JsonConstraint>(
@@ -2205,11 +2241,7 @@ std::shared_ptr<const JsonConstraint> JsonConstraint::WithTools(
   grammar->root_ = grammar->rules_.size();
   grammar->rules_.push_back(std::move(alternatives));
   const std::lock_guard lock(mutex);
-  if (const auto found = cache.find(key); found != cache.end())
-    return found->second;
-  if (cache.size() >= 16)
-    cache.erase(cache.begin());
-  return cache.emplace(key, std::move(grammar)).first->second;
+  return cache.Insert(key, std::move(grammar));
 }
 
 JsonConstraint::State JsonConstraint::Expand(State pending) const {
@@ -2543,23 +2575,35 @@ std::shared_ptr<const std::vector<std::uint8_t>> TokenConstraint::Allowed(
     if (initial_state_.empty())
       initial_state_ = grammar->CanonicalMaskState(
           grammar->Start(), vocabulary->max_token_bytes_);
-    if (const auto found = masks_.find(canonical); found != masks_.end())
-      return found->second;
+    if (const auto found = masks_.find(canonical); found != masks_.end()) {
+      found->second.last_used = ++mask_clock_;
+      return found->second.mask;
+    }
   }
   auto mask = std::make_shared<const std::vector<std::uint8_t>>(
       vocabulary->Allowed(*grammar, canonical));
   const std::lock_guard lock(mutex_);
-  if (const auto found = masks_.find(canonical); found != masks_.end())
-    return found->second;
-  if (masks_.size() >= 16) {
-    // Every request needs the initial mask, even when the model state is
-    // cached. Keep it within the same 16-entry budget instead of rebuilding
-    // the entire vocabulary mask after each completed native call.
-    auto victim = masks_.begin();
-    if (victim->first == initial_state_)
-      ++victim;
-    masks_.erase(victim);
+  if (const auto found = masks_.find(canonical); found != masks_.end()) {
+    found->second.last_used = ++mask_clock_;
+    return found->second.mask;
   }
-  return masks_.emplace(std::move(canonical), std::move(mask)).first->second;
+  if (masks_.size() >= kGrammarCacheEntries) {
+    // Every request needs the initial mask, even when the model state is
+    // cached. Keep it within the same bounded LRU budget instead of rebuilding
+    // the entire vocabulary mask after each completed native call.
+    auto victim = masks_.end();
+    for (auto it = masks_.begin(); it != masks_.end(); ++it) {
+      if (it->first == initial_state_)
+        continue;
+      if (victim == masks_.end() ||
+          it->second.last_used < victim->second.last_used)
+        victim = it;
+    }
+    if (victim != masks_.end())
+      masks_.erase(victim);
+  }
+  return masks_
+      .emplace(std::move(canonical), MaskEntry{std::move(mask), ++mask_clock_})
+      .first->second.mask;
 }
 }  // namespace gufo::sampling
