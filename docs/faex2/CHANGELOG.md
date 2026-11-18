@@ -4,6 +4,21 @@
 
 ## 2026-11-18
 
+### Независимое ревью `APPROVE`, закрытие замечаний (`45f0b8eb`/`b81812aa`) и стендовая приёмка `T2a-2` на `faex2`
+
+- По итогам fresh-context ревью и стендовой проверки этап `T2a-2` полностью закрыт на кандидате `b81812aa`:
+  - `d54de2da`, `e52ae479` — стабилизирован тест `TestLayeredPrefillKeepsCheckpointAfterSharedArrival` (проход-1 `count == 8`, проход-2 при 2 декодерах `count >= 8`).
+  - `45f0b8eb`, `b81812aa` — закрыты Major #1 и Minor #1–4 ревью: одноразовая токенизация `[0, system_prefix_bytes)` в `src/models/qwen/vision/prompt.cpp` (без повторного прохода BPE на 55 КБ), сохранение `kBranchPoint` на пути `fits() == true` в `ContinuationCache::ReserveSnapshot` + `try/catch` вокруг `host_memory()`, безусловный сброс `consecutive_short_bypasses = 0` при `selected == 0` и 4 новых юнит-теста (`WithTools` LRU, `TokenConstraint::masks_` LRU + `initial_state_`, гонка `ReserveSnapshot -> Commit`, сброс обгонов после отмены длинной головы). Повторное ревью вернуло **`APPROVE`**.
+  - Обновлён [ROADMAP_SPEC_01.md](ROADMAP_SPEC_01.md) (ревизия 4) — зафиксированы стендовые итоги `T2a-2` и актуальные границы перед возможным выкатом.
+- **Стендовые проверки `faex2` (`~/gufo-t2a2-verify-20261118`, артефакты в `LLM_FAEX2/results/2026-11-18-t2a2-verify/`):**
+  - `python3 tools/ci/check-format.py` — **PASS: Checked 727 C++ files**.
+  - `cmake --build --preset pr` — **56/56 tests passed** (`23.22 s`).
+  - `ctest --preset cpu-sanitizer` (9 целевых тестов) — **9/9 Passed** (`101.02 s`).
+  - HIP Release (`ENGINE_ENABLE_HIP=ON`, `GUFO_ENABLE_NPU=OFF`, `DAMDGPU_TARGETS=gfx1151`, `therock-10.1.0`) — сборка `0`, `gufo --version` = `b81812aafd3cf30ba98364827a3d9d831c5b43cd`, SHA-256 `06e4ffbe…`.
+  - Живое окно на `Qwen3.6-35B-A3B` (`127.0.0.1:13345`, `mtp1`, без `--mmproj`, простой продакшена `be242d70` 90 с): **matched pair** vs `be242d70` (`--sessions 1`) — 24/24 счётчиков токенов совпали, `prefill_ms`/`decode_ms` в 5 %/3 мс, `p1_hermes_cold.ttft_ms` ускорился (`17,23 → 13,35 мс`, −22,5 %); **живой smoke `T2a-2`** (`--sessions 2`) — **7/7 PASS** (`System+Tools` cold без дублирующей shared-записи на диск, compaction `13 025 / 13 060`, `aux` `disk_delta=0`, `S_short` обогнал `L3_queued` `21,10 с vs 28,89 с`, `[ERROR]=0`, `reservation_mismatch=0`).
+  - Продакшен `be242d70-964e84e5` возвращён (`READY`, PID `218964`, `/health` ok, `"28+28="` → `"56"`), сборочные/кэш-каталоги на стенде удалены (`735G` свободно).
+  - **Не запускалось:** полный `299/299` GPU CTest (`qwen_snapshot_streaming_test`), живой `--mmproj` на `b81812aa`, часовой прогон памяти. `deploy` и `git push` не выполнялись.
+
 ### Реализована Фаза 2 задачи `T2a-2` и актуализирован `ROADMAP_SPEC_01.md` (ревизия 4)
 
 - По согласованному [дизайну `T2a-2`](../superpowers/specs/2026-11-18-t2a2-scheduler-cache-design.md) (`ef6b2f10`, с тремя уточнениями владельца) выполнены четыре C++-шага и обновление дорожной карты на ветке `faex2`:
