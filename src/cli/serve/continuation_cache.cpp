@@ -968,10 +968,14 @@ bool ContinuationCache::ReserveSnapshot(
     return impl_->VictimRank(candidate, ram_only, incoming, input_identity,
                              max_priority);
   };
-  const std::optional<HostMemoryStatus> host_memory =
-      impl_->snapshot_support.host_memory
-          ? impl_->snapshot_support.host_memory()
-          : std::nullopt;
+  std::optional<HostMemoryStatus> host_memory;
+  if (impl_->snapshot_support.host_memory) {
+    try {
+      host_memory = impl_->snapshot_support.host_memory();
+    } catch (...) {
+      host_memory.reset();
+    }
+  }
   {
     const std::lock_guard<std::mutex> lock(impl_->mutex);
     std::size_t effective_capacity = impl_->snapshot_capacity_bytes;
@@ -1116,9 +1120,17 @@ bool ContinuationCache::ReserveSnapshot(
         events.push_back(make_event(SnapshotEventAction::kRemoved, reason,
                                     removed_bytes, removed_tokens));
       };
+      if (exact < impl_->entries.size() && impl_->entries[exact]->valid &&
+          !ram_only &&
+          (impl_->entries[exact]->purpose == SnapshotPurpose::kBranchPoint ||
+           impl_->IsBranchPoint(exact))) {
+        purpose = SnapshotPurpose::kBranchPoint;
+      }
       while (can_fit_after_eviction && !fits()) {
         if (exact < impl_->entries.size() && impl_->entries[exact]->valid) {
-          if (!ram_only && impl_->IsBranchPoint(exact))
+          if (!ram_only && (impl_->entries[exact]->purpose ==
+                                SnapshotPurpose::kBranchPoint ||
+                            impl_->IsBranchPoint(exact)))
             purpose = SnapshotPurpose::kBranchPoint;
           remove(exact, SnapshotEventReason::kExactReplacement);
           continue;
@@ -1366,11 +1378,12 @@ std::size_t ContinuationCache::Commit(
         }
         if (retain_snapshot && target != no_entry) {
           auto& snapshot_entry = *impl_->entries[target];
-          // Republishing the same prefix, as an uncached request for exactly
-          // a branch point does, keeps the divergence marked as a branch point
-          // unless the replacement comes from a ram_only request.
+          // Republishing the same prefix keeps an explicit or inferred branch
+          // point marked kBranchPoint unless replaced by a ram_only request.
           const bool learned =
-              exact_replacement && !ram_only && impl_->IsBranchPoint(target);
+              exact_replacement && !ram_only &&
+              (snapshot_entry.purpose == SnapshotPurpose::kBranchPoint ||
+               impl_->IsBranchPoint(target));
           if (snapshot_entry.snapshot != nullptr) {
             const std::size_t removed_bytes = snapshot_entry.snapshot_bytes;
             const std::size_t removed_tokens = snapshot_entry.tokens.size();

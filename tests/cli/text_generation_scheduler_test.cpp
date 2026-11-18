@@ -3879,6 +3879,81 @@ void TestShortPromptPriorityAndAntiStarvation() {
          "short clients bypass up to max_short_bypasses, then long admits");
 }
 
+void TestShortPromptPriorityResetsAfterCancelledLongHead() {
+  auto control = std::make_shared<FakeControl>();
+  control->block_advance_label = 1;
+  auto scheduler = MakeScheduler(control, 1, {},
+                                 {
+                                     .short_prompt_priority_tokens = 4,
+                                     .max_short_bypasses = 2,
+                                 });
+
+  // First long head + short_b (will admit naturally after long_a is cancelled)
+  // while active blocks slot 0.Wait: submit active, then long_a (head), then
+  // short_b (bypass 1 while blocked -> wait: if we cancel long_a BEFORE active
+  // finishes? Even better: block active2 on short_b? Let's do:
+  // active(1) holds slot 0. Queue: long_a(2), short_b(3), short_c(4).
+  // Wait — scheduler only admits 1 request per round when slot=1!
+  // After active finishes: round 1 admits short_b (bypass #1 -> counter=1);
+  // short_b blocks on advance(3). Queue has [long_a, short_c].
+  // Cancel long_a while short_b holds slot 0! Now queue head is short_c.
+  // Release short_b -> round 2 admits short_c natively (selected == 0)!
+  // counter MUST reset to 0, so later long_d(6) gets BOTH bypasses short_e,
+  // short_f!
+  auto active = scheduler->Submit({1}, 2, 0.0F);
+  control->WaitForAdvance(1);
+
+  auto long_a = scheduler->Submit({2, 20, 21, 22, 23, 24}, 1, 0.0F, {}, false,
+                                  TextRequestMetadata{.client_id = "long-a"});
+  auto short_b = scheduler->Submit({3, 30}, 1, 0.0F, {}, false,
+                                   TextRequestMetadata{.client_id = "short-b"});
+  auto short_c = scheduler->Submit({4, 40}, 2, 0.0F, {}, false,
+                                   TextRequestMetadata{.client_id = "short-c"});
+
+  {
+    const std::lock_guard<std::mutex> lock(control->mutex);
+    control->block_prefill_label = 3;
+  }
+  control->ReleaseAdvance();
+  control->WaitForPrefill(3);
+
+  // While short_b holds slot 0 in Prefill, cancel queued long_a so short_c
+  // becomes queue head; short_c must admit naturally and reset bypasses.
+  long_a.Cancel();
+  (void)long_a.Wait();
+  {
+    const std::lock_guard<std::mutex> lock(control->mutex);
+    control->block_advance_label = 4;
+    control->advance_gate_entered = false;
+    control->release_advance = false;
+  }
+  control->ReleasePrefill();
+  control->WaitForAdvance(4);
+
+  auto long_d = scheduler->Submit({5, 50, 51, 52, 53, 54}, 1, 0.0F, {}, false,
+                                  TextRequestMetadata{.client_id = "long-d"});
+  auto short_e = scheduler->Submit({6, 60}, 1, 0.0F, {}, false,
+                                   TextRequestMetadata{.client_id = "short-e"});
+  auto short_f = scheduler->Submit({7, 70}, 1, 0.0F, {}, false,
+                                   TextRequestMetadata{.client_id = "short-f"});
+
+  control->ReleaseAdvance();
+  (void)active.Wait();
+  (void)short_b.Wait();
+  (void)short_c.Wait();
+  (void)long_d.Wait();
+  (void)short_e.Wait();
+  (void)short_f.Wait();
+
+  const auto events = control->Events();
+  const std::size_t p_d = EventIndex(events, EventKind::kPrefill, 5);
+  const std::size_t p_e = EventIndex(events, EventKind::kPrefill, 6);
+  const std::size_t p_f = EventIndex(events, EventKind::kPrefill, 7);
+  Expect(p_e < p_f && p_f < p_d,
+         "natural short admission after cancelled long head resets bypass "
+         "counter");
+}
+
 void TestShortPromptPriorityPreservesClientFifo() {
   auto control = std::make_shared<FakeControl>();
   control->block_advance_label = 1;
@@ -4110,6 +4185,7 @@ int main() {
   TestLongPrefillsKeepWideFairTurns();
   TestShortArrivalBehindWaitingPrefill();
   TestShortPromptPriorityAndAntiStarvation();
+  TestShortPromptPriorityResetsAfterCancelledLongHead();
   TestShortPromptPriorityPreservesClientFifo();
   TestShortPromptPriorityCanBeDisabled();
   TestAdaptivePrefillChunkWithMultipleDecoders();

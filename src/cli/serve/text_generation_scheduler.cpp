@@ -689,15 +689,13 @@ struct TextGenerationScheduler::Impl {
                                         queued_clients.end(), is_short);
         if (match != queued_clients.end()) {
           selected = static_cast<std::size_t>(match - queued_clients.begin());
-          ++consecutive_short_bypasses;
-        } else {
-          consecutive_short_bypasses = 0;
         }
-      } else {
-        consecutive_short_bypasses = 0;
       }
-    } else if (!is_short(queued_clients.front())) {
+    }
+    if (selected == 0) {
       consecutive_short_bypasses = 0;
+    } else {
+      ++consecutive_short_bypasses;
     }
     auto client = std::move(queued_clients[selected]);
     queued_clients.erase(queued_clients.begin() +

@@ -2066,6 +2066,84 @@ void TestExactReplacementPreservesInferredBranchPoint() {
   Expect(cache.CachedPrefixTokens(base) == base.size(),
          "inferred branch point preserved across exact replacement outlives "
          "non-branch continuations");
+
+  // Explicit kBranchPoint must remain protected across exact replacement even
+  // when a deeper kBranchPoint exists in the same family (IsBranchPoint alone
+  // clears learned=false when superseded by a deeper branch point).
+  {
+    ContinuationCache explicit_cache(
+        1,
+        [&] { return std::make_unique<FakeState>(next_id++, &invalidations); },
+        ContinuationCache::SnapshotSupport{
+            .restore =
+                [](ContinuationState& state,
+                   const ContinuationSnapshot& snapshot) {
+                  dynamic_cast<FakeState&>(state).value =
+                      dynamic_cast<const FakeSnapshot&>(snapshot).value;
+                },
+            .capacity_bytes = [] { return std::size_t{256}; },
+            .on_event = {},
+        },
+        8);
+    const Tokens sys{10, 20};
+    const Tokens deep{10, 20, 30, 40};
+    const Tokens filler{50, 51};
+    {
+      auto ls = explicit_cache.Acquire(sys);
+      Expect(ls.TryReserveSnapshot(64, sys.size(), false,
+                                   SnapshotPurpose::kBranchPoint) &&
+                 ls.Commit(sys, std::make_unique<FakeSnapshot>(1, 64)) == 64,
+             "explicit shallow kBranchPoint cached");
+      auto ld = explicit_cache.Acquire(deep);
+      Expect(ld.TryReserveSnapshot(64, deep.size(), false,
+                                   SnapshotPurpose::kBranchPoint) &&
+                 ld.Commit(deep, std::make_unique<FakeSnapshot>(2, 64)) == 64,
+             "deeper kBranchPoint cached");
+    }
+    {
+      auto rep = explicit_cache.Acquire(sys, {}, {}, {}, false);
+      Expect(rep.TryReserveSnapshot(64, sys.size(), false,
+                                    SnapshotPurpose::kContinuation, sys) &&
+                 rep.Commit(sys, std::make_unique<FakeSnapshot>(3, 64)) == 64,
+             "exact replacement of explicit branch point succeeds while deeper "
+             "kBranchPoint is present");
+    }
+    // Pressure 192 bytes leaves 64 bytes; sys (now explicit kBranchPoint, rank
+    // 3) stays after filler or newer unbranched eviction when competing
+    // cleanly, verify sys retains branch priority by replacing deep first
+    // (ancestor? No, fill with 2 more 64-byte continuations so deep is
+    // older/replaced): Wait: both sys and deep are rank 3; rep has newer clock
+    // than deep (so sys outlives deep; check sys has kBranchPoint by evicting a
+    // rank 2 continuation first: add leaf {10, 20, 99} -> deep stays untouched?
+    // Better: publish child of filler {50, 51, 52} -> filler drops to rank 2,
+    // then pressure 128 bytes evicts filler & deep before sys).
+    const Tokens filler_child{50, 51, 52};
+    {
+      auto lf = explicit_cache.Acquire(filler);
+      Expect(lf.TryReserveSnapshot(64, filler.size()) &&
+                 lf.Commit(filler, std::make_unique<FakeSnapshot>(4, 64)) == 64,
+             "filler cached");
+      auto lc = explicit_cache.Acquire(filler_child);
+      Expect(lc.TryReserveSnapshot(64, filler_child.size()) &&
+                 lc.Commit(filler_child,
+                           std::make_unique<FakeSnapshot>(5, 64)) == 64,
+             "filler_child demotes filler to rank 2");
+    }
+    // Now 256 bytes used: sys(rank 3, clock 4), deep(rank 3, clock 2),
+    // filler(rank 2), filler_child(rank 3, clock 6). A 192-byte request evicts
+    // filler (rank 2) + deep (rank 3, clock 2) + sys? Try 128-byte request ->
+    // evicts filler (rank 2) + deep (rank 3, oldest clock), keeping sys!
+    const Tokens big{88, 89};
+    {
+      auto lb = explicit_cache.Acquire(big);
+      Expect(lb.TryReserveSnapshot(128, big.size()) &&
+                 lb.Commit(big, std::make_unique<FakeSnapshot>(6, 128)) == 128,
+             "pressure evicts demoted filler and oldest deep branch");
+    }
+    Expect(explicit_cache.CachedPrefixTokens(sys) == sys.size(),
+           "explicit kBranchPoint stays retained when replaced under deeper "
+           "kBranchPoint");
+  }
 }
 
 int main() {

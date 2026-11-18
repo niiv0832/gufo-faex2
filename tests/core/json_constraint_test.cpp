@@ -2466,6 +2466,62 @@ void TestGrammarCachesUseLruAndRetain24ToolSchemas() {
   (void)JsonConstraint::WithReasoning(g16);
   assert(JsonConstraint::WithReasoning(compiled[0]) == reasoned[0]);
   assert(JsonConstraint::WithReasoning(compiled[1]) != reasoned[1]);
+
+  // WithTools uses a 16-entry LRU keyed on tool signatures.
+  std::vector<std::shared_ptr<const JsonConstraint>> toolsets;
+  for (int i = 0; i < 16; ++i) {
+    toolsets.push_back(JsonConstraint::WithTools(
+        nullptr, {{"tool_" + std::to_string(i), tool_grammars[i]}}, false,
+        false, Format::kQwen));
+  }
+  assert(JsonConstraint::WithTools(nullptr, {{"tool_0", tool_grammars[0]}},
+                                   false, false, Format::kQwen) == toolsets[0]);
+  (void)JsonConstraint::WithTools(nullptr, {{"tool_16", tool_grammars[16]}},
+                                  false, false, Format::kQwen);
+  assert(JsonConstraint::WithTools(nullptr, {{"tool_0", tool_grammars[0]}},
+                                   false, false, Format::kQwen) == toolsets[0]);
+  assert(JsonConstraint::WithTools(nullptr, {{"tool_1", tool_grammars[1]}},
+                                   false, false, Format::kQwen) != toolsets[1]);
+
+  // TokenConstraint::masks_ uses 16-entry LRU while always keeping
+  // initial_state_. Create 16 distinct enum choices ("a00".."p15") so each
+  // prefix after opening quote + first letter has a distinct
+  // CanonicalMaskState.
+  auto enum_schema = parse(R"({"type":"string","enum":[]})");
+  for (int i = 0; i < 16; ++i) {
+    const std::string tag =
+        std::string(1, static_cast<char>('a' + i)) + std::to_string(i);
+    enum_schema["enum"].push_back(tag);
+  }
+  TokenConstraint binding;
+  binding.grammar = JsonConstraint::Compile(enum_schema, true);
+  binding.vocabulary =
+      std::make_shared<ConstraintVocabulary>(129, [](std::uint32_t id) {
+        return ConstraintVocabulary::Piece{
+            id == 128 ? "" : std::string(1, static_cast<char>(id)), id == 128};
+      });
+  const auto initial = binding.grammar->Start();
+  const auto initial_mask = binding.Allowed(initial);
+  const auto quote_state = binding.grammar->Advance(initial, '"');
+  std::vector<JsonConstraint::State> states;
+  std::vector<std::shared_ptr<const std::vector<std::uint8_t>>> masks;
+  for (int i = 0; i < 16; ++i) {
+    auto s = binding.grammar->Advance(quote_state,
+                                      static_cast<unsigned char>('a' + i));
+    assert(!s.empty());
+    states.push_back(s);
+    if (i < 15)
+      masks.push_back(binding.Allowed(s));
+  }
+  // Cache currently holds initial + states[0..14] (16 entries). Refresh
+  // states[0], then add states[15]: states[1] must be evicted while initial and
+  // refreshed states[0] remain cached.
+  assert(binding.Allowed(states[0]) == masks[0]);
+  const auto m15 = binding.Allowed(states[15]);
+  assert(m15 != nullptr);
+  assert(binding.Allowed(initial) == initial_mask);
+  assert(binding.Allowed(states[0]) == masks[0]);
+  assert(binding.Allowed(states[1]) != masks[1]);
 }
 
 int main(int argc, char** argv) {
