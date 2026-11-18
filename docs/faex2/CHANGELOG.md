@@ -4,6 +4,15 @@
 
 ## 2026-11-18
 
+### Проект дизайна `T2a-2`: приоритеты планировщика, доводка кэша и закрытие хвостов (до реализации)
+
+- По итогам аудита кода и коммитов подготовлен [дизайн `T2a-2`](../superpowers/specs/2026-11-18-t2a2-scheduler-cache-design.md) на согласование владельцем:
+  - **Планировщик (`text_generation_scheduler.hpp/.cpp`):** приоритет коротких запросов (`<= 2048`) в `PopQueued` при конкуренции за слоты с защитой от голодания (`max_short_bypasses = 4`, без нарушения одновременного допуска); адаптивное деление `decode_active_tokens` от `others_decoding` в `StepPrefill` (сохраняет ширину 4096 для `Qwen` и удваивает `layer_groups` с 8 до 16 при `>= 2` декодерах; уменьшает чанк для не-слоистых путей).
+  - **Кэш и память (`chat_template.cpp`, `prompt.cpp`, `text_model_runner.cpp`, `continuation_cache.cpp`):** экспорт точной границы `system_prefix_tokens` из `QwenChatTemplate::Render` для удержания `System+Tools` (`kBranchPoint`) в одиночном диалоге при сжатии истории; перенос повышения `IsBranchPoint` при `exact_replacement` из `fe2694bc` (отклонены `stale` из `fe2694bc` и сегментный `hipHostRegister` из `8ab834a5` для `src/cache`); единое чтение `/proc/meminfo` в `HostSnapshotLimits()` + динамический `ceiling_bytes` за цикл `ReserveSnapshot` (`MemoryGovernor`-идея).
+  - **`GrammarCache` и оценка `capture`:** общий `BoundedLruCache` в `json_constraint.cpp` (`ToolParameters` 16 → 64 под 20 инструментов `base_request.json` Hermes) и `BindConstraint` LRU 4 → 16 в `text_model_runner.cpp`. Отдельный пошаговый `--capture-dir` лог перенесён в подготовку `T7` (Этап 2 после HIP-графов `T3–T5`).
+  - **Попутные закрытия:** удаление недостижимой проверки `qwen_snapshot == nullptr` (`767c6018`/`004d8fa1`) в `StreamPersistentSnapshot` (`inference_backend.cpp:1623-1633`) и план синхронизации `ROADMAP_SPEC_01.md` (ревизия 4 под прод `be242d70`).
+- Только документация; C++-код, тесты, `ROADMAP_SPEC_01.md` и продакшен `be242d70` не изменялись; сборки, модели, GPU-проверки и `push` не запускались.
+
 ### Закрыты долги приёмки `be242d70`: час памяти PASS и 4-пользовательский профиль
 
 - По подтверждению владельца («действуй по твоей рекомендации») выполнены обе оставшиеся приёмочные проверки. Час памяти — штатным оркестратором третьего круга (`remed_window.py`) в окне с простым ~65 мин: harness из `be242d70`, план — точная копия этапа 4 (`compose --duration 3600`, nonce `t2a1mem01`, свежий кэш, монитор 1 Гц). **Ворота PASS** (до измерений записаны): RSS рост макс +0,11 / медианы +0,08 ГиБ; GTT +0,07 / +0,21 (допуск ≤1). 1552 запроса, продолжения 740 RAM / 30 диск / **0 полных перечитываний**; все 15 длинных перечитываний с названными причинами; ядро CLEAN, restore verified.
