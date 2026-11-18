@@ -19,10 +19,12 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <iomanip>
 #include <iostream>
 #include <limits>
 #include <memory>
 #include <span>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -311,11 +313,13 @@ void CheckQwenIncrementalOracle(
 // Stage 1 (B1) diagnostic, enabled by GUFO_VISION_SERVING_DIAGNOSTIC=1:
 // quantifies the greedy near-tie between the decode-written cache history and
 // the matrix prefill of the same tokens. Read-only: prints per-step margins,
-// logit deltas and KL; it adds no requirements and changes no assertions.
+// logit deltas and KL (plus common-prefix aggregates up to first divergence);
+// it adds no requirements and changes no assertions.
 void DumpQwenVisionContinuationDiagnostic(
     const std::shared_ptr<const hip::QwenGpuModel>& model,
     const server::ChatRequest& request, const Backend::Result& previous,
-    const Backend::Result& cached) {
+    const Backend::Result& cached,
+    std::span<const tokenization::TokenId> cold_serving_tokens) {
   const char* enabled = ::getenv("GUFO_VISION_SERVING_DIAGNOSTIC");
   if (enabled == nullptr || std::string_view(enabled) != "1")
     return;
@@ -367,26 +371,35 @@ void DumpQwenVisionContinuationDiagnostic(
   };
   const auto [cached_steps, cached_rows] = trace(true);
   const auto [cold_steps, cold_rows] = trace(false);
-  std::cout << "vision-diag: cached_trajectory_matches_serving="
-            << (cached_steps.size() == cached.tokens.size() &&
-                std::equal(cached_steps.begin(), cached_steps.end(),
-                           cached.tokens.begin(),
-                           [](const Step& step, tokenization::TokenId id) {
-                             return step.token == id;
-                           }))
-            << " prompt=" << tokens.size()
-            << " cache_prefix=" << cached.cached_prompt_tokens << '\n';
-  double max_kl = 0;
-  float max_delta = 0;
+  const auto matches = [](const std::vector<Step>& steps,
+                          std::span<const tokenization::TokenId> expected) {
+    return steps.size() == expected.size() &&
+           std::equal(steps.begin(), steps.end(), expected.begin(),
+                      [](const Step& step, tokenization::TokenId id) {
+                        return step.token == id;
+                      });
+  };
+  std::ostringstream out;
+  out << std::fixed << std::setprecision(6);
+  out << "vision-diag: cached_trajectory_matches_serving="
+      << matches(cached_steps, cached.tokens)
+      << " cold_trajectory_matches_serving="
+      << matches(cold_steps, cold_serving_tokens) << " prompt=" << tokens.size()
+      << " cache_prefix=" << cached.cached_prompt_tokens << '\n';
+  double all_max_kl = 0, common_max_kl = 0;
+  float all_max_delta = 0, common_max_delta = 0;
   std::size_t divergence = cached.tokens.size();
+  std::vector<float> step_deltas(cached.tokens.size(), 0.0F);
+  std::vector<double> step_kls(cached.tokens.size(), 0.0);
   for (std::size_t i = 0; i < cached.tokens.size(); ++i) {
     const auto& left = cached_rows[i];
     const auto& right = cold_rows[i];
     const float left_max = *std::ranges::max_element(left);
     const float right_max = *std::ranges::max_element(right);
     double left_sum = 0, right_sum = 0;
+    float step_delta = 0;
     for (std::size_t j = 0; j < left.size(); ++j) {
-      max_delta = std::max(max_delta, std::abs(left[j] - right[j]));
+      step_delta = std::max(step_delta, std::abs(left[j] - right[j]));
       left_sum += std::exp(static_cast<double>(left[j] - left_max));
       right_sum += std::exp(static_cast<double>(right[j] - right_max));
     }
@@ -396,21 +409,42 @@ void DumpQwenVisionContinuationDiagnostic(
       const double log_q = right[j] - right_max - std::log(right_sum);
       kl += std::exp(log_p) * (log_p - log_q);
     }
-    max_kl = std::max(max_kl, kl);
-    if (divergence == cached.tokens.size() &&
-        cached_steps[i].token != cold_steps[i].token)
-      divergence = i;
+    step_deltas[i] = step_delta;
+    step_kls[i] = kl;
+    all_max_delta = std::max(all_max_delta, step_delta);
+    all_max_kl = std::max(all_max_kl, kl);
+    if (divergence == cached.tokens.size()) {
+      common_max_delta = std::max(common_max_delta, step_delta);
+      common_max_kl = std::max(common_max_kl, kl);
+      if (cached_steps[i].token != cold_steps[i].token)
+        divergence = i;
+    }
   }
-  std::cout << "vision-diag: max_logit_delta=" << max_delta
-            << " max_KL_temperature1=" << max_kl
-            << " first_divergence_step=" << divergence << '\n';
+  const std::size_t common_steps =
+      divergence < cached.tokens.size() ? divergence + 1 : cached.tokens.size();
+  out << "vision-diag: common_prefix_steps=" << common_steps
+      << " common_max_logit_delta=" << common_max_delta
+      << " common_max_KL_temperature1=" << common_max_kl
+      << " all_steps_max_logit_delta=" << all_max_delta
+      << " all_steps_max_KL_temperature1=" << all_max_kl
+      << " first_divergence_step=" << divergence << '\n';
   for (std::size_t i = 0; i < cached.tokens.size(); ++i) {
-    std::cout << "vision-diag step=" << i
-              << " cached_token=" << cached_steps[i].token
-              << " cold_token=" << cold_steps[i].token
-              << " cached_margin=" << cached_steps[i].margin
-              << " cold_margin=" << cold_steps[i].margin << '\n';
+    out << "vision-diag step=" << i << " cached_token=" << cached_steps[i].token
+        << " cold_token=" << cold_steps[i].token
+        << " cached_margin=" << cached_steps[i].margin
+        << " cold_margin=" << cold_steps[i].margin
+        << " max_delta=" << step_deltas[i] << " kl=" << step_kls[i] << '\n';
+    if (i == divergence) {
+      const auto a = cached_steps[i].token;
+      const auto b = cold_steps[i].token;
+      out << "vision-diag divergence_logits step=" << i << " token_a=" << a
+          << " (L_cached=" << cached_rows[i][a]
+          << ", L_cold=" << cold_rows[i][a] << ") token_b=" << b
+          << " (L_cached=" << cached_rows[i][b]
+          << ", L_cold=" << cold_rows[i][b] << ")\n";
+    }
   }
+  std::cout << out.str();
 }
 
 void CheckAppendSnapshotOracle(
@@ -840,7 +874,7 @@ int main(int argc, char** argv) {
       CheckQwenIncrementalOracle(qwen, continuation, references[0], continued);
     if (!flash)
       DumpQwenVisionContinuationDiagnostic(qwen, continuation, references[0],
-                                           continued);
+                                           continued, cold_continuation.tokens);
     if (flash)
       CheckFlashIncrementalOracle(qfn, continuation, continued);
 
