@@ -4,6 +4,14 @@
 
 ## 2026-11-18
 
+### Продакшен переведён на `b81812aa` (`T2a-2`): GPU/vision/час памяти PASS, launcher v17 и `git push`
+
+- По явному поручению владельца (`/goal`) выполнены совмещённая приёмка, перевод продакшена на `b81812aa` (`e5af3a93…`) и публикация ветки `faex2` (`~/gufo-t2a2-deploy-20261118`, артефакты в `LLM_FAEX2/results/2026-11-18-t2a2-deploy/README.md`):
+  - **Сборка:** релиз `gufo` `[299/299]` (`REL_RC=0`, SHA-256 `e5af3a93…`, `gufo --version` `b81812aa…`) и `build/gpu-test` (все цели Qwen/`qwen38_flash_next`/cache/scheduler/server; не слинковался только сторонний `ds4_serving_test`).
+  - **GPU CTest и `--mmproj`:** целевой Qwen/FlashNext/HIP/`cache_*`/`scheduler`/`server` набор — **77/77 Passed** (`91,98 с`); широкий `gpu-fast` (за исключением пропущенного по согласованию `#190`): **151/159 Passed**, 4 Skipped, 4 падения вне стека `T2a-2`/35B-A3B (`#37`, `#97`, `#205`, `#206`); выделенно **PASS**: `qwen_snapshot_streaming_test` (`0,75 с`), `qwen_layered_prefill_test` (`106,26 с`), `qwen_vision_serving_test --mmproj ... --append-only` (`rc=0`, `append_max_logit_error=0.00`; без `--append-only` остаётся долгом Этапа 1 `35/36 → 36/36`). На живом `b81812aa` (`--mmproj`): `faex2_remediation.py check --only images` — **4/4 PASS**, `--only images_complex --record-only` — **5/5 RECORDED**.
+  - **Час памяти (`remed_window.py` + `compose --duration 3600`, `--mmproj`, 1 Гц):** **PASS** — RSS макс **+0,13 ГиБ** / мед. `+0,07 ГиБ`, GTT макс **−0,06 ГиБ** / мед. `+0,09 ГиБ` (допуск ≤ 1 ГиБ); `3614,0 с`, `186` циклов, `1560` запросов, `failures: []`, `744` продолжений (`715 RAM / 28 диск / 1 'evicted'`, `0` без причины), журнал ядра **CLEAN**, `restore_verified: true` (час ≠ 24/7).
+  - **Выкат:** launcher v17 (`main` → `b81812aa-e5af3a93`, `recovery` → `be242d70-964e84e5`), `gufo-faex2.service` `READY` (owner `268920`, child `268922`, `/health`, `"56"`, `"red"` PNG), `63 ГиБ` кэш и `src/tmp` удалены (`676G` свободно), `faex2` запушена в `origin`.
+
 ### Независимое ревью `APPROVE`, закрытие замечаний (`45f0b8eb`/`b81812aa`) и стендовая приёмка `T2a-2` на `faex2`
 
 - По итогам fresh-context ревью и стендовой проверки этап `T2a-2` полностью закрыт на кандидате `b81812aa`:
