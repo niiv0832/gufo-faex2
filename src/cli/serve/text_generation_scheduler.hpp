@@ -25,6 +25,9 @@ enum class TextRequestPhase : std::uint8_t {
 };
 
 inline constexpr std::size_t kDefaultDecodeActivePrefillTokens = 512;
+inline constexpr std::size_t kDefaultMinDecodeActivePrefillTokens = 128;
+inline constexpr std::size_t kDefaultShortPromptPriorityTokens = 2048;
+inline constexpr std::size_t kDefaultMaxShortPromptBypasses = 4;
 inline constexpr std::size_t kDefaultMaxOutputBytes =
     static_cast<std::size_t>(1024) * 1024;
 inline constexpr std::size_t kDefaultMaxBufferedOutputBytes =
@@ -34,6 +37,7 @@ inline constexpr std::size_t kDefaultMaxBufferedOutputBytesTotal =
 
 struct TextPrefillPolicy {
   std::size_t decode_active_tokens{kDefaultDecodeActivePrefillTokens};
+  std::size_t min_decode_active_tokens{kDefaultMinDecodeActivePrefillTokens};
 };
 
 struct TextSchedulerPolicy {
@@ -44,6 +48,8 @@ struct TextSchedulerPolicy {
   std::chrono::milliseconds stream_start_delay{std::chrono::seconds(5)};
   std::size_t max_pending_requests{16};
   std::size_t max_pending_requests_per_client{4};
+  std::size_t short_prompt_priority_tokens{kDefaultShortPromptPriorityTokens};
+  std::size_t max_short_bypasses{kDefaultMaxShortPromptBypasses};
   std::size_t max_output_bytes_per_request{kDefaultMaxOutputBytes};
   std::size_t max_buffered_output_bytes_per_request{
       kDefaultMaxBufferedOutputBytes};

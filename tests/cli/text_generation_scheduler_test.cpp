@@ -3837,6 +3837,186 @@ void TestPrefixLossThresholdsAndPrivacy() {
   }
 }
 
+void TestShortPromptPriorityAndAntiStarvation() {
+  auto control = std::make_shared<FakeControl>();
+  control->block_advance_label = 1;
+  auto scheduler = MakeScheduler(control, 1, {},
+                                 {
+                                     .short_prompt_priority_tokens = 4,
+                                     .max_short_bypasses = 2,
+                                 });
+
+  auto active = scheduler->Submit({1}, 2, 0.0F);
+  control->WaitForAdvance(1);
+
+  auto long_a = scheduler->Submit({2, 20, 21, 22, 23, 24}, 1, 0.0F, {}, false,
+                                  TextRequestMetadata{.client_id = "long-a"});
+  auto short_b = scheduler->Submit({3, 30}, 1, 0.0F, {}, false,
+                                   TextRequestMetadata{.client_id = "short-b"});
+  auto short_c = scheduler->Submit({4, 40}, 1, 0.0F, {}, false,
+                                   TextRequestMetadata{.client_id = "short-c"});
+  auto short_d = scheduler->Submit({5, 50}, 1, 0.0F, {}, false,
+                                   TextRequestMetadata{.client_id = "short-d"});
+
+  control->ReleaseAdvance();
+  (void)active.Wait();
+  (void)long_a.Wait();
+  (void)short_b.Wait();
+  (void)short_c.Wait();
+  (void)short_d.Wait();
+
+  const auto events = control->Events();
+  const std::size_t p_a = EventIndex(events, EventKind::kPrefill, 2);
+  const std::size_t p_b = EventIndex(events, EventKind::kPrefill, 3);
+  const std::size_t p_c = EventIndex(events, EventKind::kPrefill, 4);
+  const std::size_t p_d = EventIndex(events, EventKind::kPrefill, 5);
+  Expect(p_b < p_c && p_c < p_a && p_a < p_d,
+         "short clients bypass up to max_short_bypasses, then long admits");
+}
+
+void TestShortPromptPriorityPreservesClientFifo() {
+  auto control = std::make_shared<FakeControl>();
+  control->block_advance_label = 1;
+  auto scheduler = MakeScheduler(control, 1, {},
+                                 {
+                                     .short_prompt_priority_tokens = 4,
+                                     .max_short_bypasses = 4,
+                                 });
+
+  auto active = scheduler->Submit({1}, 2, 0.0F);
+  control->WaitForAdvance(1);
+
+  auto a_long = scheduler->Submit({2, 20, 21, 22, 23, 24}, 1, 0.0F, {}, false,
+                                  TextRequestMetadata{.client_id = "client-a"});
+  auto a_short =
+      scheduler->Submit({3, 30}, 1, 0.0F, {}, false,
+                        TextRequestMetadata{.client_id = "client-a"});
+  auto b_short =
+      scheduler->Submit({4, 40}, 1, 0.0F, {}, false,
+                        TextRequestMetadata{.client_id = "client-b"});
+
+  control->ReleaseAdvance();
+  (void)active.Wait();
+  (void)a_long.Wait();
+  (void)a_short.Wait();
+  (void)b_short.Wait();
+
+  const auto events = control->Events();
+  const std::size_t p_a_long = EventIndex(events, EventKind::kPrefill, 2);
+  const std::size_t p_a_short = EventIndex(events, EventKind::kPrefill, 3);
+  const std::size_t p_b_short = EventIndex(events, EventKind::kPrefill, 4);
+  Expect(p_b_short < p_a_long && p_a_long < p_a_short,
+         "short bypasses between clients without reordering inside a client");
+}
+
+void TestShortPromptPriorityCanBeDisabled() {
+  auto control = std::make_shared<FakeControl>();
+  control->block_advance_label = 1;
+  auto scheduler = MakeScheduler(control, 1, {},
+                                 {
+                                     .short_prompt_priority_tokens = 0,
+                                 });
+
+  auto active = scheduler->Submit({1}, 2, 0.0F);
+  control->WaitForAdvance(1);
+
+  auto long_a = scheduler->Submit({2, 20, 21, 22, 23, 24}, 1, 0.0F, {}, false,
+                                  TextRequestMetadata{.client_id = "long-a"});
+  auto short_b = scheduler->Submit({3, 30}, 1, 0.0F, {}, false,
+                                   TextRequestMetadata{.client_id = "short-b"});
+
+  control->ReleaseAdvance();
+  (void)active.Wait();
+  (void)long_a.Wait();
+  (void)short_b.Wait();
+
+  const auto events = control->Events();
+  Expect(EventIndex(events, EventKind::kPrefill, 2) <
+             EventIndex(events, EventKind::kPrefill, 3),
+         "setting short_prompt_priority_tokens=0 keeps strict round-robin");
+}
+
+void TestAdaptivePrefillChunkWithMultipleDecoders() {
+  // Non-layered runner: chunk size shrinks proportionally to active decoders,
+  // bounded by min_decode_active_tokens.
+  {
+    auto control = std::make_shared<FakeControl>();
+    control->block_advance_label = 2;
+    auto scheduler = MakeScheduler(control, 3,
+                                   {
+                                       .decode_active_tokens = 8,
+                                       .min_decode_active_tokens = 2,
+                                   });
+
+    auto dec_a = scheduler->Submit({1}, 12, 0.0F);
+    auto dec_b = scheduler->Submit({2}, 12, 0.0F);
+    control->WaitForAdvance(2);
+    auto prefill =
+        scheduler->Submit({3, 30, 31, 32, 33, 34, 35, 36, 37, 38}, 1, 0.0F);
+    control->ReleaseAdvance();
+
+    (void)dec_a.Wait();
+    (void)dec_b.Wait();
+    const auto res = prefill.Wait();
+    Expect(res.max_prefill_chunk_tokens == 4 && res.prefill_chunks == 3,
+           "two active decoders halve the non-layered prefill chunk");
+  }
+  {
+    auto control = std::make_shared<FakeControl>();
+    control->block_advance_label = 4;
+    auto scheduler = MakeScheduler(control, 5,
+                                   {
+                                       .decode_active_tokens = 8,
+                                       .min_decode_active_tokens = 3,
+                                   });
+
+    auto d1 = scheduler->Submit({1}, 12, 0.0F);
+    auto d2 = scheduler->Submit({2}, 12, 0.0F);
+    auto d3 = scheduler->Submit({3}, 12, 0.0F);
+    auto d4 = scheduler->Submit({4}, 12, 0.0F);
+    control->WaitForAdvance(4);
+    auto prefill =
+        scheduler->Submit({5, 50, 51, 52, 53, 54, 55, 56, 57}, 1, 0.0F);
+    control->ReleaseAdvance();
+
+    (void)d1.Wait();
+    (void)d2.Wait();
+    (void)d3.Wait();
+    (void)d4.Wait();
+    const auto res = prefill.Wait();
+    Expect(res.max_prefill_chunk_tokens == 3 && res.prefill_chunks == 3,
+           "min_decode_active_tokens floors adaptive prefill chunk shrinking");
+  }
+  // Layered runner: pass width stays 16, while layer groups double from 4 to 8.
+  {
+    auto control = std::make_shared<FakeControl>();
+    control->block_advance_label = 2;
+    control->layered_prefill_pass_tokens = 16;
+    control->max_prefill_layer_groups = 16;
+    auto scheduler = MakeScheduler(control, 3,
+                                   {
+                                       .decode_active_tokens = 4,
+                                       .min_decode_active_tokens = 2,
+                                   });
+
+    auto dec_a = scheduler->Submit({1}, 16, 0.0F);
+    auto dec_b = scheduler->Submit({2}, 16, 0.0F);
+    control->WaitForAdvance(2);
+    auto prefill = scheduler->Submit(
+        {3, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44}, 1,
+        0.0F);
+    control->ReleaseAdvance();
+
+    (void)dec_a.Wait();
+    (void)dec_b.Wait();
+    const auto res = prefill.Wait();
+    Expect(res.prefill_chunks == 1 && res.max_prefill_chunk_tokens == 16 &&
+               res.max_prefill_layer_groups == 8 &&
+               res.prefill_yield_rounds == 7,
+           "layered prefill keeps pass width and yields twice as often");
+  }
+}
+
 int main() {
   // Log assertions in this binary match the plain "[LEVEL] [component]" text
   // captured from a redirected sink; a TTY stderr would tint the level tag.
@@ -3924,6 +4104,10 @@ int main() {
   TestArrivalDoesNotWaitForAnotherLongChunk();
   TestLongPrefillsKeepWideFairTurns();
   TestShortArrivalBehindWaitingPrefill();
+  TestShortPromptPriorityAndAntiStarvation();
+  TestShortPromptPriorityPreservesClientFifo();
+  TestShortPromptPriorityCanBeDisabled();
+  TestAdaptivePrefillChunkWithMultipleDecoders();
   for (const bool multi_token : {false, true}) {
     for (const bool batched : {false, true}) {
       if (batched && !multi_token)

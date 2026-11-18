@@ -503,7 +503,8 @@ struct TextGenerationScheduler::Impl {
           "text generation scheduler runner pool must not be null");
     }
     sessions = std::make_shared<SessionTable>(runner_pool->capacity());
-    if (prefill_policy.decode_active_tokens == 0) {
+    if (prefill_policy.decode_active_tokens == 0 ||
+        prefill_policy.min_decode_active_tokens == 0) {
       throw std::invalid_argument(
           "active-decode prefill budget must be at least one token");
     }
@@ -656,13 +657,50 @@ struct TextGenerationScheduler::Impl {
     queued_count = count;
   }
 
-  [[nodiscard]] std::shared_ptr<ScheduledRequest> PopQueued() {
+  [[nodiscard]] std::size_t EffectiveDecodeActiveTokens(
+      std::size_t others_decoding) const noexcept {
+    if (others_decoding <= 1) {
+      return prefill_policy.decode_active_tokens;
+    }
+    const std::size_t floor = std::min(prefill_policy.decode_active_tokens,
+                                       prefill_policy.min_decode_active_tokens);
+    return std::max(floor,
+                    prefill_policy.decode_active_tokens / others_decoding);
+  }
+
+  [[nodiscard]] std::shared_ptr<ScheduledRequest> PopQueued(
+      std::size_t free_slots) {
     const std::lock_guard<std::mutex> lock(queue_mutex);
     if (queued_clients.empty()) {
       return {};
     }
-    auto client = std::move(queued_clients.front());
-    queued_clients.pop_front();
+    const auto is_short = [&](const PendingClient& pending) {
+      return scheduler_policy.short_prompt_priority_tokens != 0 &&
+             pending.requests.front()->prompt.size() <=
+                 scheduler_policy.short_prompt_priority_tokens;
+    };
+    std::size_t selected = 0;
+    if (scheduler_policy.short_prompt_priority_tokens != 0 &&
+        queued_count > free_slots && scheduler_policy.max_short_bypasses != 0 &&
+        !is_short(queued_clients.front())) {
+      if (consecutive_short_bypasses < scheduler_policy.max_short_bypasses) {
+        const auto match = std::find_if(std::next(queued_clients.begin()),
+                                        queued_clients.end(), is_short);
+        if (match != queued_clients.end()) {
+          selected = static_cast<std::size_t>(match - queued_clients.begin());
+          ++consecutive_short_bypasses;
+        } else {
+          consecutive_short_bypasses = 0;
+        }
+      } else {
+        consecutive_short_bypasses = 0;
+      }
+    } else if (!is_short(queued_clients.front())) {
+      consecutive_short_bypasses = 0;
+    }
+    auto client = std::move(queued_clients[selected]);
+    queued_clients.erase(queued_clients.begin() +
+                         static_cast<std::ptrdiff_t>(selected));
     auto request = std::move(client.requests.front());
     client.requests.pop_front();
     // Admission reserves a session before potentially slow cache preparation.
@@ -1119,11 +1157,11 @@ struct TextGenerationScheduler::Impl {
         // Parked followers already reserve a visible admission session. They
         // may resume in place, but new arrivals must respect those
         // reservations.
-        if (prefilling.size() + decoding.size() + capturing.size() +
-                waiting.size() >=
-            runner_pool->capacity())
+        const std::size_t active = prefilling.size() + decoding.size() +
+                                   capturing.size() + waiting.size();
+        if (active >= runner_pool->capacity())
           return;
-        request = PopQueued();
+        request = PopQueued(runner_pool->capacity() - active);
       }
       if (request == nullptr) {
         return;
@@ -1220,7 +1258,8 @@ struct TextGenerationScheduler::Impl {
 
   void StepPrefill(const std::shared_ptr<ScheduledRequest>& request,
                    bool decoder_runnable, bool peer_waiting = false,
-                   const PrefillYield& yield = {}) {
+                   const PrefillYield& yield = {},
+                   std::size_t others_decoding = 0) {
     try {
       if (CompleteIfStopped(request)) {
         return;
@@ -1235,14 +1274,16 @@ struct TextGenerationScheduler::Impl {
           incremental_prefill_supported && (decoder_runnable || peer_waiting);
       // Beside decoders, a runner with layered prefill keeps its efficient
       // pass and lets them decode between layer groups: one group per
-      // decode-active budget of the pass, so they get the rounds that many
-      // bounded chunks would give them.
+      // effective active-decode budget of the pass, increasing yield frequency
+      // when multiple decoders are running without shrinking the pass width.
+      const std::size_t effective_active_tokens =
+          EffectiveDecodeActiveTokens(others_decoding);
       const bool layered = decoder_runnable && static_cast<bool>(yield) &&
                            layered_prefill_pass_tokens != 0 &&
                            incremental_prefill_supported;
       const std::size_t budget = layered ? layered_prefill_pass_tokens
                                  : bounded_prefill
-                                     ? prefill_policy.decode_active_tokens
+                                     ? effective_active_tokens
                                      : request->runner_request.prompt_tokens();
       if ((decoder_runnable || runner_pool->capacity() > 1) &&
           !incremental_prefill_supported) {
@@ -1252,10 +1293,9 @@ struct TextGenerationScheduler::Impl {
       const auto start = Clock::now();
       const std::size_t rounds_before = yield_rounds;
       const double yield_ms_before = yield_ms;
-      const auto step =
-          layered ? request->runner_request.Prefill(
-                        budget, prefill_policy.decode_active_tokens, yield)
-                  : request->runner_request.Prefill(budget);
+      const auto step = layered ? request->runner_request.Prefill(
+                                      budget, effective_active_tokens, yield)
+                                : request->runner_request.Prefill(budget);
       request->result.prefill_yield_rounds += yield_rounds - rounds_before;
       request->result.max_prefill_layer_groups =
           std::max(request->result.max_prefill_layer_groups, step.layer_groups);
@@ -2078,10 +2118,13 @@ struct TextGenerationScheduler::Impl {
         // The request stays queued during its pass: a layered pass admits
         // arrivals between its layer groups.
         auto request = prefilling.front();
-        StepPrefill(request, true, false, [&] {
-          RunYieldRound(request, prefilling, decoding, capturing, waiting,
-                        stop_token);
-        });
+        StepPrefill(
+            request, true, false,
+            [&] {
+              RunYieldRound(request, prefilling, decoding, capturing, waiting,
+                            stop_token);
+            },
+            decoding.size());
         prefilling.erase(std::ranges::find(prefilling, request));
         if (!IsTerminal(request)) {
           if (request->runner_request.SnapshotPending()) {
@@ -2147,6 +2190,7 @@ struct TextGenerationScheduler::Impl {
   std::condition_variable queue_condition;
   std::deque<PendingClient> queued_clients;
   std::size_t queued_count{0};
+  std::size_t consecutive_short_bypasses{0};
   bool stopping{false};
   std::atomic<bool> device_lost{false};
   const std::exception_ptr device_lost_failure =
