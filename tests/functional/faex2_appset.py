@@ -199,8 +199,39 @@ def image_names() -> list:
 
 CRITICAL = ["incorrect_math", "incorrect_fact", "fabricated_source", "empty", "truncated"]
 
+DEFAULT_RUBRIC = {
+    "correctness": {"0": "Ответ неверный, пустой или содержит существенное противоречие.",
+                    "1": "Часть необходимых фактов или шагов отсутствует.",
+                    "2": "Все обязательные факты и значения верны."},
+    "instruction": {"0": "Задача не выполнена.", "1": "Есть несущественное нарушение формы.",
+                    "2": "Инструкция и заданная форма ответа выполнены."},
+    "russian_clarity": {"0": "Ответ непонятен.", "1": "Ответ понятен, но содержит языковые ошибки.",
+                        "2": "Ответ ясен; язык и формат соответствуют заданию."},
+    "explanation": {"0": "Требуемое объяснение неверно или отсутствует.",
+                    "1": "Требуемое объяснение неполное.",
+                    "2": "Объяснение верно, если оно запрошено; иначе не требуется."},
+}
+DEFAULT_PASS = {"correctness": 2, "minimum_per_dimension": 1, "minimum_total": 6,
+                "critical_failure_result": "FAIL"}
+
 
 def _task(id_, domain, bucket, evaluation, thinking, **fields):
+    if not fields.get("expected_facts"):
+        if fields.get("expected_values"):
+            fields["expected_facts"] = [
+                "Зафиксированные значения: " +
+                json.dumps(fields["expected_values"], ensure_ascii=False, sort_keys=True)]
+        elif fields.get("autocheck"):
+            fields["expected_facts"] = [
+                "Фиксированные условия проверки: " +
+                json.dumps(fields["autocheck"], ensure_ascii=False, sort_keys=True)]
+        else:
+            fields["expected_facts"] = [
+                "Ответ должен опираться только на приведённый синтетический источник."]
+    fields.setdefault("prohibited_errors", [
+        "Выдуманные факты, противоречия исходным данным и невыполнение инструкции."])
+    fields.setdefault("rubric", DEFAULT_RUBRIC)
+    fields.setdefault("pass_criteria", DEFAULT_PASS)
     return {"id": id_, "domain": domain, "bucket": bucket, "evaluation": evaluation,
             "thinking": thinking, "critical_failures": list(CRITICAL), **fields}
 
@@ -270,7 +301,7 @@ def _table_tasks():
 
 def _receipt_tasks():
     questions = {
-        "receipt-a": "На чеке четыре покупки и итоговая строка TOTAL. Какова итоговая сумма? Ответь только числом.",
+        "receipt-a": "На чеке три покупки и итоговая строка TOTAL. Какова итоговая сумма? Ответь только числом.",
         "receipt-b": "Какова итоговая сумма (TOTAL) в чеке? Ответь только числом.",
         "receipt-c": "Какова итоговая сумма (TOTAL) в чеке? Ответь только числом.",
         "receipt-d": "Какова итоговая сумма (TOTAL) в чеке? Ответь только числом.",
@@ -411,7 +442,7 @@ def _tool_chain_tasks():
     tasks = []
     for topic, answer in (("астрономия", "ПОЛЯРИС_742"), ("ботаника", "ФЛОРА_318")):
         tasks.append(_task(f"tool-chain-lookup-{topic}", "tool-chain", "medium", "auto",
-                           "hermes", max_completion_tokens=128,
+                           "hermes", max_completion_tokens=768,
                            tools=schema("lookup", "Школьный справочник; внешних действий нет.",
                                         "topic", ("астрономия", "ботаника")),
                            first_prompt=f"Найди в справочнике тему «{topic}».",
@@ -422,7 +453,7 @@ def _tool_chain_tasks():
                            expected_values={"answer": answer}))
     for city, temp in (("сочи", 20), ("казань", 15)):
         tasks.append(_task(f"tool-chain-weather-{city}", "tool-chain", "medium", "auto",
-                           "hermes", max_completion_tokens=128,
+                           "hermes", max_completion_tokens=768,
                            tools=schema("get_weather", "Кэш школьного проекта о погоде; "
                                         "внешних запросов нет.", "city", ("сочи", "казань")),
                            first_prompt=f"Посмотри погоду для города «{city}».",
@@ -434,7 +465,7 @@ def _tool_chain_tasks():
                            expected_values={"fahrenheit": temp * 9 // 5 + 32}))
     for day, lesson in (("monday", "биология"), ("friday", "история")):
         tasks.append(_task(f"tool-chain-lesson-{day}", "tool-chain", "medium", "auto",
-                           "hermes", max_completion_tokens=128,
+                           "hermes", max_completion_tokens=768,
                            tools=schema("get_lesson", "Расписание класса; внешних действий нет.",
                                         "day", ("monday", "friday")),
                            first_prompt=f"Посмотри в расписании, какой урок в {day}.",
@@ -443,6 +474,25 @@ def _tool_chain_tasks():
                            prompt="Какой урок в результате инструмента? Ответь одним словом.",
                            autocheck={"type": "compact", "value": lesson},
                            expected_values={"lesson": lesson}))
+    for index, task in enumerate(tasks):
+        preamble, _ = long_document(100 + index, 5000)
+        task["first_prompt"] = ("Синтетический справочный архив:\n" + preamble +
+                                "\nСледующее поручение относится к этому архиву:\n" +
+                                task["first_prompt"])
+        task["target_range"] = [2000, 18000]
+        key = next(iter(task["tool_arguments"].values()))
+        second = {"name": "confirm_record", "arguments": {"key": key},
+                  "result": {"confirmed": True}}
+        task["tools"].append({"type": "function", "function": {
+            "name": "confirm_record", "description": "Проверяет синтетическую запись.",
+            "strict": True, "parameters": {"type": "object", "properties": {
+                "key": {"type": "string", "enum": [key]}},
+                "required": ["key"], "additionalProperties": False}}})
+        task["tool_sequence"] = [
+            {"name": task["tool_name"], "arguments": task["tool_arguments"],
+             "result": task["tool_result"]}, second]
+        task["second_prompt"] = ("Проверь запись вторым инструментом confirm_record; "
+                                 f"вызови его с key равным «{key}».")
     return tasks
 
 
@@ -476,12 +526,14 @@ def _json_schema_tasks():
 def _hermes_tasks():
     return [
         _task("hermes-reuse-tool-01", "hermes-reuse", "medium", "auto", "hermes",
-              hermes_case="tool-01-search", max_completion_tokens=None,
-              autocheck={"type": "valid_tool_call"},
+              hermes_case="tool-01-search", max_completion_tokens=None, target_range=[2000, 18000],
+              autocheck={"type": "valid_tool_call", "name": "web_search",
+                         "required_text": "query"},
               expected_values={"case": "tool-01-search"}),
         _task("hermes-reuse-mixed-02", "hermes-reuse", "medium", "auto", "hermes",
-              hermes_case="mixed-02-ls-then-read", max_completion_tokens=None,
-              autocheck={"type": "valid_tool_call"},
+              hermes_case="mixed-02-ls-then-read", max_completion_tokens=None, target_range=[2000, 18000],
+              autocheck={"type": "valid_tool_call", "name": "read_file",
+                         "required_text": "path", "contains": "schedule.csv"},
               expected_values={"case": "mixed-02-ls-then-read"}),
     ]
 
@@ -607,7 +659,8 @@ def _d_tasks():
                            "off", prompt=text + (
                                "\n\nПерескажи документ в 3–5 предложениях, обязательно упомянув "
                                "температуру, ветер и осадки одной любой записи документа."),
-                           max_completion_tokens=768))
+                           max_completion_tokens=768,
+                           target_range=[20000, 32000] if target == short_target else [44000, 64000]))
 
     # long-facts: документы 1-2 (короткие) и 5-6 (длинные), по 3 позиции.
     for doc_index, target in ((1, short_target), (2, short_target),
@@ -617,6 +670,7 @@ def _d_tasks():
             tasks.append(_task(f"long-facts-{doc_index}-{position}", "long-facts",
                                "long", "auto", "off", prompt=prompt,
                                max_completion_tokens=96,
+                               target_range=[20000, 32000] if target == short_target else [44000, 64000],
                                autocheck={"type": "json", "value": [
                                    check[1] for check in values["fact_checks"]]},
                                expected_values=values, fact_day=values["day"],
@@ -645,7 +699,8 @@ def _d_tasks():
             autocheck = {"type": "compact", "value": "B"}
             needle = "4471 B"
         tasks.append(_task(f"long-tool-dialog-{variant + 1}", "long-tool-dialog", "long",
-                           "auto", "hermes", max_completion_tokens=256,
+                           "auto", "hermes", max_completion_tokens=768,
+                           target_range=[20000, 32000] if first_target == short_target else [44000, 64000],
                            historical_tools=[{"type": "function", "function": {
                                "name": "read_log", "description": "Чтение синтетического журнала",
                                "strict": True, "parameters": {
@@ -682,7 +737,8 @@ def _d_tasks():
             autocheck = {"type": "contains_all", "values": ["7", facts[9]["precip"]]}
             expected = {"x": 7, "precip_day_9": facts[9]["precip"]}
         tasks.append(_task(f"long-vision-dialog-{variant + 1}", "long-vision-dialog", "long",
-                           "auto", "hermes", max_completion_tokens=256,
+                           "auto", "hermes", max_completion_tokens=768,
+                           target_range=[20000, 32000] if target == short_target else [44000, 64000],
                            messages=[{"role": "user", "content": [
                                image(image_name) if variant % 2 == 0 else image(image_name),
                                {"type": "text", "text": text}]},

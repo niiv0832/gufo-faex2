@@ -8,10 +8,14 @@ thinking/cache_prompt и слепой экспорт/раскрытие на с�
 from __future__ import annotations
 
 import json
+import base64
+import importlib.util
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import shutil
 import sys
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -61,6 +65,14 @@ class RegistryTests(unittest.TestCase):
             self.assertRegex(task["id"], r"^[a-z0-9][a-z0-9а-яё-]*$", task["id"])
             self.assertIn(task["thinking"], ("off", "hermes"))
             self.assertTrue(set(appset.CRITICAL) <= set(task["critical_failures"]))
+
+    def test_every_task_supplies_grounding_to_the_reviewer(self):
+        for task in self.all_tasks:
+            with self.subTest(task=task["id"]):
+                self.assertTrue(task.get("expected_facts"))
+                self.assertTrue(task.get("prohibited_errors"))
+                self.assertIn("rubric", task)
+                self.assertIn("pass_criteria", task)
 
     def test_subgroup_coverage_cannot_silently_shrink(self):
         new_ids = {task["id"] for task in self.new}
@@ -112,6 +124,23 @@ class RegistryTests(unittest.TestCase):
         self.assertEqual(len(estimates), 28)
         self.assertEqual(sum(value > 40_000 for value in estimates.values()), 14)
         self.assertEqual(sum(value < 40_000 for value in estimates.values()), 14)
+
+    def test_long_tasks_declare_two_actual_token_buckets(self):
+        tasks = [t for t in self.new if t["bucket"] == "long"]
+        self.assertEqual(sum(t["target_range"] == [20000, 32000] for t in tasks), 14)
+        self.assertEqual(sum(t["target_range"] == [44000, 64000] for t in tasks), 14)
+
+    def test_wrong_actual_long_token_bucket_cannot_pass(self):
+        task = next(t for t in appset.new_tasks()
+                    if t["domain"] == "long-facts" and t["id"] == "long-facts-1-begin")
+        answer = json.dumps(task["autocheck"]["value"])
+        with tempfile.TemporaryDirectory() as tmp:
+            instance = runner.SetRunner("http://127.0.0.1:1", Path(tmp) / "run", "greedy", 0)
+            response = {"status": "PASS", "text": answer, "finish": "stop",
+                        "metrics": {"prompt_tokens": 45000}}
+            with patch.object(instance, "_transport", return_value=response):
+                row = instance.run_task(task)
+        self.assertNotEqual(row["status"], "PASS")
 
     def test_long_documents_are_deterministic_and_facts_match(self):
         first, facts = appset.long_document(1, 24_000)
@@ -278,11 +307,26 @@ class AutocheckTests(unittest.TestCase):
     def test_json_and_valid_tool_call(self):
         self.assertTrue(self.grade('{"answer": 391}', {"type": "json", "value": {"answer": 391}}))
         self.assertFalse(self.grade("не json", {"type": "json", "value": {}}))
+        self.assertFalse(self.grade('{"answer": true}', {"type": "json", "value": {"answer": 1}}))
         good = {"finish": "tool_calls", "tools": [{"id": "1", "type": "function",
                                                    "function": {"name": "a", "arguments": "{}"}}]}
         self.assertTrue(runner.grade_autocheck(good, {"type": "valid_tool_call"}))
         bad = {"finish": "stop", "tools": []}
         self.assertFalse(runner.grade_autocheck(bad, {"type": "valid_tool_call"})[0])
+
+    def test_hermes_tool_name_and_arguments_are_checked(self):
+        task = next(t for t in appset.new_tasks() if t["id"] == "hermes-reuse-tool-01")
+        call = {"id": "1", "type": "function", "function": {
+            "name": "web_search", "arguments": '{"query":"солнечное затмение"}'}}
+        result = {"finish": "tool_calls", "tools": [call]}
+        self.assertTrue(runner.grade_autocheck(result, task["autocheck"])[0])
+        call["function"]["name"] = "terminal"
+        self.assertFalse(runner.grade_autocheck(result, task["autocheck"])[0])
+        call["function"]["name"] = "web_search"
+        call["function"]["arguments"] = '{"query":3}'
+        self.assertFalse(runner.grade_autocheck(result, task["autocheck"])[0])
+        call["function"]["arguments"] = '{"query":"затмение","limit":101}'
+        self.assertFalse(runner.grade_autocheck(result, task["autocheck"])[0])
 
     def test_every_auto_spec_is_satisfiable_by_a_correct_answer(self):
         """Каждая автопроверка набора должна пропускать эталонный ответ."""
@@ -300,8 +344,11 @@ class AutocheckTests(unittest.TestCase):
     def _reference_answer(self, task):
         spec = task["autocheck"]
         if spec["type"] == "valid_tool_call":
+            arguments = {spec["required_text"]: spec.get("contains", "пример")} \
+                if "required_text" in spec else {}
             return {"text": "", "tools": [{"id": "x", "type": "function",
-                                           "function": {"name": "any", "arguments": "{}"}}],
+                                           "function": {"name": spec.get("name", "any"),
+                                                        "arguments": json.dumps(arguments)}}],
                     "finish": "tool_calls"}
         if spec["type"] == "all":
             return {"text": self._reference_all(spec["checks"], task),
@@ -333,6 +380,151 @@ class AutocheckTests(unittest.TestCase):
 
 
 class RequestPolicyTests(unittest.TestCase):
+    @unittest.skipUnless(importlib.util.find_spec("jsonschema"), "нужен jsonschema")
+    def test_real_loopback_transport_replays_two_validated_tool_calls(self):
+        task = next(t for t in appset.all_tasks() if t["id"] == "tool-chain-weather-сочи")
+        seen = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *_):
+                pass
+
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                index = len(seen)
+                seen.append(body)
+                message = {"role": "assistant", "content": "68"}
+                finish = "stop"
+                if index < 2:
+                    step = task["tool_sequence"][index]
+                    message = {"role": "assistant", "content": None, "tool_calls": [{
+                        "id": f"call_{index}", "type": "function",
+                        "function": {"name": step["name"],
+                                     "arguments": json.dumps(step["arguments"], ensure_ascii=False)}}]}
+                    finish = "tool_calls"
+                payload = {"id": f"fake_{index}", "created": 1, "model": body["model"],
+                           "object": "chat.completion",
+                           "choices": [{"index": 0, "message": message, "finish_reason": finish}],
+                           "usage": {"prompt_tokens": 5000, "completion_tokens": 2,
+                                     "total_tokens": 5002, "cached_tokens": 0,
+                                     "draft_tokens": 0, "draft_tokens_accepted": 0,
+                                     "gufo": {"prefill_tokens": 5000, "prefill_ms": 2.5,
+                                              "decode_ms": 3.0, "queue_ms": 0, "ttft_ms": 3,
+                                              "cache_restore_ms": 0, "cache_snapshot_ms": 0,
+                                              "cache_disk_enqueue_ms": 0}}}
+                raw = json.dumps(payload, ensure_ascii=False).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                instance = runner.SetRunner(f"http://127.0.0.1:{server.server_port}",
+                                            Path(tmp) / "run", "greedy", 0)
+                row = instance.run_task(task)
+                self.assertEqual(row["status"], "PASS", row.get("error"))
+                self.assertEqual(len(seen), 3)
+                self.assertEqual([body["cache_prompt"] for body in seen], [False, True, True])
+                self.assertEqual(len(row["tool_trace"]), 2)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
+    def test_tool_chain_has_two_distinct_calls(self):
+        tasks = [t for t in appset.new_tasks() if t["domain"] == "tool-chain"]
+        self.assertEqual(len(tasks), 6)
+        for task in tasks:
+            with self.subTest(task=task["id"]):
+                self.assertEqual(len(task["tool_sequence"]), 2)
+                self.assertNotEqual(task["tool_sequence"][0]["name"],
+                                    task["tool_sequence"][1]["name"])
+                self.assertEqual(task["target_range"], [2000, 18000])
+                self.assertGreater(len(task["first_prompt"]) / appset.CHARS_PER_TOKEN, 2000)
+
+    def test_runner_executes_two_tool_rounds_before_final_answer(self):
+        task = next(t for t in appset.new_tasks() if t["id"] == "tool-chain-weather-сочи")
+        calls = []
+        for index, step in enumerate(task["tool_sequence"]):
+            calls.append({"status": "PASS", "text": "", "finish": "tool_calls",
+                          "tools": [{"id": f"call_{index}", "type": "function",
+                                     "function": {"name": step["name"],
+                                                  "arguments": json.dumps(step["arguments"])}}]})
+        calls.append({"status": "PASS", "text": "68", "finish": "stop",
+                      "metrics": {"prompt_tokens": 5000}})
+        with tempfile.TemporaryDirectory() as tmp:
+            instance = runner.SetRunner("http://127.0.0.1:1", Path(tmp) / "run", "greedy", 0)
+            with patch.object(instance, "_transport", side_effect=calls) as transport:
+                row = instance.run_task(task)
+            self.assertEqual(transport.call_count, 3)
+            self.assertEqual(row["status"], "PASS", row)
+            self.assertEqual(len(row["tool_trace"]), 2)
+            self.assertEqual([item["tools"][0]["function"]["name"] for item in row["tool_trace"]],
+                             [step["name"] for step in task["tool_sequence"]])
+    def test_partial_run_cannot_claim_overall_pass(self):
+        task = next(t for t in appset.all_tasks() if t["id"] == "ocr-table-a")
+        with tempfile.TemporaryDirectory() as tmp:
+            instance = runner.SetRunner("http://127.0.0.1:1", Path(tmp) / "run",
+                                        "greedy", 0)
+            response = {"status": "PASS", "text": "11", "finish": "stop", "metrics": {}}
+            with patch.object(instance, "_transport", return_value=response):
+                instance.run([task])
+            self.assertNotEqual(instance.report["status"], "PASS")
+    def test_reasoning_tasks_allow_budget_and_visible_answer(self):
+        for task in appset.new_tasks():
+            if task["thinking"] != "hermes" or task["domain"] == "hermes-reuse":
+                continue
+            with self.subTest(task=task["id"]):
+                self.assertGreater(task["max_completion_tokens"], 512)
+
+    def test_real_loopback_transport_records_response_and_grades_it(self):
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *_):
+                pass
+
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                payload = {
+                    "id": "fake", "created": 1, "model": body["model"],
+                    "object": "chat.completion",
+                    "choices": [{"index": 0, "message": {"role": "assistant", "content": "11"},
+                                 "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 20, "completion_tokens": 2,
+                              "total_tokens": 22, "cached_tokens": 0,
+                              "draft_tokens": 0, "draft_tokens_accepted": 0,
+                              "gufo": {"prefill_tokens": 20, "prefill_ms": 2.5,
+                                       "decode_ms": 3.0, "queue_ms": 0, "ttft_ms": 3,
+                                       "cache_restore_ms": 0, "cache_snapshot_ms": 0,
+                                       "cache_disk_enqueue_ms": 0}}}
+                raw = json.dumps(payload).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+        task = next(t for t in appset.all_tasks() if t["id"] == "ocr-table-a")
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                instance = runner.SetRunner(f"http://127.0.0.1:{server.server_port}",
+                                            Path(tmp) / "run", "greedy", 0)
+                row = instance.run_task(task)
+                self.assertEqual(row["status"], "PASS", row.get("error"))
+                self.assertTrue((instance.output / "requests" / task["id"] /
+                                 "response.raw").is_file())
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
     def test_long_result_without_verified_token_count_is_not_pass(self):
         task = next(t for t in appset.all_tasks() if t["id"] == "long-facts-1-begin")
         answer = str(task["expected_values"]["temp"])
@@ -391,14 +583,16 @@ class RequestPolicyTests(unittest.TestCase):
         task = next(t for t in appset.all_tasks() if t["id"] == "tool-chain-weather-сочи")
         steps = runner.build_requests(task, "greedy", 0)
         body = steps[0][1]["body"]
-        self.assertNotIn("chat_template_kwargs", body)
+        self.assertTrue(body["chat_template_kwargs"]["enable_thinking"])
+        self.assertEqual(body["reasoning_budget_tokens"], 512)
         self.assertIn("tools", body)
         fake_turn1 = {"text": None, "finish": "tool_calls", "tools": [{
             "id": "call_1", "type": "function",
             "function": {"name": "get_weather", "arguments": '{"city": "сочи"}'}}]}
         turn2 = runner.turn2_request(task, fake_turn1, "greedy", 0)["body"]
         self.assertTrue(turn2["cache_prompt"])
-        self.assertNotIn("chat_template_kwargs", turn2)
+        self.assertTrue(turn2["chat_template_kwargs"]["enable_thinking"])
+        self.assertEqual(turn2["reasoning_budget_tokens"], 512)
         self.assertEqual([m["role"] for m in turn2["messages"]],
                          ["user", "assistant", "tool", "user"])
         self.assertEqual(json.loads(turn2["messages"][2]["content"]), task["tool_result"])
@@ -409,6 +603,8 @@ class RequestPolicyTests(unittest.TestCase):
         self.assertNotIn("chat_template_kwargs", body)
         self.assertEqual(len(body["tools"]), 20)
         self.assertEqual(body["messages"][0]["role"], "system")
+        self.assertTrue(body["stream"])
+        self.assertEqual(body["stream_options"], {"include_usage": True})
 
     def test_runner_rejects_existing_output_and_bad_pass(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -418,6 +614,15 @@ class RequestPolicyTests(unittest.TestCase):
                 runner.SetRunner("http://127.0.0.1:1", existing, "greedy", 0)
             with self.assertRaises(Exception):
                 runner.SetRunner("http://127.0.0.1:1", Path(tmp) / "new", "bogus", 0)
+
+    def test_runner_rejects_unsafe_task_id_before_writing(self):
+        task = dict(next(t for t in appset.all_tasks() if t["id"] == "ocr-table-a"))
+        task["id"] = "../../escape"
+        with tempfile.TemporaryDirectory() as tmp:
+            instance = runner.SetRunner("http://127.0.0.1:1", Path(tmp) / "run", "greedy", 0)
+            row = instance.run_task(task)
+            self.assertEqual(row["status"], "FAIL")
+            self.assertFalse((Path(tmp) / "escape.json").exists())
 
 
 class BlindProtocolTests(unittest.TestCase):
@@ -438,9 +643,12 @@ class BlindProtocolTests(unittest.TestCase):
         if task["evaluation"] == "auto":
             spec = task.get("autocheck") or {"type": "valid_tool_call"}
             if spec["type"] == "valid_tool_call":
+                arguments = {spec["required_text"]: spec.get("contains", "пример")} \
+                    if "required_text" in spec else {}
                 return {"text": "", "finish": "tool_calls", "tools": [
                     {"id": "x", "type": "function",
-                     "function": {"name": "any", "arguments": "{}"}}]}
+                     "function": {"name": spec.get("name", "any"),
+                                  "arguments": json.dumps(arguments)}}]}
             if spec["type"] == "all":
                 probe = AutocheckTests("test_json_and_valid_tool_call")
                 return {"text": probe._reference_all(spec["checks"], task),
@@ -461,8 +669,10 @@ class BlindProtocolTests(unittest.TestCase):
                          "status": status, "finish": result["finish"],
                          "text": result.get("text", ""), "tools": result.get("tools", [])})
         path.mkdir(parents=True)
+        hashes = runner.fixture_hashes()
         (path / "report.json").write_text(json.dumps(
-            {"status": "PASS", "pass_name": "sampled", "seed": 1, "results": rows},
+            {"status": "PASS", "pass_name": "sampled", "seed": 1, "results": rows,
+             "fixture_sha256": hashes},
             ensure_ascii=False), encoding="utf-8")
         return path
 
@@ -483,6 +693,7 @@ class BlindProtocolTests(unittest.TestCase):
             self.assertNotIn("run_a", json.dumps(pair))
             self.assertNotIn("run_b", json.dumps(pair))
             self.assertTrue(pair["prompt"].strip())
+            self.assertTrue(pair["messages"])
             self.assertIn("expected_facts", pair)
             self.assertIn("prohibited_errors", pair)
             for side in ("response_a", "response_b"):
@@ -498,6 +709,14 @@ class BlindProtocolTests(unittest.TestCase):
         self.assertEqual(len(big), 2)
         for pair in big:
             self.assertTrue(pair["images"], "known_limit pairs keep their images")
+            for image_path in pair["images"]:
+                self.assertIsInstance(image_path, str)
+                self.assertTrue((out / image_path).read_bytes().startswith(b"\x89PNG"))
+        long_tool = next(pair for pair in pairs if pair["task_class"].startswith("long-tool-dialog"))
+        self.assertEqual(sum(m["role"] == "tool" for m in long_tool["messages"]), 2)
+        vision = next(pair for pair in pairs if pair["task_class"].startswith("long-vision-dialog"))
+        self.assertTrue(vision["images"])
+        self.assertNotIn("data:image", json.dumps(vision["messages"]))
 
     def test_unblind_on_identical_runs_shows_zero_difference(self):
         out = self._blind()
@@ -551,6 +770,22 @@ class BlindProtocolTests(unittest.TestCase):
         out = self._blind()
         with self.assertRaises(Exception):
             runner.unblind(out, None)
+
+    def test_export_rejects_failed_transport_instead_of_reviewing_it_as_success(self):
+        report_path = self.run_b / "report.json"
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        report["results"][0].update(status="FAIL", error="timeout")
+        report_path.write_text(json.dumps(report, ensure_ascii=False), encoding="utf-8")
+        with self.assertRaises(Exception):
+            runner.export_blind(self.run_a, self.run_b, self.tmp / "bad", 20261119)
+
+    def test_export_rejects_mismatched_fixture_hashes(self):
+        report_path = self.run_b / "report.json"
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        report["fixture_sha256"][runner.APPSET_FILE] = "different"
+        report_path.write_text(json.dumps(report, ensure_ascii=False), encoding="utf-8")
+        with self.assertRaises(Exception):
+            runner.export_blind(self.run_a, self.run_b, self.tmp / "bad", 20261119)
 
     def test_unblind_tracks_independent_manual_review_per_original_side(self):
         out = self._blind()

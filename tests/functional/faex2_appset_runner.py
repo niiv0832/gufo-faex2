@@ -21,6 +21,9 @@ NOT_EXERCISED (не выбран фильтром).
 from __future__ import annotations
 
 import argparse
+import base64
+import copy
+import hashlib
 import json
 from pathlib import Path
 import random
@@ -37,6 +40,15 @@ BLIND_SEED_DEFAULT = 20261119
 RUBRIC_FILE = "faex2_quality.jsonl"
 APPSET_FILE = "faex2_appset.jsonl"
 
+
+def fixture_hashes() -> dict:
+    root = Path(__file__).parent
+    files = (APPSET_FILE, RUBRIC_FILE, "faex2_appset.py", "faex2_appset_runner.py",
+             "faex2_remediation_images.py", "faex2_vision_probes.py", "faex2_images.py",
+             "hermes_synth.py", "fixtures/hermes_synth/base_request.json",
+             "fixtures/hermes_synth/cases.jsonl")
+    return {name: file_hash(root / name) for name in files}
+
 # ---------------------------------------------------------------------------
 # Нормализация и автопроверки (чистые функции, без модели)
 # ---------------------------------------------------------------------------
@@ -51,6 +63,18 @@ def _compact(text: str) -> str:
 
 def _numbers(text: str) -> list:
     return [int(value) for value in re.findall(r"-?\d+", normalize(text))]
+
+
+def _same_json(actual, expected):
+    if type(actual) is not type(expected):
+        return False
+    if isinstance(expected, dict):
+        return actual.keys() == expected.keys() and all(
+            _same_json(actual[key], value) for key, value in expected.items())
+    if isinstance(expected, list):
+        return len(actual) == len(expected) and all(
+            _same_json(a, b) for a, b in zip(actual, expected))
+    return actual == expected
 
 
 def _sentences(text: str) -> int:
@@ -138,7 +162,7 @@ def grade_autocheck(result: dict, autocheck: dict):
         return not missing, "missing " + str(missing) if missing else "numbers_all"
     if kind == "json":
         try:
-            return json.loads(text) == autocheck["value"], "json"
+            return _same_json(json.loads(text), autocheck["value"]), "json"
         except ValueError:
             return False, "not json"
     if kind == "sentence_count":
@@ -150,7 +174,36 @@ def grade_autocheck(result: dict, autocheck: dict):
                   text.splitlines() if line.strip()]
         return actual == [re.sub(r"\s+", " ", line) for line in autocheck["value"]], "line_match"
     if kind == "valid_tool_call":
-        return _valid_tool_call(result), "valid_tool_call"
+        if not _valid_tool_call(result):
+            return False, "invalid tool identity or JSON"
+        function = result["tools"][0]["function"]
+        if "name" in autocheck and function.get("name") != autocheck["name"]:
+            return False, "wrong tool name"
+        arguments = json.loads(function["arguments"])
+        field = autocheck.get("required_text")
+        if field is not None:
+            value = arguments.get(field)
+            if not isinstance(value, str) or not value.strip():
+                return False, "missing text argument"
+            if "contains" in autocheck and autocheck["contains"] not in value:
+                return False, "wrong text argument"
+        if function.get("name") in ("web_search", "read_file") and field:
+            definitions = {t["function"]["name"]: t["function"]
+                           for t in hermes_synth.load_base()["tools"]}
+            schema = definitions[function["name"]]["parameters"]
+            properties = schema["properties"]
+            for key, value in arguments.items():
+                if key not in properties:
+                    return False, "unknown tool argument"
+                constraint = properties[key]
+                kind = constraint.get("type")
+                if kind == "string" and not isinstance(value, str):
+                    return False, "invalid string argument"
+                if kind == "integer" and (type(value) is not int or
+                        ("minimum" in constraint and value < constraint["minimum"]) or
+                        ("maximum" in constraint and value > constraint["maximum"])):
+                    return False, "invalid integer argument"
+        return True, "valid_tool_call"
     raise ValueError("Неизвестная автопроверка: " + kind)
 
 
@@ -169,7 +222,10 @@ def _body(base_updates: dict, thinking: str, pass_name: str, seed: int) -> dict:
         raise ValueError("pass_name должен быть greedy или sampled")
     if thinking == "off":
         body.setdefault("chat_template_kwargs", {})["enable_thinking"] = False
-    elif thinking != "hermes":
+    elif thinking == "hermes":
+        body.setdefault("chat_template_kwargs", {})["enable_thinking"] = True
+        body["reasoning_budget_tokens"] = 512
+    else:
         raise ValueError("thinking должен быть off или hermes")
     return body
 
@@ -186,7 +242,7 @@ def build_requests(task: dict, pass_name: str, seed: int) -> list:
         body = hermes_synth.build_request(
             next(case for case in hermes_synth.load_cases()
                  if case["id"] == task["hermes_case"]))
-        body = {**body, "cache_prompt": False, "stream": False}
+        body = {**body, "cache_prompt": False}
         if pass_name == "greedy":
             body.update({"temperature": 0, "seed": 0})
         else:
@@ -196,7 +252,10 @@ def build_requests(task: dict, pass_name: str, seed: int) -> list:
                               "body": body}, "main")]
     if "tools" in task:
         first = _body({"messages": [{"role": "user", "content": task["first_prompt"]}],
-                       "tools": task["tools"], "max_completion_tokens": limit},
+                       "tools": task["tools"], "parallel_tool_calls": False,
+                       "tool_choice": {"type": "function", "function": {
+                           "name": task["tool_sequence"][0]["name"]}},
+                       "max_completion_tokens": limit},
                       thinking, pass_name, seed)
         return [(task["id"] + "-turn1", {"method": "POST",
                                          "path": "/v1/chat/completions", "body": first},
@@ -227,22 +286,41 @@ def build_requests(task: dict, pass_name: str, seed: int) -> list:
 
 
 def turn2_request(task: dict, turn1_result: dict, pass_name: str, seed: int) -> dict:
-    """Второй ход tool-цепочки: история + литерал tool_result + финальный вопрос."""
+    """Второй ход: первый результат и требование вызвать confirm_record."""
     body = {"model": ALIAS, "cache_prompt": True, "stream": False,
-            "tool_choice": "none", "max_completion_tokens": task.get("max_completion_tokens"),
+            "tools": task["tools"], "parallel_tool_calls": False,
+            "tool_choice": {"type": "function", "function": {
+                "name": task["tool_sequence"][1]["name"]}},
+            "max_completion_tokens": task.get("max_completion_tokens"),
             "messages": [{"role": "user", "content": task["first_prompt"]},
                          {"role": "assistant", "content": turn1_result.get("text") or None,
                           "tool_calls": turn1_result.get("tools")},
                          {"role": "tool", "tool_call_id": turn1_result["tools"][0]["id"],
                           "content": json.dumps(task["tool_result"], ensure_ascii=False)},
-                         {"role": "user", "content": task["prompt"]}]}
+                         {"role": "user", "content": task["second_prompt"]}]}
     if task["thinking"] == "off":
         body["chat_template_kwargs"] = {"enable_thinking": False}
+    elif task["thinking"] == "hermes":
+        body["chat_template_kwargs"] = {"enable_thinking": True}
+        body["reasoning_budget_tokens"] = 512
     if pass_name == "greedy":
         body.update({"temperature": 0, "seed": 0})
     else:
         body.update({"temperature": 1, "top_k": 20, "top_p": 0.95, "min_p": 0.05,
                      "seed": seed})
+    return {"method": "POST", "path": "/v1/chat/completions", "body": body}
+
+
+def turn3_request(task: dict, previous: dict, turn2_result: dict) -> dict:
+    """Третий ход после второго проверенного вызова инструмента."""
+    body = dict(previous["body"])
+    body["tool_choice"] = "none"
+    body["messages"] = [*body["messages"],
+                        {"role": "assistant", "content": turn2_result.get("text") or None,
+                         "tool_calls": turn2_result["tools"]},
+                        {"role": "tool", "tool_call_id": turn2_result["tools"][0]["id"],
+                         "content": json.dumps(task["tool_sequence"][1]["result"], ensure_ascii=False)},
+                        {"role": "user", "content": task["prompt"]}]
     return {"method": "POST", "path": "/v1/chat/completions", "body": body}
 
 
@@ -263,9 +341,9 @@ class SetRunner:
         (self.output / "requests").mkdir()
         self.report = {"status": "RUNNING", "pass_name": pass_name, "seed": seed,
                        "base_url": base_url, "results": [],
-                       "fixture_sha256": {
-                           APPSET_FILE: file_hash(Path(__file__).with_name(APPSET_FILE)),
-                           RUBRIC_FILE: file_hash(Path(__file__).with_name(RUBRIC_FILE))}}
+                       "qualification": "NOT_QUALIFIED",
+                       "provenance_status": "UNVERIFIED",
+                       "fixture_sha256": fixture_hashes()}
         self.save()
 
     def save(self):
@@ -286,21 +364,25 @@ class SetRunner:
         require(proc.returncode == 0, "transport process failed: " + identifier)
         return json.loads((outdir / "result.json").read_text(encoding="utf-8"))
 
-    def _verify_tool_turn(self, result: dict, task: dict) -> None:
+    def _verify_tool_turn(self, result: dict, task: dict, index: int = 0) -> None:
         require(result.get("finish") == "tool_calls" and len(result.get("tools") or []) == 1,
                 task["id"] + ": missing/extra tool call")
         call = result["tools"][0]
         require(call.get("type") == "function" and
                 isinstance(call.get("id"), str) and bool(call["id"]),
                 task["id"] + ": invalid tool identity")
-        require(call["function"]["name"] == task["tool_name"], task["id"] + ": wrong tool")
-        require(json.loads(call["function"]["arguments"]) == task["tool_arguments"],
+        expected = task["tool_sequence"][index]
+        require(call["function"]["name"] == expected["name"], task["id"] + ": wrong tool")
+        require(json.loads(call["function"]["arguments"]) == expected["arguments"],
                 task["id"] + ": wrong tool arguments")
 
     def run_task(self, task: dict) -> dict:
         row = {"id": task["id"], "domain": task["domain"], "bucket": task["bucket"],
                "evaluation": task["evaluation"], "status": "RUNNING"}
         try:
+            require(isinstance(task["id"], str) and
+                    re.fullmatch(r"[a-z0-9][a-z0-9а-яё-]{0,95}", task["id"]) is not None,
+                    "invalid task id")
             steps = build_requests(task, self.pass_name, self.seed)
             results = []
             for identifier, request, kind in steps:
@@ -312,16 +394,25 @@ class SetRunner:
                     self._verify_tool_turn(result, task)
                     request = turn2_request(task, result, self.pass_name, self.seed)
                     steps.append((task["id"] + "-turn2", request, "turn2"))
+                elif kind == "turn2":
+                    self._verify_tool_turn(result, task, 1)
+                    request = turn3_request(task, request, result)
+                    steps.append((task["id"] + "-turn3", request, "turn3"))
             final = results[-1]
             row["finish"] = final.get("finish")
             row["text"] = final.get("text") or ""
+            row["tools"] = final.get("tools") or []
+            row["tool_trace"] = [{"tools": result.get("tools", []),
+                                  "finish": result.get("finish")}
+                                 for result in results if result.get("tools")]
             row["final_result"] = final
             row["usage"] = final.get("usage", {})
             row["metrics"] = final.get("metrics", {})
-            if task["bucket"] == "long":
+            if "target_range" in task:
                 count = row["metrics"].get("prompt_tokens")
-                require(type(count) is int and 20000 <= count <= 64000,
-                        task["id"] + ": длина истории не подтверждена в диапазоне 20K–64K")
+                low, high = task["target_range"]
+                require(type(count) is int and low <= count <= high,
+                        task["id"] + ": длина истории не подтверждена в целевом диапазоне")
             if task.get("autocheck", {}).get("type") != "valid_tool_call":
                 require(final.get("finish") == "stop" and
                         bool((final.get("text") or "").strip()) and
@@ -362,7 +453,8 @@ class SetRunner:
         statuses = {row["status"] for row in self.report["results"]}
         if self.report["status"] != "FAIL":
             self.report["status"] = ("KNOWN_FAILURES" if "KNOWN_LIMIT_FAIL" in statuses else
-                                     "NEEDS_REVIEW" if "NEEDS_REVIEW" in statuses else "PASS")
+                                     "NEEDS_REVIEW" if "NEEDS_REVIEW" in statuses
+                                     else "RECORDED_NOT_QUALIFIED")
         self.save()
 
 
@@ -392,22 +484,41 @@ def export_blind(run_a: Path, run_b: Path, out: Path, seed: int) -> None:
     require(report_a.get("pass_name") in ("greedy", "sampled") and
             report_a.get("pass_name") == report_b.get("pass_name") and
             report_a.get("seed") == report_b.get("seed"), "Несовместимые прогоны")
+    expected_hashes = fixture_hashes()
+    require(report_a.get("fixture_sha256") == report_b.get("fixture_sha256") == expected_hashes,
+            "Разные или отсутствующие хеши набора")
     rubric, pass_criteria = _load_quality_rubric()
     images = appset.image_blocks()
+    image_paths = {}
+    (out / "images").mkdir()
+    for name, block in images.items():
+        url = block["image_url"]["url"]
+        require(url.startswith("data:image/png;base64,"), "Неизвестный формат изображения")
+        content = base64.b64decode(url.split(",", 1)[1], validate=True)
+        digest = hashlib.sha256(content).hexdigest()
+        relative = "images/" + digest + ".png"
+        path = out / relative
+        if not path.exists():
+            path.write_bytes(content)
+        image_paths[name] = relative
     rows, key = [], {}
     counters: dict = {}
     for task in appset.all_tasks():
         counters[task["domain"]] = counters.get(task["domain"], 0) + 1
         pair_id = f"{task['domain']}/{counters[task['domain']]:03d}"
         result_a, result_b = _task_result(report_a, task["id"]), _task_result(report_b, task["id"])
+        require(not result_a.get("error") and not result_b.get("error"),
+                task["id"] + ": транспорт или условия сценария не выполнены")
         pair = {"pair_id": pair_id, "task_class": task["domain"] + "/" + task["bucket"],
                 "evaluation": task["evaluation"],
                 "response_a": {"text": result_a.get("text") or "",
                                "finish": result_a.get("finish"),
-                               "tools": result_a.get("tools")},
+                               "tools": result_a.get("tools"),
+                               "tool_trace": result_a.get("tool_trace", [])},
                 "response_b": {"text": result_b.get("text") or "",
                                "finish": result_b.get("finish"),
-                               "tools": result_b.get("tools")}}
+                               "tools": result_b.get("tools"),
+                               "tool_trace": result_b.get("tool_trace", [])}}
         auto = {}
         if task["evaluation"] == "auto":
             autocheck = task.get("autocheck") or {"type": "valid_tool_call"}
@@ -416,7 +527,8 @@ def export_blind(run_a: Path, run_b: Path, out: Path, seed: int) -> None:
                     "run_b": result_b.get("status") == "PASS" and
                     grade_autocheck(result_b, autocheck)[0]}
         pair["prompt"] = _task_prompt(task)
-        pair["images"] = [images[name] for name in task.get("images", [])]
+        pair["images"] = [image_paths[name] for name in task.get("images", [])]
+        pair["messages"] = _review_messages(task, image_paths)
         pair["expected_facts"] = task.get("expected_facts", [])
         pair["prohibited_errors"] = task.get("prohibited_errors", [])
         pair["expected_values"] = task.get("expected_values", {})
@@ -436,8 +548,7 @@ def export_blind(run_a: Path, run_b: Path, out: Path, seed: int) -> None:
     write_json(out / "manifest.json", {
         "run_a": str(run_a), "run_b": str(run_b), "seed": seed,
         "pairs": len(rows), "pass_name": report_a["pass_name"],
-        "fixture_sha256": {APPSET_FILE: file_hash(Path(__file__).with_name(APPSET_FILE)),
-                           RUBRIC_FILE: file_hash(Path(__file__).with_name(RUBRIC_FILE))}})
+        "fixture_sha256": expected_hashes})
 
 
 def _task_prompt(task: dict) -> str:
@@ -457,6 +568,37 @@ def _task_prompt(task: dict) -> str:
         elif isinstance(content, list):
             parts += [item.get("text", "") for item in content if item.get("type") == "text"]
     return "\n".join(parts)
+
+
+def _review_messages(task: dict, image_paths: dict) -> list:
+    """История для рецензента; ссылки на PNG не раскрывают вариант."""
+    if "hermes_case" in task:
+        case = next(case for case in hermes_synth.load_cases()
+                    if case["id"] == task["hermes_case"])
+        messages = copy.deepcopy(hermes_synth.build_request(case)["messages"])
+    elif "messages" in task:
+        messages = copy.deepcopy(task["messages"])
+    elif "first_prompt" in task:
+        messages = [{"role": "user", "content": task["first_prompt"]},
+                    {"role": "tool", "content": json.dumps(task["tool_result"],
+                                                           ensure_ascii=False)},
+                    {"role": "user", "content": task["second_prompt"]},
+                    {"role": "tool", "content": json.dumps(task["tool_sequence"][1]["result"],
+                                                           ensure_ascii=False)},
+                    {"role": "user", "content": task["prompt"]}]
+    else:
+        messages = [{"role": "user", "content": task["prompt"]}]
+    for message in messages:
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if part.get("type") != "image_url":
+                continue
+            url = part["image_url"]["url"]
+            raw = base64.b64decode(url.split(",", 1)[1], validate=True)
+            part["image_url"]["url"] = "images/" + hashlib.sha256(raw).hexdigest() + ".png"
+    return messages
 
 
 def unblind(blind_dir: Path, reviews_path: Path | None) -> dict:
