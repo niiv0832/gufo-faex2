@@ -384,6 +384,24 @@ class AutocheckTests(unittest.TestCase):
         call["function"]["arguments"] = '{"limit":5}'
         self.assertFalse(runner.grade_autocheck(result, task["autocheck"])[0])
 
+    def test_hermes_parallel_tool_calls_checked_strictly(self):
+        task = next(t for t in appset.new_tasks() if t["id"] == "hermes-reuse-mixed-02")
+        good_calls = [
+            {"id": "1", "type": "function",
+             "function": {"name": "read_file", "arguments": '{"path":"/home/user/work/schedule.csv"}'}},
+            {"id": "2", "type": "function",
+             "function": {"name": "read_file", "arguments": '{"path":"/home/user/work/notes.md"}'}},
+        ]
+        self.assertTrue(runner.grade_autocheck(
+            {"finish": "tool_calls", "tools": good_calls}, task["autocheck"])[0])
+        bad_second = [
+            good_calls[0],
+            {"id": "2", "type": "function",
+             "function": {"name": "read_file", "arguments": '{"unknown_arg":1}'}},
+        ]
+        self.assertFalse(runner.grade_autocheck(
+            {"finish": "tool_calls", "tools": bad_second}, task["autocheck"])[0])
+
     def test_every_auto_spec_is_satisfiable_by_a_correct_answer(self):
         """Каждая автопроверка набора должна пропускать эталонный ответ."""
         for task in appset.all_tasks():

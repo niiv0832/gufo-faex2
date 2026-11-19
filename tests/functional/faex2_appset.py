@@ -418,15 +418,15 @@ def _code_tasks():
                               "    def h(a):\n        total = 0\n        for x in a:\n"
                               "            total += x\n        return total / len(a)\n"
                               "и чему равен её результат для a = [2, 4, 6].",
-                       max_completion_tokens=384,
+                       max_completion_tokens=768,
                        expected_values={"answer": 4}))
     tasks.append(_task("code-explain-words-2", "code-explain", "short", "manual", "off",
                        prompt="Объясни школьнику простыми словами, что делает функция\n"
                               "    def k(a):\n        best = a[0]\n        for x in a:\n"
                               "            if x > best:\n                best = x\n"
                               "        return best\n"
-                              "и чему равен её результат для a = [5, 12, 3].",
-                       max_completion_tokens=384,
+                       "и чему равен её результат для a = [5, 12, 3].",
+                       max_completion_tokens=768,
                        expected_values={"answer": 12}))
     return tasks
 

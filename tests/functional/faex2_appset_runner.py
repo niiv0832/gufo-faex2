@@ -88,15 +88,43 @@ def _bullets(text: str) -> int:
 
 
 def _valid_tool_call(result: dict) -> bool:
-    if result.get("finish") != "tool_calls" or len(result.get("tools") or []) != 1:
+    tools = result.get("tools") or []
+    if result.get("finish") != "tool_calls" or not tools:
         return False
-    call = result["tools"][0]
-    if call.get("type") != "function" or not call.get("id"):
-        return False
-    try:
-        return isinstance(json.loads(call["function"]["arguments"]), dict)
-    except (ValueError, TypeError):
-        return False
+    for call in tools:
+        if call.get("type") != "function" or not call.get("id"):
+            return False
+        function = call.get("function") or {}
+        if not isinstance(function.get("name"), str) or not function["name"]:
+            return False
+        try:
+            if not isinstance(json.loads(function["arguments"]), dict):
+                return False
+        except (ValueError, TypeError):
+            return False
+    return True
+
+
+def _validate_hermes_args(name: str, arguments: dict, definitions: dict) -> str | None:
+    if name not in definitions:
+        return None
+    schema = definitions[name]["parameters"]
+    properties = schema["properties"]
+    for required_name in schema.get("required", []):
+        if required_name not in arguments:
+            return "missing required tool argument: " + required_name
+    for key, value in arguments.items():
+        if key not in properties:
+            return "unknown tool argument"
+        constraint = properties[key]
+        kind = constraint.get("type")
+        if kind == "string" and not isinstance(value, str):
+            return "invalid string argument"
+        if kind == "integer" and (type(value) is not int or
+                ("minimum" in constraint and value < constraint["minimum"]) or
+                ("maximum" in constraint and value > constraint["maximum"])):
+            return "invalid integer argument"
+    return None
 
 
 def grade_long_facts(task: dict, text: str) -> list:
@@ -177,36 +205,35 @@ def grade_autocheck(result: dict, autocheck: dict):
     if kind == "valid_tool_call":
         if not _valid_tool_call(result):
             return False, "invalid tool identity or JSON"
-        function = result["tools"][0]["function"]
-        if "name" in autocheck and function.get("name") != autocheck["name"]:
+        tools = result["tools"]
+        matching = [call for call in tools
+                    if "name" not in autocheck or call["function"].get("name") == autocheck["name"]]
+        if not matching:
             return False, "wrong tool name"
-        arguments = json.loads(function["arguments"])
         field = autocheck.get("required_text")
         if field is not None:
-            value = arguments.get(field)
-            if not isinstance(value, str) or not value.strip():
-                return False, "missing text argument"
-            if "contains" in autocheck and autocheck["contains"] not in value:
-                return False, "wrong text argument"
-        if function.get("name") in ("web_search", "read_file") and field:
             definitions = {t["function"]["name"]: t["function"]
                            for t in hermes_synth.load_base()["tools"]}
-            schema = definitions[function["name"]]["parameters"]
-            properties = schema["properties"]
-            for required_name in schema.get("required", []):
-                if required_name not in arguments:
-                    return False, "missing required tool argument: " + required_name
-            for key, value in arguments.items():
-                if key not in properties:
-                    return False, "unknown tool argument"
-                constraint = properties[key]
-                kind = constraint.get("type")
-                if kind == "string" and not isinstance(value, str):
-                    return False, "invalid string argument"
-                if kind == "integer" and (type(value) is not int or
-                        ("minimum" in constraint and value < constraint["minimum"]) or
-                        ("maximum" in constraint and value > constraint["maximum"])):
-                    return False, "invalid integer argument"
+            for call in tools:
+                name = call["function"].get("name")
+                if name in definitions:
+                    err = _validate_hermes_args(name, json.loads(call["function"]["arguments"]),
+                                                definitions)
+                    if err is not None:
+                        return False, err
+            matched, first_err = False, None
+            for call in matching:
+                arguments = json.loads(call["function"]["arguments"])
+                value = arguments.get(field)
+                if not isinstance(value, str) or not value.strip():
+                    first_err = first_err or "missing text argument"
+                elif "contains" in autocheck and autocheck["contains"] not in value:
+                    first_err = first_err or "wrong text argument"
+                else:
+                    matched = True
+                    break
+            if not matched:
+                return False, first_err or "wrong text argument"
         return True, "valid_tool_call"
     raise ValueError("Неизвестная автопроверка: " + kind)
 
@@ -967,6 +994,8 @@ def main() -> None:
     rep.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if args.command == "run":
+        if not args.skip_server_check:
+            import jsonschema  # noqa: F401 - требуется для strict tool / json_schema в metrics.py
         runner = SetRunner(args.base_url, args.output, args.pass_name, args.seed,
                            args.timeout)
         if not args.skip_server_check:
