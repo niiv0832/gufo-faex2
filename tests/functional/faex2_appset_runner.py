@@ -731,6 +731,13 @@ def unblind(blind_dir: Path, reviews_path: Path | None) -> dict:
 
 def _task_text_for_tokenize(task: dict) -> str:
     """Собрать текстовое содержимое задачи для грубой калибровки через POST /tokenize."""
+    if "hermes_case" in task:
+        case = next(c for c in hermes_synth.load_cases() if c["id"] == task["hermes_case"])
+        req = hermes_synth.build_request(case)
+        parts = [json.dumps(req.get("tools", []), ensure_ascii=False)]
+        for msg in req["messages"]:
+            parts.append(str(msg.get("content") or ""))
+        return "\n".join(parts)
     if "first_prompt" in task:
         return task["first_prompt"] + "\n" + task.get("second_prompt", "") + "\n" + task.get("prompt", "")
     if "prompt" in task:

@@ -19,10 +19,10 @@ from faex2_remediation_images import ADVANCE, FONT, LINE, SCALE, _draw
 from faex2_images import _png_content
 from faex2_vision_probes import BLACK, WHITE, _Canvas, _pixel_text
 
-# Оценка «символов на токен» для калибровки длинных документов.
+# Оценка «символов на токен» для калибровки длинных документов (откалибровано по /tokenize 35B-A3B).
 # Точная длина на стенде проверяется фактическим prompt_tokens (POST /tokenize
 # или input_tokens); эта константа нужна только для детерминированной генерации.
-CHARS_PER_TOKEN = 2.4
+CHARS_PER_TOKEN = 3.0
 SPARSE_THRESHOLD = 18_560
 
 _WINDS = ("С", "СВ", "В", "ЮВ", "Ю", "ЮЗ", "З", "СЗ")
@@ -650,7 +650,7 @@ def _long_dialog_text(doc_index: int, target_tokens: int) -> str:
 def _d_tasks():
     tasks = []
     extra_images = {}
-    short_target, long_target = 24_000, 50_000
+    short_target, long_target = 25_000, 52_000
 
     # long-retell: документы 1-4 (короткие) и 5-8 (длинные), все manual.
     for doc_index in range(1, 9):
@@ -678,12 +678,12 @@ def _d_tasks():
                                fact_position=position))
 
     # long-tool-dialog: история из «логов инструментов», 4 уникальных сценария × 2 длины.
-    # Короткий диапазон: 18K + 6K ≈ 24K (с запасом внутри 20K–32K); длинный: 40K + 16K ≈ 56K.
+    # Короткий диапазон: 20K + 6K ≈ 26K (внутри 20K–32K); длинный: 38K + 14K ≈ 52K (внутри 44K–64K).
     for variant, (doc_index, first_target, second_target) in enumerate((
-            (3, 18_000, 6_000),
-            (7, 40_000, 16_000),
-            (4, 18_000, 6_000),
-            (8, 40_000, 16_000))):
+            (3, 20_000, 6_000),
+            (7, 38_000, 14_000),
+            (4, 20_000, 6_000),
+            (8, 38_000, 14_000))):
         first = _long_dialog_text(doc_index, first_target)
         second = _long_dialog_text(doc_index + 20, second_target)
         if variant == 0:
@@ -716,7 +716,7 @@ def _d_tasks():
             needle = "8832 A"
         tasks.append(_task(f"long-tool-dialog-{variant + 1}", "long-tool-dialog", "long",
                            "auto", "hermes", max_completion_tokens=768,
-                           target_range=[20000, 32000] if first_target == 18_000 else [44000, 64000],
+                           target_range=[20000, 32000] if first_target == 20_000 else [44000, 64000],
                            historical_tools=[{"type": "function", "function": {
                                "name": "read_log", "description": "Чтение синтетического журнала",
                                "strict": True, "parameters": {
