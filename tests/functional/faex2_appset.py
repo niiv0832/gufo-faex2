@@ -556,15 +556,16 @@ def _a_new_tasks():
                   {"type": "contains_all", "values": ["корень", "стебель", "лист", "цветок"]}]}),
         _task("spelling-park", "spelling", "short", "auto", "off",
               prompt="Исправь орфографические и пунктуационные ошибки и запиши исправленный "
-                     "текст целиком: «Мы пришло в парк. Трава была высокая? Солнце светило "
-                     "ярче чем вчера.»",
+                     "текст целиком без пояснений: «Мы пришло в парк. Трава была высокая? "
+                     "Солнце светило ярче чем вчера.»",
               max_completion_tokens=256,
               autocheck={"type": "all", "checks": [
                   {"type": "contains_all", "values": ["пришли", "ярче, чем"]},
                   {"type": "excludes_all", "values": ["пришло", "?"]}]}),
         _task("spelling-forest", "spelling", "short", "auto", "off",
-              prompt="Исправь орфографические ошибки и запиши исправленный текст целиком: "
-                     "«Дети пошли в лис. В густом лесу росли грибы. Мы взяли корзину и ножници.»",
+              prompt="Исправь орфографические ошибки и запиши исправленный текст целиком "
+                     "без пояснений: «Дети пошли в лис. В густом лесу росли грибы. "
+                     "Мы взяли корзину и ножници.»",
               max_completion_tokens=256,
               autocheck={"type": "all", "checks": [
                   {"type": "contains_all", "values": ["ножницы"]},
@@ -676,31 +677,46 @@ def _d_tasks():
                                expected_values=values, fact_day=values["day"],
                                fact_position=position))
 
-    # long-tool-dialog: история из «логов инструментов», 2 сценария × 2 длины.
-    # Короткий диапазон: 24K + 8K ≈ 32K; длинный: 40K + 16K ≈ 56K.
+    # long-tool-dialog: история из «логов инструментов», 4 уникальных сценария × 2 длины.
+    # Короткий диапазон: 18K + 6K ≈ 24K (с запасом внутри 20K–32K); длинный: 40K + 16K ≈ 56K.
     for variant, (doc_index, first_target, second_target) in enumerate((
-            (3, short_target, 8_000),
+            (3, 18_000, 6_000),
             (7, 40_000, 16_000),
-            (4, short_target, 8_000),
+            (4, 18_000, 6_000),
             (8, 40_000, 16_000))):
         first = _long_dialog_text(doc_index, first_target)
         second = _long_dialog_text(doc_index + 20, second_target)
-        if variant < 2:
+        if variant == 0:
             first = "Лог проверки серверов:\nСервер ALPHA: ошибка MEM, код 2F.\n" + first
             second = "Второй лог (без ошибок MEM):\n" + second
             final = ("В первом логе найди имя сервера с ошибкой MEM и её код. "
                      "Ответь в формате: ИМЯ КОД.")
             autocheck = {"type": "contains_all", "values": ["ALPHA", "2F"]}
             needle = "ALPHA 2F"
-        else:
+        elif variant == 1:
+            first = "Лог проверки серверов:\nСервер BRAVO: ошибка CRC, код 7C.\n" + first
+            second = "Второй лог (без ошибок CRC):\n" + second
+            final = ("В первом логе найди имя сервера с ошибкой CRC и её код. "
+                     "Ответь в формате: ИМЯ КОД.")
+            autocheck = {"type": "contains_all", "values": ["BRAVO", "7C"]}
+            needle = "BRAVO 7C"
+        elif variant == 2:
             first = "Инвентарный список ангара A:\n" + first
-            second = "Инвентарный список ангара B:\n" + second.replace("осадки —", "предмет 4471 —", 1)
+            second = "Инвентарный список ангара B:\n" + second.replace(
+                "осадки —", "предмет 4471 —", 1)
             final = "В каком ангаре находится предмет с инвентарным номером 4471? Ответь одной буквой."
             autocheck = {"type": "compact", "value": "B"}
             needle = "4471 B"
+        else:
+            first = "Инвентарный список ангара A:\n" + first.replace(
+                "осадки —", "предмет 8832 —", 1)
+            second = "Инвентарный список ангара B:\n" + second
+            final = "В каком ангаре находится предмет с инвентарным номером 8832? Ответь одной буквой."
+            autocheck = {"type": "compact", "value": "A"}
+            needle = "8832 A"
         tasks.append(_task(f"long-tool-dialog-{variant + 1}", "long-tool-dialog", "long",
                            "auto", "hermes", max_completion_tokens=768,
-                           target_range=[20000, 32000] if first_target == short_target else [44000, 64000],
+                           target_range=[20000, 32000] if first_target == 18_000 else [44000, 64000],
                            historical_tools=[{"type": "function", "function": {
                                "name": "read_log", "description": "Чтение синтетического журнала",
                                "strict": True, "parameters": {
@@ -719,34 +735,46 @@ def _d_tasks():
                                      {"role": "user", "content": final}],
                            autocheck=autocheck, expected_values={"needle": needle}))
 
-    # long-vision-dialog: изображение в середине длинной истории, 2 сценария × 2 длины.
-    for variant, (doc_index, target) in enumerate(((4, short_target), (9, long_target),
-                                                   (4, short_target), (9, long_target))):
+    # long-vision-dialog: 4 уникальных диалога с изображением в середине длинной истории.
+    vision_specs = (
+        (10, short_target, "table-a", "table", 10),
+        (11, long_target, "formula-a", "formula", 9),
+        (12, short_target, "table-b", "table", 12),
+        (13, long_target, "formula-b", "formula", 15),
+    )
+    for variant, (doc_index, target, image_name, kind, day) in enumerate(vision_specs):
         text, facts = long_document(doc_index, target)
-        if variant % 2 == 0:
-            image_name = "table-a"
-            question = ("На изображении таблица. Какое число находится в строке 2, столбце 3, "
-                        "и какая температура была в день 10 документа? Ответь двумя значениями "
-                        "через пробел: число таблицы и температура.")
-            autocheck = {"type": "numbers_all", "values": [11, facts[10]["temp"]]}
-            expected = {"table_cell": "11", "temp_day_10": facts[10]["temp"]}
+        midpoint = text.find("День ", len(text) // 2)
+        if midpoint <= 0:
+            midpoint = len(text) // 2
+        part1, part2 = text[:midpoint], text[midpoint:]
+        if kind == "table":
+            row_idx, col_idx = (1, 2) if image_name == "table-a" else (2, 1)
+            cell_value = _TABLES[image_name][row_idx][col_idx]
+            question = (f"На изображении таблица. Какое число находится в строке {row_idx + 1}, "
+                        f"столбце {col_idx + 1}, и какая температура была в день {day} документа? "
+                        "Ответь двумя значениями через пробел: число таблицы и температура.")
+            autocheck = {"type": "numbers_all", "values": [cell_value, facts[day]["temp"]]}
+            expected = {"table_cell": str(cell_value), f"temp_day_{day}": facts[day]["temp"],
+                        "day": day}
         else:
-            image_name = "formula-a"
-            question = ("На изображении формула для X. Чему равен X и какие осадки были в "
-                        "день 9 документа? Ответь числом и словом через пробел.")
-            autocheck = {"type": "contains_all", "values": ["7", facts[9]["precip"]]}
-            expected = {"x": 7, "precip_day_9": facts[9]["precip"]}
+            x_val = _FORMULAS[image_name][1]
+            question = (f"На изображении формула для X. Чему равен X и какие осадки были в "
+                        f"день {day} документа? Ответь числом и словом через пробел.")
+            autocheck = {"type": "contains_all", "values": [str(x_val), facts[day]["precip"]]}
+            expected = {"x": x_val, f"precip_day_{day}": facts[day]["precip"], "day": day}
         tasks.append(_task(f"long-vision-dialog-{variant + 1}", "long-vision-dialog", "long",
                            "auto", "hermes", max_completion_tokens=768,
                            target_range=[20000, 32000] if target == short_target else [44000, 64000],
                            messages=[{"role": "user", "content": [
-                               image(image_name) if variant % 2 == 0 else image(image_name),
-                               {"type": "text", "text": text}]},
+                               {"type": "text", "text": part1},
+                               image(image_name),
+                               {"type": "text", "text": part2}]},
                                {"role": "assistant", "content": "Изображение и документ получены."},
                                {"role": "user", "content": question}],
                            images=[image_name], autocheck=autocheck,
                            expected_values=expected))
-        extra_images.setdefault(image_name, True)
+        extra_images[image_name] = image(image_name)
 
     return tasks, extra_images
 

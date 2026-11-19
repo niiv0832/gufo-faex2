@@ -164,27 +164,81 @@ class RegistryTests(unittest.TestCase):
             self.assertIn(f"День {day}: температура {value},", task["prompt"])
 
     def test_long_vision_answers_are_backed_by_actual_document(self):
+        seen_signatures = set()
         for task in self.new:
             if task["domain"] != "long-vision-dialog":
                 continue
             content = task["messages"][0]["content"]
-            text = next(item["text"] for item in content if item["type"] == "text")
+            self.assertEqual([item["type"] for item in content],
+                             ["text", "image_url", "text"], task["id"])
+            self.assertTrue(content[0]["text"].strip() and content[2]["text"].strip(),
+                            task["id"])
+            text = content[0]["text"] + content[2]["text"]
             expected = task["expected_values"]
+            day = expected["day"]
+            seen_signatures.add((tuple(task["images"]), task["messages"][-1]["content"],
+                                 content[0]["text"][:64]))
             with self.subTest(task=task["id"]):
-                if "temp_day_10" in expected:
-                    self.assertIn("День 10: температура " + str(expected["temp_day_10"]) + ",", text)
+                temp_key = f"temp_day_{day}"
+                if temp_key in expected:
+                    self.assertIn(f"День {day}: температура {expected[temp_key]},", text)
                 else:
-                    line = next(line for line in text.split("День ") if line.startswith("9:"))
-                    self.assertIn("осадки — " + expected["precip_day_9"] + ".", line)
+                    precip_key = f"precip_day_{day}"
+                    line = next(line for line in text.split("День ")
+                                if line.startswith(f"{day}:"))
+                    self.assertIn("осадки — " + expected[precip_key] + ".", line)
+        self.assertEqual(len(seen_signatures), 4)
 
     def test_long_tool_answer_is_contained_in_history(self):
+        seen_needles = set()
         for task in self.new:
             if task["domain"] != "long-tool-dialog":
                 continue
             history = "\n".join(m.get("content") or "" for m in task["messages"][:-1])
+            seen_needles.add(task["expected_values"]["needle"])
+            estimate = len(history) / appset.CHARS_PER_TOKEN
+            low, high = task["target_range"]
+            self.assertGreater(estimate, low + 2000, task["id"])
+            self.assertLess(estimate, high - 2000, task["id"])
             with self.subTest(task=task["id"]):
                 for value in task["expected_values"]["needle"].split():
                     self.assertIn(value, history)
+        self.assertEqual(len(seen_needles), 4)
+
+    def test_goldens_are_independently_verified(self):
+        for name, (lines, total) in appset._RECEIPTS.items():
+            with self.subTest(receipt=name):
+                item_sum = sum(int(line.rsplit(" ", 1)[1]) for line in lines[1:])
+                self.assertEqual(item_sum, total)
+        for name, (expr, x_val) in appset._FORMULAS.items():
+            with self.subTest(formula=name):
+                rhs = expr.split("=", 1)[1].strip()
+                self.assertEqual(eval(rhs, {"__builtins__": {}}, {}), x_val)
+        self.assertEqual(appset._TABLES["table-a"][1][2], 11)
+        self.assertEqual(sum(v for row in appset._TABLES["table-b"] for v in row), 225)
+        self.assertEqual(appset._TABLES["table-c"][2][0], 49)
+        self.assertEqual(sum(v > 10 for row in appset._TABLES["table-d"] for v in row), 5)
+        self.assertEqual(sum(v for row in appset._TABLES["table-e"] for v in row), 2100)
+        self.assertEqual(appset._TABLES["table-f"][0][1], 8)
+        self.assertEqual(self.by_id["dialog-corr-notebooks"]["expected_values"],
+                         {"initial": 3 * 60 + 50, "corrected": 5 * 60 + 50})
+        self.assertEqual(self.by_id["dialog-corr-pens"]["expected_values"],
+                         {"initial": 4 * 25 + 20, "corrected": 6 * 25 + 20})
+        self.assertEqual(self.by_id["physics-train"]["expected_values"], {"speed_km_h": 240 // 4})
+        self.assertEqual(self.by_id["physics-bike"]["expected_values"], {"speed_km_h": 36 // 2})
+        # Независимая проверка Python-задач code-fix и code-explain.
+        self.assertEqual(sum(range(1, 6)), self.by_id["code-fix-sum-range"]["expected_values"]["answer"])
+        self.assertEqual(str(sorted([3, 1, 2])), self.by_id["code-fix-sort-order"]["expected_values"]["answer"])
+        self.assertEqual(sum(x > 10 for x in [5, 12, 8, 20]),
+                         self.by_id["code-fix-loop-bound"]["expected_values"]["answer"])
+        self.assertEqual([7, 4, 9][0], self.by_id["code-fix-index"]["expected_values"]["answer"])
+        self.assertEqual(2 * 3 * 4, self.by_id["code-fix-product"]["expected_values"]["answer"])
+        self.assertEqual("АБВ"[:], self.by_id["code-fix-slice"]["expected_values"]["answer"])
+        self.assertEqual([1, 5, 9, 3][-2], self.by_id["code-explain-last"]["expected_values"]["answer"])
+        self.assertEqual(len(set([1, 2, 2, 3])), self.by_id["code-explain-set"]["expected_values"]["answer"])
+        self.assertEqual(sum([2, 4, 6]) / len([2, 4, 6]),
+                         self.by_id["code-explain-words-1"]["expected_values"]["answer"])
+        self.assertEqual(max([5, 12, 3]), self.by_id["code-explain-words-2"]["expected_values"]["answer"])
 
     def test_long_tool_dialog_contains_two_valid_tool_results(self):
         for task in self.new:
@@ -326,6 +380,8 @@ class AutocheckTests(unittest.TestCase):
         call["function"]["arguments"] = '{"query":3}'
         self.assertFalse(runner.grade_autocheck(result, task["autocheck"])[0])
         call["function"]["arguments"] = '{"query":"затмение","limit":101}'
+        self.assertFalse(runner.grade_autocheck(result, task["autocheck"])[0])
+        call["function"]["arguments"] = '{"limit":5}'
         self.assertFalse(runner.grade_autocheck(result, task["autocheck"])[0])
 
     def test_every_auto_spec_is_satisfiable_by_a_correct_answer(self):
@@ -681,13 +737,19 @@ class BlindProtocolTests(unittest.TestCase):
         runner.export_blind(self.run_a, self.run_b, out, 20261119)
         return out
 
+    def _key_path(self, out):
+        return out.parent / (out.name + ".key.json")
+
     def test_export_hides_identity_and_keeps_review_material(self):
         out = self._blind()
         pairs = [json.loads(line) for line in
                  (out / "blind_pairs.jsonl").read_text(encoding="utf-8").splitlines()]
-        key = json.loads((out / "blinding_key.json").read_text(encoding="utf-8"))
+        key = json.loads(self._key_path(out).read_text(encoding="utf-8"))
         self.assertEqual(len(pairs), 96)
         self.assertEqual(len(key["pairs"]), 96)
+        self.assertFalse((out / "blinding_key.json").exists())
+        self.assertNotIn("run_a", (out / "manifest.json").read_text(encoding="utf-8"))
+        self.assertNotIn("run_b", (out / "manifest.json").read_text(encoding="utf-8"))
         for pair in pairs:
             self.assertNotIn("id", pair)
             self.assertNotIn("run_a", json.dumps(pair))
@@ -755,7 +817,7 @@ class BlindProtocolTests(unittest.TestCase):
                     bad = {"scores": {"correctness": 0, "instruction": 2,
                                       "russian_clarity": 2, "explanation": 2},
                            "critical_failures": [], "rationale": "Ошибка"}
-                    key = json.loads((out / "blinding_key.json").read_text(encoding="utf-8"))
+                    key = json.loads(self._key_path(out).read_text(encoding="utf-8"))
                     entry = key["pairs"][pair["pair_id"]]
                     a = bad if entry["task"] == wrong and entry["a_is"] == "run_b" else grade
                     b = bad if entry["task"] == wrong and entry["a_is"] == "run_a" else grade
@@ -789,7 +851,7 @@ class BlindProtocolTests(unittest.TestCase):
 
     def test_unblind_tracks_independent_manual_review_per_original_side(self):
         out = self._blind()
-        key = json.loads((out / "blinding_key.json").read_text(encoding="utf-8"))["pairs"]
+        key = json.loads(self._key_path(out).read_text(encoding="utf-8"))["pairs"]
         pairs = [json.loads(line) for line in
                  (out / "blind_pairs.jsonl").read_text(encoding="utf-8").splitlines()]
         chosen = next(pair for pair in pairs if pair["evaluation"] == "manual"
@@ -815,7 +877,7 @@ class BlindProtocolTests(unittest.TestCase):
 
     def test_sampled_auto_answer_is_also_reviewed_blindly(self):
         out = self._blind()
-        key = json.loads((out / "blinding_key.json").read_text(encoding="utf-8"))["pairs"]
+        key = json.loads(self._key_path(out).read_text(encoding="utf-8"))["pairs"]
         pairs = [json.loads(line) for line in
                  (out / "blind_pairs.jsonl").read_text(encoding="utf-8").splitlines()]
         chosen = next(pair for pair in pairs if pair["evaluation"] == "auto"
@@ -835,6 +897,141 @@ class BlindProtocolTests(unittest.TestCase):
                                           ensure_ascii=False) + "\n")
         summary = runner.unblind(out, reviews)
         self.assertEqual(summary["outcomes"]["only_b"], 1)
+
+
+class ProvenanceCalibrateAndReportTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_verify_server_and_calibrate_via_loopback_transport(self):
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *_):
+                pass
+
+            def do_GET(self):
+                routes = {
+                    "/health": {"status": "ok"},
+                    "/ready": {"status": "ready", "model": runner.ALIAS},
+                    "/props": {"model_alias": runner.ALIAS, "model": runner.ALIAS, "total_slots": 4},
+                    "/v1/models": {"object": "list", "data": [{"id": runner.ALIAS}]},
+                }
+                payload = json.dumps(routes[self.path]).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                approx = max(1, int(len(body["content"]) / appset.CHARS_PER_TOKEN))
+                payload = json.dumps({"tokens": list(range(approx))}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            url = f"http://127.0.0.1:{server.server_port}"
+            set_runner = runner.SetRunner(url, self.tmp / "run", "greedy", 0)
+            prov = set_runner.verify_server()
+            self.assertEqual(set_runner.report["provenance_status"], "VERIFIED")
+            self.assertEqual(prov["props"]["model_alias"], runner.ALIAS)
+            long_tasks = [t for t in appset.new_tasks() if t["domain"] in ("long-facts", "tool-chain")][:4]
+            cal = runner.calibrate_lengths(url, long_tasks, self.tmp / "cal", verify=True)
+            self.assertEqual(cal["status"], "CALIBRATED")
+            self.assertEqual(cal["provenance_status"], "VERIFIED")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
+    def _make_greedy_run(self, name: str, provenance: str = "VERIFIED",
+                         wrong_auto_ids=(), long_facts_correct: int = 24):
+        path = self.tmp / name
+        path.mkdir(parents=True)
+        rows = []
+        lf_remaining = long_facts_correct
+        for task in appset.all_tasks():
+            if task["evaluation"] == "known_limit":
+                rows.append({"id": task["id"], "domain": task["domain"],
+                             "bucket": task["bucket"], "evaluation": "known_limit",
+                             "status": "KNOWN_LIMIT_FAIL", "finish": "stop", "text": "WRONG"})
+                continue
+            status = "FAIL" if task["id"] in wrong_auto_ids else "PASS"
+            row = {"id": task["id"], "domain": task["domain"], "bucket": task["bucket"],
+                   "evaluation": task["evaluation"], "status": status,
+                   "finish": "stop", "text": "ok"}
+            if task["domain"] == "long-facts":
+                c0 = lf_remaining > 0
+                lf_remaining -= 1
+                c1 = lf_remaining > 0
+                lf_remaining -= 1
+                row["fact_checks"] = [c0, c1]
+            rows.append(row)
+        (path / "report.json").write_text(json.dumps({
+            "status": "PASS", "pass_name": "greedy", "seed": 0,
+            "provenance_status": provenance, "fixture_sha256": runner.fixture_hashes(),
+            "results": rows,
+        }, ensure_ascii=False), encoding="utf-8")
+        return path
+
+    def _make_sampled_unblind(self, name: str, a_wrong: int, b_wrong: int, crit_b: int = 0):
+        path = self.tmp / name
+        path.mkdir(parents=True)
+        (path / "unblinded.json").write_text(json.dumps({
+            "outcomes": {"both_ok": 94 - a_wrong - b_wrong, "only_a": a_wrong,
+                         "only_b": b_wrong, "both_fail": 0},
+            "total_graded_pairs": 94,
+            "per_variant": {"a": {"ok": 94 - a_wrong, "wrong": a_wrong, "not_graded": 2},
+                            "b": {"ok": 94 - b_wrong, "wrong": b_wrong, "not_graded": 2}},
+            "critical_counts": {"a": 0, "b": crit_b},
+            "by_domain": {"ocr-text": {"both_ok": 8, "only_a": 0, "only_b": 0, "both_fail": 0}},
+            "paired_difference": {"a_minus_b": (a_wrong - b_wrong) / 94,
+                                  "b_minus_a": (b_wrong - a_wrong) / 94},
+        }), encoding="utf-8")
+        return path
+
+    def test_report_enforces_provenance_and_barriers(self):
+        ga = self._make_greedy_run("ga", provenance="VERIFIED")
+        gb_unverified = self._make_greedy_run("gb-u", provenance="UNVERIFIED")
+        sampled_tie = self._make_sampled_unblind("sb-tie", a_wrong=2, b_wrong=2)
+        rep1 = runner.build_appset_report(ga, gb_unverified, self.tmp / "r1.json",
+                                          sampled_unblind=sampled_tie)
+        self.assertEqual(rep1["status"], "INCOMPLETE_PROVENANCE")
+
+        gb_ok = self._make_greedy_run("gb-ok", provenance="VERIFIED", long_facts_correct=22)
+        rep_no_sampled = runner.build_appset_report(ga, gb_ok, self.tmp / "r2.json")
+        self.assertEqual(rep_no_sampled["status"], "NOT_EXERCISED")
+
+        rep_pass = runner.build_appset_report(ga, gb_ok, self.tmp / "r3.json",
+                                              sampled_unblind=sampled_tie)
+        self.assertEqual(rep_pass["status"], "DESCRIPTIVE_TASK_GATE_PASS")
+        self.assertEqual(rep_pass["q1_qualification"], "REQUIRES_NUMERICAL_SLICE")
+        self.assertEqual(len(rep_pass["known_limit_isolated"]), 2)
+
+        gb_bad_lf = self._make_greedy_run("gb-lf", provenance="VERIFIED", long_facts_correct=21)
+        rep_fail_lf = runner.build_appset_report(ga, gb_bad_lf, self.tmp / "r4.json",
+                                                 sampled_unblind=sampled_tie)
+        self.assertEqual(rep_fail_lf["status"], "FAIL")
+
+        gb_bad_auto = self._make_greedy_run("gb-a", provenance="VERIFIED",
+                                            wrong_auto_ids=("ocr-table-a", "ocr-table-b"))
+        rep_fail_auto = runner.build_appset_report(ga, gb_bad_auto, self.tmp / "r5.json",
+                                                   sampled_unblind=sampled_tie)
+        self.assertEqual(rep_fail_auto["status"], "FAIL")
+
+        sampled_bad = self._make_sampled_unblind("sb-bad", a_wrong=0, b_wrong=5)
+        rep_fail_sampled = runner.build_appset_report(ga, gb_ok, self.tmp / "r6.json",
+                                                      sampled_unblind=sampled_bad)
+        self.assertEqual(rep_fail_sampled["status"], "FAIL")
 
 
 if __name__ == "__main__":

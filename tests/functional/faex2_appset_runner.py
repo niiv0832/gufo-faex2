@@ -25,6 +25,7 @@ import base64
 import copy
 import hashlib
 import json
+import os
 from pathlib import Path
 import random
 import re
@@ -192,6 +193,9 @@ def grade_autocheck(result: dict, autocheck: dict):
                            for t in hermes_synth.load_base()["tools"]}
             schema = definitions[function["name"]]["parameters"]
             properties = schema["properties"]
+            for required_name in schema.get("required", []):
+                if required_name not in arguments:
+                    return False, "missing required tool argument: " + required_name
             for key, value in arguments.items():
                 if key not in properties:
                     return False, "unknown tool argument"
@@ -364,6 +368,30 @@ class SetRunner:
         require(proc.returncode == 0, "transport process failed: " + identifier)
         return json.loads((outdir / "result.json").read_text(encoding="utf-8"))
 
+    def verify_server(self) -> dict:
+        """Снять провенанс живого сервера (/health, /ready, /props, /v1/models)."""
+        provenance = {}
+        for key, path in (("health", "/health"), ("ready", "/ready"),
+                          ("props", "/props"), ("models", "/v1/models")):
+            result = self._transport("discovery-" + key,
+                                     {"method": "GET", "path": path, "body": None})
+            require(result.get("status") == "PASS" and result.get("http_status") == 200,
+                    f"discovery {path} failed")
+            provenance[key] = result.get("response")
+        require(provenance["health"] == {"status": "ok"}, "bad health")
+        require(provenance["ready"] == {"status": "ready", "model": ALIAS}, "bad ready")
+        props = provenance["props"]
+        require(isinstance(props, dict) and props.get("model_alias") == ALIAS,
+                "unexpected props model_alias")
+        models = provenance["models"]
+        listed = [item.get("id") for item in (models or {}).get("data", [])
+                  if isinstance(item, dict)]
+        require(ALIAS in listed, "model alias missing in /v1/models")
+        self.report["server_provenance"] = provenance
+        self.report["provenance_status"] = "VERIFIED"
+        self.save()
+        return provenance
+
     def _verify_tool_turn(self, result: dict, task: dict, index: int = 0) -> None:
         require(result.get("finish") == "tool_calls" and len(result.get("tools") or []) == 1,
                 task["id"] + ": missing/extra tool call")
@@ -476,9 +504,12 @@ def _task_result(report: dict, identifier: str) -> dict:
 
 
 def export_blind(run_a: Path, run_b: Path, out: Path, seed: int) -> None:
-    """blind_pairs.jsonl (без id задачи и меток вариантов) + blinding_key.json."""
+    """Каталог рецензента и отдельный приватный ключ рядом с ним."""
+    require(bool(out.name) and out.name not in (".", ".."),
+            "blind output must name a directory")
+    key_path = out.parent / (out.name + ".key.json")
     require(not out.exists(), "blind output must be a new directory")
-    out.mkdir(parents=True)
+    require(not key_path.exists() and not key_path.is_symlink(), "blind key already exists")
     report_a = json.loads((run_a / "report.json").read_text(encoding="utf-8"))
     report_b = json.loads((run_b / "report.json").read_text(encoding="utf-8"))
     require(report_a.get("pass_name") in ("greedy", "sampled") and
@@ -487,9 +518,17 @@ def export_blind(run_a: Path, run_b: Path, out: Path, seed: int) -> None:
     expected_hashes = fixture_hashes()
     require(report_a.get("fixture_sha256") == report_b.get("fixture_sha256") == expected_hashes,
             "Разные или отсутствующие хеши набора")
+    tasks = appset.all_tasks()
+    pairs_raw = []
+    for task in tasks:
+        result_a, result_b = _task_result(report_a, task["id"]), _task_result(report_b, task["id"])
+        require(not result_a.get("error") and not result_b.get("error"),
+                task["id"] + ": транспорт или условия сценария не выполнены")
+        pairs_raw.append((task, result_a, result_b))
     rubric, pass_criteria = _load_quality_rubric()
     images = appset.image_blocks()
     image_paths = {}
+    out.mkdir(parents=True)
     (out / "images").mkdir()
     for name, block in images.items():
         url = block["image_url"]["url"]
@@ -503,12 +542,9 @@ def export_blind(run_a: Path, run_b: Path, out: Path, seed: int) -> None:
         image_paths[name] = relative
     rows, key = [], {}
     counters: dict = {}
-    for task in appset.all_tasks():
+    for task, result_a, result_b in pairs_raw:
         counters[task["domain"]] = counters.get(task["domain"], 0) + 1
         pair_id = f"{task['domain']}/{counters[task['domain']]:03d}"
-        result_a, result_b = _task_result(report_a, task["id"]), _task_result(report_b, task["id"])
-        require(not result_a.get("error") and not result_b.get("error"),
-                task["id"] + ": транспорт или условия сценария не выполнены")
         pair = {"pair_id": pair_id, "task_class": task["domain"] + "/" + task["bucket"],
                 "evaluation": task["evaluation"],
                 "response_a": {"text": result_a.get("text") or "",
@@ -541,13 +577,16 @@ def export_blind(run_a: Path, run_b: Path, out: Path, seed: int) -> None:
         key[pair_id] = {"task": task["id"], "a_is": "run_b" if swap else "run_a",
                         "auto": auto}
         rows.append(pair)
-    write_json(out / "blinding_key.json", {"seed": seed, "pairs": key})
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    descriptor = os.open(key_path, flags, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+        json.dump({"seed": seed, "pairs": key, "run_a": str(run_a),
+                   "run_b": str(run_b)}, output, ensure_ascii=False, indent=2)
     (out / "blind_pairs.jsonl").write_text(
         "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
         encoding="utf-8")
     write_json(out / "manifest.json", {
-        "run_a": str(run_a), "run_b": str(run_b), "seed": seed,
-        "pairs": len(rows), "pass_name": report_a["pass_name"],
+        "seed": seed, "pairs": len(rows), "pass_name": report_a["pass_name"],
         "fixture_sha256": expected_hashes})
 
 
@@ -596,6 +635,7 @@ def _review_messages(task: dict, image_paths: dict) -> list:
             if part.get("type") != "image_url":
                 continue
             url = part["image_url"]["url"]
+            require(url.startswith("data:image/png;base64,"), "Неизвестный формат изображения")
             raw = base64.b64decode(url.split(",", 1)[1], validate=True)
             part["image_url"]["url"] = "images/" + hashlib.sha256(raw).hexdigest() + ".png"
     return messages
@@ -603,7 +643,8 @@ def _review_messages(task: dict, image_paths: dict) -> list:
 
 def unblind(blind_dir: Path, reviews_path: Path | None) -> dict:
     """Соединить отзывы с blinding_key и вывести парные исходы."""
-    key = json.loads((blind_dir / "blinding_key.json").read_text(encoding="utf-8"))["pairs"]
+    key_path = blind_dir.parent / (blind_dir.name + ".key.json")
+    key = json.loads(key_path.read_text(encoding="utf-8"))["pairs"]
     reviews = {}
     manifest = json.loads((blind_dir / "manifest.json").read_text(encoding="utf-8"))
     sampled = manifest["pass_name"] == "sampled"
@@ -688,6 +729,204 @@ def unblind(blind_dir: Path, reviews_path: Path | None) -> dict:
     return summary
 
 
+def _task_text_for_tokenize(task: dict) -> str:
+    """Собрать текстовое содержимое задачи для грубой калибровки через POST /tokenize."""
+    if "first_prompt" in task:
+        return task["first_prompt"] + "\n" + task.get("second_prompt", "") + "\n" + task.get("prompt", "")
+    if "prompt" in task:
+        return task["prompt"]
+    parts = []
+    for message in task.get("messages", []):
+        content = message.get("content")
+        if isinstance(content, str):
+            parts.append(content)
+        elif isinstance(content, list):
+            parts += [item.get("text", "") for item in content if item.get("type") == "text"]
+    return "\n".join(parts)
+
+
+def calibrate_lengths(base_url: str, tasks: list, output: Path,
+                      timeout: int = 60, verify: bool = True) -> dict:
+    """Проверить фактическую длину текстов задач с target_range через POST /tokenize."""
+    runner = SetRunner(base_url, output, "greedy", 0, timeout=timeout)
+    if verify:
+        runner.verify_server()
+    records = []
+    all_ok = True
+    for task in tasks:
+        if "target_range" not in task:
+            continue
+        text = _task_text_for_tokenize(task)
+        res = runner._transport(
+            "tokenize-" + task["id"],
+            {"method": "POST", "path": "/tokenize",
+             "body": {"content": text, "add_special": False}},
+        )
+        require(res.get("status") == "PASS" and res.get("http_status") == 200,
+                task["id"] + ": /tokenize failed")
+        tokens = (res.get("response") or {}).get("tokens")
+        require(isinstance(tokens, list), task["id"] + ": invalid /tokenize payload")
+        count = len(tokens)
+        low, high = task["target_range"]
+        # Текстовая оценка не включает chat framing / image tokens; на прогоне действует строгий prompt_tokens.
+        in_range = low - 512 <= count <= high
+        above_sparse = task["bucket"] != "long" or count > appset.SPARSE_THRESHOLD
+        ok = in_range and above_sparse
+        if not ok:
+            all_ok = False
+        records.append({
+            "id": task["id"],
+            "domain": task["domain"],
+            "bucket": task["bucket"],
+            "text_tokens": count,
+            "target_range": [low, high],
+            "above_sparse_threshold": above_sparse,
+            "ok": ok,
+        })
+    summary = {
+        "status": "CALIBRATED" if all_ok else "OUT_OF_RANGE",
+        "provenance_status": runner.report["provenance_status"],
+        "sparse_threshold": appset.SPARSE_THRESHOLD,
+        "tasks": records,
+    }
+    write_json(output / "calibration.json", summary)
+    return summary
+
+
+def _check_domain_non_regression(by_domain: dict) -> list:
+    regressed = []
+    for domain, counts in sorted(by_domain.items()):
+        if counts.get("only_b", 0) > counts.get("only_a", 0):
+            regressed.append({"domain": domain, **counts})
+    return regressed
+
+
+def build_appset_report(greedy_a: Path, greedy_b: Path, output: Path,
+                        greedy_unblind: Path | None = None,
+                        sampled_unblind: Path | None = None) -> dict:
+    """Свести барьеры прикладного набора (без подмены численного среза Q1)."""
+    report_a = json.loads((greedy_a / "report.json").read_text(encoding="utf-8"))
+    report_b = json.loads((greedy_b / "report.json").read_text(encoding="utf-8"))
+    require(report_a.get("pass_name") == "greedy" and report_b.get("pass_name") == "greedy",
+            "greedy reports required")
+    require(report_a.get("fixture_sha256") == report_b.get("fixture_sha256") == fixture_hashes(),
+            "fixture_sha256 mismatch")
+
+    tasks = appset.all_tasks()
+    prov_ok = (report_a.get("provenance_status") == "VERIFIED" and
+               report_b.get("provenance_status") == "VERIFIED")
+
+    # 1. Детерминированные auto-задачи (66) + transport/critical по всем 94 оценочным.
+    auto_tasks = [t for t in tasks if t["evaluation"] == "auto"]
+    auto_outcomes = {"both_ok": 0, "only_a": 0, "only_b": 0, "both_fail": 0}
+    auto_by_domain: dict = {}
+    greedy_critical_b = 0
+    for task in tasks:
+        if task["evaluation"] == "known_limit":
+            continue
+        ra = _task_result(report_a, task["id"])
+        rb = _task_result(report_b, task["id"])
+        if rb.get("status") == "FAIL" and rb.get("error"):
+            greedy_critical_b += 1
+        if task["evaluation"] != "auto":
+            continue
+        ok_a = ra.get("status") == "PASS"
+        ok_b = rb.get("status") == "PASS"
+        key = ("both_ok" if (ok_a and ok_b) else "only_b" if (ok_a and not ok_b)
+               else "only_a" if (ok_b and not ok_a) else "both_fail")
+        auto_outcomes[key] += 1
+        drow = auto_by_domain.setdefault(task["domain"], {"both_ok": 0, "only_a": 0,
+                                                          "only_b": 0, "both_fail": 0})
+        drow[key] += 1
+
+    # 2. long-facts 22/24 с разбивкой по позициям.
+    long_facts_b = summarize_long_facts(report_b.get("results", []), tasks, "greedy")
+    by_position = {"begin": {"correct": 0, "total": 0},
+                   "mid": {"correct": 0, "total": 0},
+                   "end": {"correct": 0, "total": 0}}
+    for task in tasks:
+        if task["domain"] != "long-facts":
+            continue
+        pos = task.get("fact_position")
+        if pos not in by_position:
+            continue
+        by_position[pos]["total"] += 2
+        rb = next((r for r in report_b.get("results", []) if r.get("id") == task["id"]), None)
+        if rb and isinstance(rb.get("fact_checks"), list):
+            by_position[pos]["correct"] += sum(bool(x) for x in rb["fact_checks"])
+
+    # 3. known_limit (big-text) — строго отдельно.
+    known_limit_rows = []
+    for task in tasks:
+        if task["evaluation"] != "known_limit":
+            continue
+        ra = _task_result(report_a, task["id"])
+        rb = _task_result(report_b, task["id"])
+        known_limit_rows.append({"id": task["id"], "a_status": ra.get("status"),
+                                 "b_status": rb.get("status")})
+
+    # 4. Ручные / слепые итоги (опционально).
+    greedy_blind_summary = (json.loads((greedy_unblind / "unblinded.json").read_text(encoding="utf-8"))
+                            if greedy_unblind else None)
+    sampled_summary = (json.loads((sampled_unblind / "unblinded.json").read_text(encoding="utf-8"))
+                       if sampled_unblind else None)
+
+    greedy_auto_ok = (auto_outcomes["only_b"] <= 1 and greedy_critical_b == 0 and
+                      not _check_domain_non_regression(auto_by_domain))
+    long_facts_ok = long_facts_b.get("status") == "PASS"
+
+    sampled_ok = None
+    if sampled_summary is not None:
+        diff = sampled_summary["paired_difference"]["b_minus_a"]
+        crit_b = sampled_summary["critical_counts"]["b"]
+        sampled_reg = _check_domain_non_regression(sampled_summary["by_domain"])
+        sampled_ok = (diff <= 0.05 and crit_b == 0 and not sampled_reg)
+
+    greedy_blind_ok = None
+    if greedy_blind_summary is not None:
+        crit_b_g = greedy_blind_summary["critical_counts"]["b"]
+        greedy_blind_reg = _check_domain_non_regression(greedy_blind_summary["by_domain"])
+        greedy_blind_ok = (crit_b_g == 0 and not greedy_blind_reg)
+
+    if not prov_ok:
+        overall = "INCOMPLETE_PROVENANCE"
+    elif not (greedy_auto_ok and long_facts_ok) or (sampled_ok is False) or (greedy_blind_ok is False):
+        overall = "FAIL"
+    elif sampled_summary is None:
+        overall = "NOT_EXERCISED"
+    else:
+        overall = "DESCRIPTIVE_TASK_GATE_PASS"
+
+    summary = {
+        "status": overall,
+        "q1_qualification": "REQUIRES_NUMERICAL_SLICE",
+        "provenance": {
+            "a": report_a.get("provenance_status", "UNVERIFIED"),
+            "b": report_b.get("provenance_status", "UNVERIFIED"),
+            "verified": prov_ok,
+        },
+        "greedy_auto": {
+            "total": len(auto_tasks),
+            "outcomes": auto_outcomes,
+            "by_domain": auto_by_domain,
+            "domain_regressions": _check_domain_non_regression(auto_by_domain),
+            "critical_transport_failures_b": greedy_critical_b,
+            "pass": greedy_auto_ok,
+        },
+        "long_facts": {
+            **long_facts_b,
+            "by_position": by_position,
+        },
+        "known_limit_isolated": known_limit_rows,
+        "greedy_blind": greedy_blind_summary,
+        "sampled_blind": sampled_summary,
+        "sampled_gate_pass": sampled_ok,
+    }
+    output.parent.mkdir(parents=True, exist_ok=True)
+    write_json(output, summary)
+    return summary
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -698,6 +937,13 @@ def main() -> None:
     run.add_argument("--seed", type=int, default=0)
     run.add_argument("--timeout", type=int, default=300)
     run.add_argument("--only", help="подстрока id или домена для частичного прогона")
+    run.add_argument("--skip-server-check", action="store_true",
+                     help="пропустить снятие /health,/ready,/props,/v1/models (оставляет UNVERIFIED)")
+    cal = sub.add_parser("calibrate")
+    cal.add_argument("--base-url", required=True)
+    cal.add_argument("--output", type=Path, required=True)
+    cal.add_argument("--timeout", type=int, default=60)
+    cal.add_argument("--skip-server-check", action="store_true")
     blind = sub.add_parser("export-blind")
     blind.add_argument("--run-a", type=Path, required=True)
     blind.add_argument("--run-b", type=Path, required=True)
@@ -706,17 +952,33 @@ def main() -> None:
     unblind_parser = sub.add_parser("unblind")
     unblind_parser.add_argument("--blind", type=Path, required=True)
     unblind_parser.add_argument("--reviews", type=Path)
+    rep = sub.add_parser("report")
+    rep.add_argument("--greedy-a", type=Path, required=True)
+    rep.add_argument("--greedy-b", type=Path, required=True)
+    rep.add_argument("--greedy-unblind", type=Path)
+    rep.add_argument("--sampled-unblind", type=Path)
+    rep.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if args.command == "run":
         runner = SetRunner(args.base_url, args.output, args.pass_name, args.seed,
                            args.timeout)
+        if not args.skip_server_check:
+            runner.verify_server()
         runner.run(appset.all_tasks(), args.only)
         print("report:", runner.output / "report.json", "status:", runner.report["status"])
+    elif args.command == "calibrate":
+        summary = calibrate_lengths(args.base_url, appset.all_tasks(), args.output,
+                                    args.timeout, verify=not args.skip_server_check)
+        print("calibration:", args.output / "calibration.json", "status:", summary["status"])
     elif args.command == "export-blind":
         export_blind(args.run_a, args.run_b, args.out, args.seed)
         print("blind pairs:", args.out / "blind_pairs.jsonl")
-    else:
+    elif args.command == "unblind":
         print(json.dumps(unblind(args.blind, args.reviews), ensure_ascii=False, indent=1))
+    else:
+        summary = build_appset_report(args.greedy_a, args.greedy_b, args.output,
+                                      args.greedy_unblind, args.sampled_unblind)
+        print("appset report:", args.output, "status:", summary["status"])
 
 
 if __name__ == "__main__":
