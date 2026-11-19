@@ -4,6 +4,12 @@
 
 ## 2026-11-19
 
+### Обновлён клон `_borrow-eval/strixite` до v0.7.1 (по поручению владельца)
+
+- Клон `shawnshekari/strixite` в `/Users/vlad/Documents/Gitea/_borrow-eval/strixite` обновлён fast-forward'ом `0945ce8` (v0.7.0) → `dd3c5e0` (**v0.7.1**, 2026-11-16); подтянуты пропущенные теги v0.1.0–v0.7.1. Рабочее дерево чистое (остался только предсуществующий несущественный `.DS_Store`).
+- Состав релиза: только фиксы рантайма и документации, **конвертеры в `formats/` не менялись** — «weights are unchanged». Основное: отказ в росте K/V посреди разговора (#42: `serve/memory_governor.hpp`, `prompt_cache.*`), error-событие при обрыве стрима и `thinking-cap 32768` по умолчанию (`http_server.cpp`), точечные правки ядер (`moe_grouped.*`, `qsa.*`, `wmma_gemm.hpp`, `qsplit.hpp`), обновлены `docs/server.md`, `docs/container.md`, `CONTRIBUTING` и `deploy/strix-server.conf`.
+- Следствие для вопросов про `strixw`: переконвертация готовых весов `wemoh/Qwen3.8-Flash-Next-strixw` не требуется — формат стабилен между v0.7.0 и v0.7.1, а git-хэш конвертера записан внутри `weights.strixw` и виден через `inspect_strixw --verify`. Для нашего форка ничего не меняется: strixw — внутренний формат AGPL-движка strixite для архитектуры `qwen4exp` (Qwen3.8-Flash-Next), 35B-A3B в него не конвертируется; AGPL-код по-прежнему не заимствуется (только идеи, §9 [BORROW_EVAL](BORROW_EVAL_2026-11-17.md)).
+
 ### Б2 (Фаза 2 завершена на CPU): доработка набора, раннера (`verify_server`/`calibrate`/`report`) и `Q1` в `logits-nll-report.py`
 
 - **Набор `faex2_appset` (`0950c8d6`):**
