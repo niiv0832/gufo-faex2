@@ -4,6 +4,19 @@
 
 ## 2026-11-19
 
+### Б2 (Фаза 2 завершена на CPU): доработка набора, раннера (`verify_server`/`calibrate`/`report`) и `Q1` в `logits-nll-report.py`
+
+- **Набор `faex2_appset` (`0950c8d6`):**
+  - устранены дубли и пограничные длины в домене `D`: 4 уникальных сценария `long-vision-dialog` с изображением в середине длинного документа (`24K`/`50K`), `long-tool-dialog` сдвинут к `24K` (`18K+6K`) / `56K` с 4 уникальными целями, уточнены промпты `spelling-*` («без пояснений»);
+  - в `tests/functional/test_faex2_appset.py` добавлена независимая верификация goldens (`_RECEIPTS`, `_FORMULAS`, `_TABLES`, арифметики и исполняемых Python-сниппетов `_CODE_FIXES` / `code-explain-*`).
+- **Раннер `faex2_appset_runner.py` (`0950c8d6`):**
+  - завершена изоляция слепого ключа (`<blind_dir>.key.json`, права `0600`) без утечки `run_a`/`run_b` в `manifest.json` и без создания каталога при отказе валидации;
+  - добавлены `required`-проверка аргументов `web_search`/`read_file` в `valid_tool_call`, `SetRunner.verify_server()` (`/health`, `/ready`, `/props`, `/v1/models` → `provenance_status == "VERIFIED"`), команда `calibrate` (`POST /tokenize` для длинных задач) и команда `report` (сводка greedy `only_b <= 1` на 66 `auto`, `long-facts 22/24` по позициям, изолированный `known_limit`, sampled парная разность `<= 5 п.п.`, блокировка при `UNVERIFIED` провенансе).
+- **Численный оценщик `tools/bench/logits-nll-report.py` (`5fbc229d`):**
+  - добавлен режим `"q1"` при сохранении обратной совместимости `meas4`: группировка по `cluster_id`, односторонний IUT `PASS`-барьер (`δ_NLL`/`κ`), одновременные интервалы Bonferroni на семейство `K`, оценка `σ` для `pilot`, диагностика `max_logit_delta` и итоговый статус `PASS`/`FAIL`/`INCONCLUSIVE`; добавлены синтетические CPU-тесты в `tests/tools/logits_nll_report_test.py`.
+- **Проект контракта `Q1`:** в [PREFILL_QUALITY_CONTRACT_Q1_PROPOSAL.md](PREFILL_QUALITY_CONTRACT_Q1_PROPOSAL.md) отражена готовность инструментов и добавлена таблица полей на утверждение владельцем.
+- **Проверки (Mac, без моделей, GPU, стенда и `push`):** `logits_nll_report_test.py` (**PASS**), `check_docs_test.py` (**11/11 OK**), 7 функциональных сьютов в `.local/audit-20261113/venv-sdk` (**203 tests OK**), `git diff --check` (**OK**). Прод `b81812aa` не затрагивался; калибровка токенов на живом `/tokenize`, GPU-пилот и утверждение `Q1` ждут отдельного решения владельца.
+
 ### Б2: проверки предварительного раннера
 
 - Добавлены CPU-проверки сквозного транспорта на собственном loopback HTTP
