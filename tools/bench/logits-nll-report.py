@@ -78,6 +78,8 @@ def document_metrics(reference, candidate, gold):
     kl = (np.exp(ref) * (ref - cand)).sum(axis=1)
     top_ref = reference.argmax(axis=1)
     top_cand = candidate.argmax(axis=1)
+    max_logit_delta = float(
+        np.abs(candidate.astype(np.float64) - reference.astype(np.float64)).max())
     return {
         "positions": int(len(gold)),
         "nll_reference": float(nll_ref.mean()),
@@ -85,6 +87,7 @@ def document_metrics(reference, candidate, gold):
         "delta_nll": float((nll_cand - nll_ref).mean()),
         "kl_mean": float(kl.mean()),
         "kl_max": float(kl.max()),
+        "max_logit_delta": max_logit_delta,
         "top1_agree": int((top_ref == top_cand).sum()),
         "top1_gold_reference": int((top_ref == gold).sum()),
         "top1_gold_candidate": int((top_cand == gold).sum()),
@@ -147,7 +150,8 @@ def compare(spec, base, comparison):
             loaded.append(load_rows(path, variant["windows"], vocab, first,
                                     count))
         metrics = document_metrics(loaded[0], loaded[1], gold)
-        metrics.update(id=document["id"], domain=document["domain"])
+        metrics.update(id=document["id"], domain=document["domain"],
+                       cluster_id=document.get("cluster_id", document["id"]))
         rows.append(metrics)
     samples, seed = spec["bootstrap_samples"], spec["seed"]
     domains = {}
@@ -163,7 +167,180 @@ def compare(spec, base, comparison):
     }
 
 
-def markdown(results):
+def paired_bootstrap_q1(values, samples, seed, one_sided_alpha, joint_side_alpha):
+    """Mean, one-sided IUT upper bound, simultaneous Bonferroni bounds, and cluster sigma."""
+    arr = np.asarray(values, dtype=np.float64)
+    rng = np.random.default_rng(seed)
+    picks = rng.integers(0, len(arr), size=(samples, len(arr)))
+    means = arr[picks].mean(axis=1)
+    upper_1sided = float(np.percentile(means, 100.0 * (1.0 - one_sided_alpha)))
+    joint_low, joint_high = np.percentile(
+        means, [100.0 * joint_side_alpha, 100.0 * (1.0 - joint_side_alpha)])
+    sigma = float(np.std(arr, ddof=1)) if len(arr) >= 2 else None
+    return {
+        "mean": float(arr.mean()),
+        "upper_1sided": upper_1sided,
+        "joint_low": float(joint_low),
+        "joint_high": float(joint_high),
+        "sigma": sigma,
+    }
+
+
+def _cluster_means(rows, key):
+    grouped = {}
+    for row in rows:
+        cid = row.get("cluster_id", row["id"])
+        grouped.setdefault(cid, []).append(row[key])
+    cids = sorted(grouped)
+    return cids, [float(np.mean(grouped[cid])) for cid in cids]
+
+
+def evaluate_q1(spec, results):
+    """Evaluate Q1 non-inferiority barriers across (comparison, domain) cells."""
+    q1_cfg = spec["q1"]
+    alpha = float(q1_cfg.get("alpha", 0.05))
+    family_alpha = float(q1_cfg.get("family_alpha", 0.05))
+    min_clusters_default = int(q1_cfg.get("min_clusters", 2))
+    if not (0.0 < alpha < 0.5) or not (0.0 < family_alpha < 0.5):
+        raise ValueError("alpha and family_alpha must be in (0, 0.5)")
+    if min_clusters_default < 2:
+        raise ValueError("q1.min_clusters must be >= 2")
+
+    samples = int(spec["bootstrap_samples"])
+    seed = int(spec["seed"])
+
+    cell_specs = []
+    for comp_cfg, comp_res in zip(spec["comparisons"], results):
+        comp_required = bool(comp_cfg.get("required", True))
+        req_domains = comp_cfg.get("required_domains")
+        present_domains = sorted(comp_res["domains"])
+        all_domains = sorted(set(present_domains) | set(req_domains or []))
+        delta_limit = comp_cfg.get("delta_nll", q1_cfg.get("default_delta_nll"))
+        kappa_limit = comp_cfg.get("kappa", q1_cfg.get("default_kappa"))
+        if delta_limit is None or kappa_limit is None:
+            raise ValueError(comp_cfg["name"] + ": missing delta_nll or kappa")
+        delta_limit, kappa_limit = float(delta_limit), float(kappa_limit)
+        if not (np.isfinite(delta_limit) and delta_limit > 0.0 and
+                np.isfinite(kappa_limit) and kappa_limit > 0.0):
+            raise ValueError(comp_cfg["name"] + ": delta_nll and kappa must be finite and > 0")
+        min_clusters = int(comp_cfg.get("min_clusters", min_clusters_default))
+        if min_clusters < 2:
+            raise ValueError(comp_cfg["name"] + ": min_clusters must be >= 2")
+        for domain in all_domains:
+            is_required = comp_required and (req_domains is None or domain in req_domains)
+            docs = [d for d in comp_res["documents"] if d["domain"] == domain]
+            cell_specs.append({
+                "comparison": comp_res["name"],
+                "domain": domain,
+                "required": is_required,
+                "delta_nll_limit": delta_limit,
+                "kappa_limit": kappa_limit,
+                "min_clusters": min_clusters,
+                "docs": docs,
+            })
+
+    required_cells_count = sum(1 for c in cell_specs if c["required"])
+    family_k = int(q1_cfg.get("family_k", max(1, 2 * required_cells_count)))
+    if family_k < 1:
+        raise ValueError("q1.family_k must be >= 1")
+    joint_side_alpha = family_alpha / (2.0 * family_k)
+
+    evaluated_cells = []
+    for index, cell in enumerate(cell_specs):
+        docs = cell["docs"]
+        cids, delta_vals = _cluster_means(docs, "delta_nll")
+        _, kl_vals = _cluster_means(docs, "kl_mean")
+        n_clusters = len(cids)
+        base_entry = {
+            "comparison": cell["comparison"],
+            "domain": cell["domain"],
+            "required": cell["required"],
+            "documents": len(docs),
+            "clusters": n_clusters,
+            "min_clusters": cell["min_clusters"],
+            "delta_nll_limit": cell["delta_nll_limit"],
+            "kappa_limit": cell["kappa_limit"],
+        }
+        if not docs:
+            base_entry.update({"verdict": "INCONCLUSIVE", "reason": "missing_domain_documents"})
+            evaluated_cells.append(base_entry)
+            continue
+        d_stats = paired_bootstrap_q1(
+            delta_vals, samples, seed + index * 2, alpha, joint_side_alpha)
+        k_stats = paired_bootstrap_q1(
+            kl_vals, samples, seed + index * 2 + 1, alpha, joint_side_alpha)
+        kl_max = float(max(d["kl_max"] for d in docs))
+        max_logit_delta = float(max(d["max_logit_delta"] for d in docs))
+        if n_clusters < cell["min_clusters"]:
+            q1_verdict, reason = "INCONCLUSIVE", "insufficient_clusters"
+        elif (d_stats["joint_low"] > cell["delta_nll_limit"] or
+              k_stats["joint_low"] > cell["kappa_limit"]):
+            q1_verdict, reason = "FAIL", "exceedance_confirmed"
+        elif (d_stats["upper_1sided"] < cell["delta_nll_limit"] and
+              k_stats["upper_1sided"] < cell["kappa_limit"]):
+            q1_verdict, reason = "PASS", "non_inferior"
+        else:
+            q1_verdict, reason = "INCONCLUSIVE", "interval_overlaps_margin"
+        base_entry.update({
+            "delta_nll": d_stats,
+            "kl": k_stats,
+            "kl_max": kl_max,
+            "max_logit_delta": max_logit_delta,
+            "verdict": q1_verdict,
+            "reason": reason,
+        })
+        evaluated_cells.append(base_entry)
+
+    required_verdicts = [c["verdict"] for c in evaluated_cells if c["required"]]
+    if "FAIL" in required_verdicts:
+        overall = "FAIL"
+    elif not required_verdicts or "INCONCLUSIVE" in required_verdicts:
+        overall = "INCONCLUSIVE"
+    else:
+        overall = "PASS"
+
+    return {
+        "status": overall,
+        "alpha_one_sided_iut": alpha,
+        "family_alpha_two_sided": family_alpha,
+        "family_k": family_k,
+        "joint_side_alpha": joint_side_alpha,
+        "required_cells": required_cells_count,
+        "note": ("Численная оценка Q1 по предъявленному срезу. Полная квалификация Q1 "
+                 "также требует точных инвариантов уровня 1 и прикладного набора задач."),
+        "cells": evaluated_cells,
+    }
+
+
+def markdown_q1(q1_report):
+    out = ["## Контракт Q1 (non-inferiority)\n",
+           "Итоговый численный статус: **%s** (`α` IUT = %.3f, Bonferroni `α/(2K)` при `K = %d`, "
+           "обязательных ячеек: %d)\n" % (
+               q1_report["status"], q1_report["alpha_one_sided_iut"],
+               q1_report["family_k"], q1_report["required_cells"]),
+           "| Срез | Домен | Обяз. | Класт./док. | ΔNLL средн. | ΔNLL upper | δ_NLL | "
+           "KL средн. | KL upper | κ | σ(ΔNLL) | Статус (причина) |",
+           "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|"]
+    for c in q1_report["cells"]:
+        req = "да" if c["required"] else "нет"
+        counts = "%d/%d" % (c["clusters"], c["documents"])
+        if "delta_nll" not in c:
+            out.append("| %s | %s | %s | %s | — | — | %.4f | — | — | %.4f | — | %s (%s) |" % (
+                c["comparison"], c["domain"], req, counts, c["delta_nll_limit"],
+                c["kappa_limit"], c["verdict"], c["reason"]))
+        else:
+            d, k = c["delta_nll"], c["kl"]
+            sig = "%.5f" % d["sigma"] if d["sigma"] is not None else "—"
+            out.append("| %s | %s | %s | %s | %+.6f | %+.6f | %.4f | %.6f | %.6f | %.4f | %s | %s (%s) |" % (
+                c["comparison"], c["domain"], req, counts,
+                d["mean"], d["upper_1sided"], c["delta_nll_limit"],
+                k["mean"], k["upper_1sided"], c["kappa_limit"], sig,
+                c["verdict"], c["reason"]))
+    out.append("")
+    return "\n".join(out)
+
+
+def markdown(results, q1_report=None):
     out = []
     for result in results:
         out.append("## %s\n" % result["name"])
@@ -194,6 +371,8 @@ def markdown(results):
                           d["nll_candidate"], d["delta_nll"], d["kl_mean"],
                           d["kl_max"], d["top1_agree"], d["positions"]))
         out.append("")
+    if q1_report is not None:
+        out.append(markdown_q1(q1_report))
     return "\n".join(out)
 
 
@@ -208,19 +387,25 @@ def main(argv):
     out_dir.mkdir(parents=True, exist_ok=False)
     results = [compare(spec, spec_path.parent, comparison)
                for comparison in spec["comparisons"]]
+    q1_report = evaluate_q1(spec, results) if "q1" in spec else None
     report = {"spec_sha256": hashlib.sha256(spec_bytes).hexdigest(),
               "bootstrap_samples": spec["bootstrap_samples"],
               "seed": spec["seed"], "comparisons": results}
+    if q1_report is not None:
+        report["q1"] = q1_report
     (out_dir / "report.json").write_text(
         json.dumps(report, indent=1, ensure_ascii=False) + "\n",
         encoding="utf-8")
-    (out_dir / "report.md").write_text(markdown(results) + "\n",
+    (out_dir / "report.md").write_text(markdown(results, q1_report) + "\n",
                                        encoding="utf-8")
     for result in results:
         s = result["all"]
         print("%s: %+.6f [%+.6f; %+.6f] %s" % (
             result["name"], s["delta_nll_mean"], s["delta_nll_low"],
             s["delta_nll_high"], s["verdict"]))
+    if q1_report is not None:
+        print("Q1: %s (required_cells=%d, K=%d)" % (
+            q1_report["status"], q1_report["required_cells"], q1_report["family_k"]))
     return 0
 
 
