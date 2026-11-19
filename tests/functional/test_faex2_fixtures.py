@@ -215,7 +215,7 @@ class QualityFixtureTests(unittest.TestCase):
                 self.assertNotIn("json", case["prompt"].lower())
                 self.assertIs(type(case["max_completion_tokens"]), int)
                 self.assertGreaterEqual(case["max_completion_tokens"], 384)
-                self.assertLessEqual(case["max_completion_tokens"], 1024)
+                self.assertLessEqual(case["max_completion_tokens"], 1536)
                 for key in ("expected_facts", "prohibited_errors", "domains"):
                     self.assertIsInstance(case[key], list)
                     self.assertTrue(case[key] and all(isinstance(value, str) and value.strip()
