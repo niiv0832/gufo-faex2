@@ -4,6 +4,15 @@
 
 ## 2026-11-21
 
+### Аудит `W1.1`/`W0.3`/`W0.5` и допрофиль `rocprofv3` (`window8_rocprof`, `02:22–02:26 MSK`) — `W0.3` закрыт полностью
+
+- **Подтверждение `W1.1 FAIL` и корневая причина в коде:** все числа `Q1`, Б2 (`long-facts 21/24 < 22`, `only_b = 2`) и matched-pair (`completion_tokens = 64` у всех строк) подтверждены по сырым JSON. Найдена причина регрессии MTP1 (+33…+209 %): [`src/models/qwen/hip/kernels/attention_sparse.hip:765-777`](../../src/models/qwen/hip/kernels/attention_sparse.hip#L765-L777) вызывает `LaunchQwenSparseDecodeAttention` только при `batch_size == 1`, а при `batch_size >= 2` проваливается в prefill-ядро `SparseWmmaCausalAttention` (`tiles = 1`, 8 блоков на 40 CU). Вердикт **FAIL** неизменен (качество провалено отдельно).
+- **Исправлены ошибки отчёта `W0.3` и снята полная карта `rocprofv3` (`window8_rocprof`, 3 мин 06 с, 7 трасс `gufo bench` на боевом `b81812aa`, `rc = 0`, `kernel.log = 0`):**
+  - устранены неверные привязки `asr_decode_gemv_bench` (Qwen3-ASR BF16) к `W1.4`, `attn_causal_bench` (27B prefill TFLOPS) к `W1.7` и `HIP multiprocessors=20` (= 20 WGP = 40 CU) как «20 CU»;
+  - показано, что `rocprofv3 1.4.1` полностью исправен (прошлые пустые логи возникли из-за `<(echo ...)` с `close_fds=True` и забытого `--kernel-trace`);
+  - реальная карта `b81812aa`: **AR d0** (`63,35 tok/s`, простой **9,2 %**) — `Q8KBlockGEMV` 28,5 %, `Wave32FusedSSMInput` 24,9 %, MoE 19,7 %, `MoeRouter` 5,2 %, `DeltaNetRecurrence` 3,4 % (~239 ГБ/с → FP32 подтверждён); **MTP1 d0** (`86,83 tok/s`, простой **11,6 %**) — **ядро № 1 `SmallBatchQ8_0ExactFp32VecGEMMKernel` (44,9 %)**, `down_exps` (`Q6_K`) растёт `30,5 → 50,1 → 64,3 → 77,5 мкс` (`AR→MTP1→MTP2→MTP3`), draft `lm_head` растёт `11,8 → 18,4 → 22,6 %`; **64K decode** — `group8 wave64` уже идёт на **213,9 ГБ/с (84,9 % потолка 252,2 ГБ/с)**, 2-я строка MTP1 +14 %, внимание MTP-головы ~2,8 %; **prefill 16K** (`2898 tok/s`) — весь SSM **11,6 %** (рекуррент **6,6 %**).
+- **Уточнение `W0.5` и верификация прода:** пики SOCKET_POWER `86,2 Вт` (compute) и `83,5 Вт` (`power_64k_clean`) / `51,0 Вт` (`power_64k_dense`) на 64K prefill — оба `< 100 Вт`. Прод `b81812aa` восстановлен и верифицирован (`READY`, identity true, 4 слота idle, `"28+28="` → `'28 + 28 = 56'`, красный PNG → `' red'`, журнал ядра CLEAN). Отчёты: `LLM_FAEX2/results/2026-11-21-w11-w03-w05/window8_rocprof/`.
+
 ### Закрыты `W1.1` (sparse — FAIL), `W0.3` (профиль) и `W0.5` (TDP) на стенде `faex2` — боевой код `b81812aa` не менялся
 
 - **По явному разрешению владельца («запускай всё», 2026-11-20 15:45 МСК) выполнены три GPU-окна** (A1+Q1 ~95 мин; Б2+скорость ~90 мин; W0.3/W0.5 ~40 мин). Гарантии каждого окна: `trap EXIT → reset-failed + start`, watchdog, остановка/возврат только `systemctl --user`. После каждого окна прод верифицирован (`READY`, identity true, `"28+28="` → `'56'`). Протокол и сырые данные: `LLM_FAEX2/results/2026-11-21-w11-w03-w05/README.md`.
