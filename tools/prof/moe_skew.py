@@ -182,6 +182,8 @@ def summarize(agg: dict) -> dict:
             "mean_hot_mass_decile": sum(hots) / len(hots) if hots else 0.0,
             "mean_hot_set_80": (sum(hot_sets) / len(hot_sets))
                                if hot_sets else 0.0,
+            "min_hot_set_80": min(hot_sets) if hot_sets else 0,
+            "max_hot_set_80": max(hot_sets) if hot_sets else 0,
             "duplicate_share": (total_dup / (total_pairs * used))
                                if total_pairs else 0.0,
             "dedup_saving": dedup_saving,
@@ -194,7 +196,11 @@ def summarize(agg: dict) -> dict:
     total_single = sum(agg["overlap_rows"])
     overlap_share = (sum(agg["overlap"]) / (total_single * used)
                      if total_single else 0.0)
-    return {"per_bucket": per_bucket, "neighbor_overlap_single": overlap_share}
+    return {
+        "per_bucket": per_bucket,
+        "neighbor_overlap_single": overlap_share,
+        "neighbor_overlap_single_pairs": total_single,
+    }
 
 
 def format_report(per_file: dict[str, dict], combined: dict) -> str:
@@ -217,9 +223,18 @@ def format_report(per_file: dict[str, dict], combined: dict) -> str:
                 f"{bucket['tail_slots_7_8_mass']:>7.4f} "
                 f"{bucket['tail7_lt1pct_share']:>7.4f} "
                 f"{bucket['tail8_lt1pct_share']:>7.4f}")
-        lines.append(
-            f"neighbor overlap (single-row calls): "
-            f"{summary['neighbor_overlap_single']:.4f}")
+        pairs = summary.get("neighbor_overlap_single_pairs", 0)
+        if pairs > 0:
+            lines.append(
+                f"neighbor overlap (single-row calls): "
+                f"{summary['neighbor_overlap_single']:.4f} ({pairs} pairs)")
+        else:
+            r2 = summary["per_bucket"][1] if len(summary["per_bucket"]) > 1 else None
+            extra = (
+                f"; MTP1 neighbor overlap = rows=2 dup {r2['duplicate_share']:.4f}"
+                if r2 and r2["calls"] > 0 else "")
+            lines.append(
+                f"neighbor overlap (single-row calls): n/a (0 pairs{extra})")
         lines.append("")
     return "\n".join(lines)
 

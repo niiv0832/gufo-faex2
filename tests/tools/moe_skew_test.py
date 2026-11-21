@@ -127,6 +127,18 @@ def test_aggregate_and_summary():
           "half of batched tokens have slot n-1 below 1%")
     check(abs(summary["neighbor_overlap_single"] - 0.5) < 1e-9,
           "two shared ids of four is a 0.5 neighbor overlap")
+    check(summary["neighbor_overlap_single_pairs"] == 4,
+          "overlap pair count is reported")
+    # Zero single-row pairs must format as n/a with rows=2 dup hint.
+    mtp_only = skew.summarize(skew.aggregate([
+        record(layers, experts, used, calls=1, bucket=1,
+               hist_fn=lambda bucket: [4, 4, 0, 0, 0, 0, 0, 0]
+               if bucket == 1 else [0] * experts,
+               tokens=2, unique_experts=6, dup=2, dup_pairs=1),
+    ]))
+    text = skew.format_report({"mtp1.jsonl": mtp_only}, mtp_only)
+    check("n/a (0 pairs; MTP1 neighbor overlap = rows=2 dup 0.5000)" in text,
+          "zero single-row pairs formatted clearly as n/a")
 
 
 def test_shape_mismatch_rejected(tmp):
