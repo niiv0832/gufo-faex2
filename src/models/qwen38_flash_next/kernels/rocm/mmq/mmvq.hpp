@@ -18,7 +18,7 @@ struct MoeBatchGroup {
 // expert; inactive slot rows (expert < 0) form a single-slot group with
 // expert = -2 so their destination row is explicitly zeroed.
 constexpr int kMoeDownMaxSlots = 512;
-constexpr int kMoeDownGroupCols = 8;
+constexpr int kMoeDownGroupCols = 4;
 
 struct MoeDownGroup {
   int32_t expert;

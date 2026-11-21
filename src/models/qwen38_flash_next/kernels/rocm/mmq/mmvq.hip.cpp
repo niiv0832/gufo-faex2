@@ -1048,36 +1048,6 @@ __launch_bounds__(32 * waves_per_block, 1) static __global__
           static_cast<uint32_t>(expert) * stride_channel_x + row * stride_row_x;
     }
 
-    if (blocks_per_row_x == blocks_per_iter) {
-      // K == 512 (2 super-blocks): every lane visits exactly one super-block,
-      // so the unpacked weight fragments stay register-resident while streaming
-      // up to kMoeDownGroupCols colliding slot rows without a 2D sum array.
-      const int kbx = lane / (qi / vdr);
-      const int kby = kbx * (qk / QK8_1);
-      const int kqs = vdr * (lane % (qi / vdr));
-      typename MoeKQuantFragment<type>::Type wf[rows_per_wave];
-#pragma unroll
-      for (int r = 0; r < rows_per_wave; ++r) {
-        wf[r].Load(weights, row_offsets[r] + kbx, kqs);
-      }
-      for (int c = 0; c < count; ++c) {
-        const uint32_t slot = static_cast<uint32_t>(groups[anchor].slots[c]);
-        const block_q8_1* y = vy + slot * stride_col_y + kby;
-        float s[rows_per_wave];
-#pragma unroll
-        for (int r = 0; r < rows_per_wave; ++r) {
-          s[r] = warp_reduce_sum<warp_size>(wf[r].Dot(y, kqs));
-        }
-        if (lane < rows_per_wave &&
-            (rows_per_wave == 1 || uint32_t(row0 + lane) < nrows_x)) {
-          const float value = s[lane];
-          dst[slot * stride_col_dst + row0 + lane] =
-              isfinite(value) ? value : 0.0f;
-        }
-      }
-      continue;
-    }
-
     float sum[kMoeDownGroupCols][rows_per_wave] = {};
     for (int kbx = lane / (qi / vdr); kbx < blocks_per_row_x;
          kbx += blocks_per_iter) {
@@ -1128,24 +1098,11 @@ static void launch_moe_down_grouped(const void* weights,
                                     const int32_t* down_groups, float* output,
                                     int k, int rows, int n_slots,
                                     int input_stride, hipStream_t stream) {
-  GGML_ASSERT(k % ggml_blck_size(type) == 0 && rows > 0 && n_slots > 0);
-  const int row_stride = k / ggml_blck_size(type);
-  if constexpr (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K) {
-    if (n_slots <= 32) {
-      constexpr int rows_per_wave = 8;
-      constexpr int waves_per_block = 2;
-      constexpr int rows_per_block = rows_per_wave * waves_per_block;
-      const dim3 grid((rows + rows_per_block - 1) / rows_per_block, n_slots);
-      mul_mat_vec_q_moe_down_grouped<type, rows_per_wave, waves_per_block>
-          <<<grid, 32 * waves_per_block, 0, stream>>>(
-              weights, input, down_groups, output, k, rows, row_stride,
-              input_stride, rows, rows * row_stride, n_slots);
-      return;
-    }
-  }
   constexpr int rows_per_wave = 4;
   constexpr int waves_per_block = 4;
   constexpr int rows_per_block = rows_per_wave * waves_per_block;
+  GGML_ASSERT(k % ggml_blck_size(type) == 0 && rows > 0 && n_slots > 0);
+  const int row_stride = k / ggml_blck_size(type);
   const dim3 grid((rows + rows_per_block - 1) / rows_per_block,
                   std::min(n_slots, 32));
   mul_mat_vec_q_moe_down_grouped<type, rows_per_wave, waves_per_block>
