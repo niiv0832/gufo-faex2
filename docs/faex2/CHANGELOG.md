@@ -4,6 +4,11 @@
 
 ## 2026-11-21
 
+### `W1.2` п. 1: владелец утвердил квалификацию `model-vision-serving-mtp` (`36/36` по п. 8 `Q1`)
+
+- **Решение владельца:** квалификация `model-vision-serving-mtp` утверждена по всем 4 критериям п. 8 `Q1` ([VISION_RESYNC_W12_2026-11-21.md](VISION_RESYNC_W12_2026-11-21.md): `KL = 0,001963 ≤ 0,010`, `maxΔ = 0,513805 ≤ 1,0`, `near-tie 0,030/0,070 < 0,15`, сдвиг `1`, `edit_distance_without_tail = 2 ≤ 2`); публичная гарантия продолжений диалогов с изображениями — **`36/36`**. Строгий тест в коде не менялся и не ослаблен.
+- **Синхронизация:** обновлены [VISION_RESYNC_W12_2026-11-21.md](VISION_RESYNC_W12_2026-11-21.md), [PREFILL_QUALITY_CONTRACT_Q1_PROPOSAL.md](PREFILL_QUALITY_CONTRACT_Q1_PROPOSAL.md), [MASTER_PLAN_02.md](MASTER_PLAN_02.md), [CONTEXT.md](CONTEXT.md). По поручению владельца следующим шагом выполняется `W1.2` п. 2 (проба опционального 2×-downscale / multi-scale OCR для `big-text-known_limit`).
+
 ### Аудит окна `w02-w04` и честная перепроверка `retest` (кандидат `e5172502`) — W0.2 и W0.4 окончательно подтверждены, W5.3 отвергнут
 
 - **Что вскрыл аудит первичного прогона `w02-w04` (`window_harness.py`):**
