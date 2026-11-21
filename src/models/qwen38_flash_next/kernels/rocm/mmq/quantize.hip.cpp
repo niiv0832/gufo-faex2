@@ -1,5 +1,6 @@
 #include "qfn_mmq_prelude.h"
 namespace qfn_mmq {
+#include "mmvq.hpp"
 #include "quantize.hpp"
 #include <cstdint>
 
@@ -238,6 +239,120 @@ void quantize_row_q8_1_by_expert_hip(
     const dim3 block_size(HIP_QUANTIZE_BLOCK_SIZE, 1, 1);
     quantize_q8_1_by_expert<<<num_blocks, block_size, 0, stream>>>(
         x, ids, vy, sorted_ids, slot_of_rank, ne00, s01, ne0, slots);
+}
+
+// Quantize one-expert slot rows while block (0, 0, 0) builds the leader-anchor
+// group table for down_exps in parallel with the other column blocks.
+__launch_bounds__(HIP_QUANTIZE_BLOCK_SIZE, 1)
+static __global__ void quantize_q8_1_and_down_groups(
+        const float * __restrict__ x, const int32_t * __restrict__ ids,
+        void * __restrict__ vy, int32_t * __restrict__ down_groups,
+        const int64_t ne00, const int64_t s01, const int64_t ne0,
+        const int slots) {
+    const int64_t i0 = (int64_t)blockDim.x * blockIdx.x + threadIdx.x;
+    const int64_t i1 = blockIdx.y;
+    if (i0 < ne0) {
+        const int64_t i_cont = i1 * ne0 + i0;
+        block_q8_1 * y = (block_q8_1 *) vy;
+        const int64_t ib  = i_cont / QK8_1;
+        const int64_t iqs = i_cont % QK8_1;
+        const float xi = i0 < ne00 ? x[i1 * s01 + i0] : 0.0f;
+        float amax = fabsf(xi);
+        amax = warp_reduce_max<QK8_1>(amax);
+        const float d = amax / 127.0f;
+        const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+        const int sumq = warp_reduce_sum<QK8_1>((int) q);
+        y[ib].qs[iqs] = q;
+        if (iqs == 0) {
+            y[ib].ds = make_half2(d, d * sumq);
+        }
+    }
+
+    if (blockIdx.x == 0 && blockIdx.y == 0) {
+        const int tid = threadIdx.x;
+        __shared__ int32_t s_ids[kMoeDownMaxSlots];
+        for (int s = tid; s < slots; s += HIP_QUANTIZE_BLOCK_SIZE) {
+            s_ids[s] = ids[s];
+        }
+        __syncthreads();
+
+        int32_t * group_list = down_groups + 1;
+        MoeDownGroup * groups =
+            reinterpret_cast<MoeDownGroup *>(group_list + slots);
+        __shared__ int wave_counts[HIP_QUANTIZE_BLOCK_SIZE / 32];
+        int running_total = 0;
+
+        for (int base = 0; base < slots; base += HIP_QUANTIZE_BLOCK_SIZE) {
+            const int s = base + tid;
+            bool is_leader = false;
+            if (s < slots) {
+                const int32_t expert = s_ids[s];
+                if (expert < 0) {
+                    groups[s].expert = -2;
+                    groups[s].count = 1;
+                    groups[s].slots[0] = s;
+                    is_leader = true;
+                } else {
+                    int earlier = 0;
+                    for (int i = 0; i < s; ++i) {
+                        if (s_ids[i] == expert) {
+                            ++earlier;
+                        }
+                    }
+                    if ((earlier % kMoeDownGroupCols) == 0) {
+                        int count = 0;
+                        for (int i = s;
+                             i < slots && count < kMoeDownGroupCols; ++i) {
+                            if (s_ids[i] == expert) {
+                                groups[s].slots[count++] = i;
+                            }
+                        }
+                        groups[s].expert = expert;
+                        groups[s].count = count;
+                        is_leader = true;
+                    } else {
+                        groups[s].expert = -1;
+                        groups[s].count = 0;
+                    }
+                }
+            }
+            const int lane = tid % 32;
+            const int wave = tid / 32;
+            const uint32_t m0 = static_cast<uint32_t>(__ballot(is_leader));
+            if (lane == 0) {
+                wave_counts[wave] = __popc(m0);
+            }
+            __syncthreads();
+            if (is_leader) {
+                int rank = running_total +
+                           __popc(m0 & ((uint32_t{1} << lane) - 1));
+                for (int w = 0; w < wave; ++w) {
+                    rank += wave_counts[w];
+                }
+                group_list[rank] = s;
+            }
+            for (int w = 0; w < HIP_QUANTIZE_BLOCK_SIZE / 32; ++w) {
+                running_total += wave_counts[w];
+            }
+            __syncthreads();
+        }
+        if (tid == 0) {
+            down_groups[0] = running_total;
+        }
+    }
+}
+
+void quantize_row_q8_1_and_down_groups_hip(
+        const float * x, const int32_t * ids, void * vy, int32_t * down_groups,
+        const int64_t ne00, const int64_t s01, const int64_t ne0,
+        const int slots, hipStream_t stream) {
+    GGML_ASSERT(ne0 % QK8_1 == 0 && slots > 0 && slots <= kMoeDownMaxSlots);
+    const int64_t block_num_x =
+        (ne0 + HIP_QUANTIZE_BLOCK_SIZE - 1) / HIP_QUANTIZE_BLOCK_SIZE;
+    const dim3 num_blocks(block_num_x, slots, 1);
+    const dim3 block_size(HIP_QUANTIZE_BLOCK_SIZE, 1, 1);
+    quantize_q8_1_and_down_groups<<<num_blocks, block_size, 0, stream>>>(
+        x, ids, vy, down_groups, ne00, s01, ne0, slots);
 }
 
 void quantize_mmq_q8_1_hip(

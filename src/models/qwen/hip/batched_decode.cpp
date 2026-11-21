@@ -99,8 +99,9 @@ void LaunchFfnActivation(const models::QwenLayerWeights& layer,
 }
 
 // qwen35moe feed-forward for `rows` independent token rows: batched router,
-// device top-k, the expert vector kernels in chunks of eight rows, the shared
-// expert through the exact shared projections, and one combine pass.
+// device top-k, the gated expert vector kernel in chunks of eight rows (for
+// non-Q4_K gate/up formats) followed by one batch-wide down_exps projection,
+// the shared expert through the exact shared projections, and one combine pass.
 void LaunchMoeFfnRows(const models::QwenLayerWeights& layer,
                       const core::ModelConfig& config, QwenGpuArena& arena,
                       const float* x, float* out, std::size_t rows,
@@ -134,13 +135,15 @@ void LaunchMoeFfnRows(const models::QwenLayerWeights& layer,
     if (qfn_mmq_moe_gated_vec(static_cast<int>(layer.ffn_gate_exps.type),
                               layer.ffn_gate_exps.data, layer.ffn_up_exps.data,
                               chunk_x, chunk_ids, chunk_act, ff, hidden, n,
-                              experts, used, stream) != 0 ||
-        qfn_mmq_moe_vec(static_cast<int>(layer.ffn_down_exps.type),
-                        layer.ffn_down_exps.data, chunk_act, chunk_ids,
-                        s.down_out + (first * used * hidden), hidden, ff,
-                        n * used, experts, 1, stream, nullptr, nullptr) != 0) {
+                              experts, used, stream) != 0) {
       throw std::runtime_error("qwen35moe expert projection failed");
     }
+  }
+  if (qfn_mmq_moe_vec(static_cast<int>(layer.ffn_down_exps.type),
+                      layer.ffn_down_exps.data, s.act, s.ids, s.down_out,
+                      hidden, ff, static_cast<int>(rows) * used, experts, 1,
+                      stream, nullptr, nullptr) != 0) {
+    throw std::runtime_error("qwen35moe expert projection failed");
   }
   LaunchProjection(layer.ffn_gate_shexp, x, s.shared_gate, rows, shared_ff,
                    hidden, stream);

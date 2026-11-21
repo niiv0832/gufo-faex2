@@ -991,6 +991,169 @@ static void launch_moe(const void* weights, const block_q8_1* input,
           nullptr, dst_slots);
 }
 
+// Leader-anchor deduplicated K-quant down projection (K = 512, 1 expert per
+// slot row). Each wave owns `rows_per_wave` output rows, decodes the unique
+// expert's weight fragments once into registers, and dots them against up to
+// `kMoeDownGroupCols` slot rows routed to that expert while also reusing each
+// slot row's Q8_1 activation across `rows_per_wave` rows. Preserves the exact
+// per-slot dot-product accumulation order and non-finite scale guard of
+// mul_mat_vec_q_moe.
+template<ggml_type type, int rows_per_wave = 4, int waves_per_block = 4>
+__launch_bounds__(32 * waves_per_block, 1) static __global__
+    void mul_mat_vec_q_moe_down_grouped(
+        const void* __restrict__ weights, const block_q8_1* __restrict__ vy,
+        const int32_t* __restrict__ down_groups, float* __restrict__ dst,
+        const uint32_t ncols_x, const uint32_t nrows_x,
+        const uint32_t stride_row_x, const uint32_t stride_col_y,
+        const uint32_t stride_col_dst, const uint32_t stride_channel_x,
+        const uint32_t n_slots) {
+  constexpr int qk = ggml_hip_type_traits<type>::qk;
+  constexpr int qi = ggml_hip_type_traits<type>::qi;
+  constexpr int vdr = get_vdr_mmvq(type);
+  constexpr int warp_size = 32;
+  constexpr int blocks_per_iter = vdr * warp_size / qi;
+
+  const int lane = threadIdx.x % warp_size;
+  const int wave = threadIdx.x / warp_size;
+  const int row0 = (blockIdx.x * waves_per_block + wave) * rows_per_wave;
+  if (row0 >= static_cast<int>(nrows_x)) {
+    return;
+  }
+
+  const int blocks_per_row_x = ncols_x / qk;
+  const int listed = down_groups[0];
+  const int32_t* group_list = down_groups + 1;
+  const auto* groups =
+      reinterpret_cast<const MoeDownGroup*>(group_list + n_slots);
+
+  for (int entry = blockIdx.y; entry < listed; entry += gridDim.y) {
+    const int anchor = group_list[entry];
+    const int expert = static_cast<int>(groups[anchor].expert);
+    if (expert == -1) {
+      continue;
+    }
+    if (expert < 0) {
+      if (lane < rows_per_wave && uint32_t(row0 + lane) < nrows_x) {
+        const uint32_t slot = static_cast<uint32_t>(groups[anchor].slots[0]);
+        dst[slot * stride_col_dst + row0 + lane] = 0.0f;
+      }
+      continue;
+    }
+    const int count = static_cast<int>(groups[anchor].count);
+    uint32_t row_offsets[rows_per_wave];
+#pragma unroll
+    for (int r = 0; r < rows_per_wave; ++r) {
+      const uint32_t row = min(uint32_t(row0 + r), nrows_x - 1);
+      row_offsets[r] =
+          static_cast<uint32_t>(expert) * stride_channel_x + row * stride_row_x;
+    }
+
+    if (blocks_per_row_x == blocks_per_iter) {
+      // K == 512 (2 super-blocks): every lane visits exactly one super-block,
+      // so the unpacked weight fragments stay register-resident while streaming
+      // up to kMoeDownGroupCols colliding slot rows without a 2D sum array.
+      const int kbx = lane / (qi / vdr);
+      const int kby = kbx * (qk / QK8_1);
+      const int kqs = vdr * (lane % (qi / vdr));
+      typename MoeKQuantFragment<type>::Type wf[rows_per_wave];
+#pragma unroll
+      for (int r = 0; r < rows_per_wave; ++r) {
+        wf[r].Load(weights, row_offsets[r] + kbx, kqs);
+      }
+      for (int c = 0; c < count; ++c) {
+        const uint32_t slot = static_cast<uint32_t>(groups[anchor].slots[c]);
+        const block_q8_1* y = vy + slot * stride_col_y + kby;
+        float s[rows_per_wave];
+#pragma unroll
+        for (int r = 0; r < rows_per_wave; ++r) {
+          s[r] = warp_reduce_sum<warp_size>(wf[r].Dot(y, kqs));
+        }
+        if (lane < rows_per_wave &&
+            (rows_per_wave == 1 || uint32_t(row0 + lane) < nrows_x)) {
+          const float value = s[lane];
+          dst[slot * stride_col_dst + row0 + lane] =
+              isfinite(value) ? value : 0.0f;
+        }
+      }
+      continue;
+    }
+
+    float sum[kMoeDownGroupCols][rows_per_wave] = {};
+    for (int kbx = lane / (qi / vdr); kbx < blocks_per_row_x;
+         kbx += blocks_per_iter) {
+      const int kby = kbx * (qk / QK8_1);
+      const int kqs = vdr * (lane % (qi / vdr));
+      typename MoeKQuantFragment<type>::Type wf[rows_per_wave];
+#pragma unroll
+      for (int r = 0; r < rows_per_wave; ++r) {
+        wf[r].Load(weights, row_offsets[r] + kbx, kqs);
+      }
+#pragma unroll
+      for (int c = 0; c < kMoeDownGroupCols; ++c) {
+        if (c >= count) {
+          break;
+        }
+        const uint32_t slot = static_cast<uint32_t>(groups[anchor].slots[c]);
+        const block_q8_1* y = vy + slot * stride_col_y + kby;
+#pragma unroll
+        for (int r = 0; r < rows_per_wave; ++r) {
+          sum[c][r] += wf[r].Dot(y, kqs);
+        }
+      }
+    }
+
+#pragma unroll
+    for (int c = 0; c < kMoeDownGroupCols; ++c) {
+      if (c >= count) {
+        break;
+      }
+#pragma unroll
+      for (int r = 0; r < rows_per_wave; ++r) {
+        sum[c][r] = warp_reduce_sum<warp_size>(sum[c][r]);
+      }
+      if (lane < rows_per_wave &&
+          (rows_per_wave == 1 || uint32_t(row0 + lane) < nrows_x)) {
+        const uint32_t slot = static_cast<uint32_t>(groups[anchor].slots[c]);
+        const float value = sum[c][lane];
+        dst[slot * stride_col_dst + row0 + lane] =
+            isfinite(value) ? value : 0.0f;
+      }
+    }
+  }
+}
+
+template<ggml_type type>
+static void launch_moe_down_grouped(const void* weights,
+                                    const block_q8_1* input,
+                                    const int32_t* down_groups, float* output,
+                                    int k, int rows, int n_slots,
+                                    int input_stride, hipStream_t stream) {
+  GGML_ASSERT(k % ggml_blck_size(type) == 0 && rows > 0 && n_slots > 0);
+  const int row_stride = k / ggml_blck_size(type);
+  if constexpr (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K) {
+    if (n_slots <= 32) {
+      constexpr int rows_per_wave = 8;
+      constexpr int waves_per_block = 2;
+      constexpr int rows_per_block = rows_per_wave * waves_per_block;
+      const dim3 grid((rows + rows_per_block - 1) / rows_per_block, n_slots);
+      mul_mat_vec_q_moe_down_grouped<type, rows_per_wave, waves_per_block>
+          <<<grid, 32 * waves_per_block, 0, stream>>>(
+              weights, input, down_groups, output, k, rows, row_stride,
+              input_stride, rows, rows * row_stride, n_slots);
+      return;
+    }
+  }
+  constexpr int rows_per_wave = 4;
+  constexpr int waves_per_block = 4;
+  constexpr int rows_per_block = rows_per_wave * waves_per_block;
+  const dim3 grid((rows + rows_per_block - 1) / rows_per_block,
+                  std::min(n_slots, 32));
+  mul_mat_vec_q_moe_down_grouped<type, rows_per_wave, waves_per_block>
+      <<<grid, 32 * waves_per_block, 0, stream>>>(
+          weights, input, down_groups, output, k, rows, row_stride,
+          input_stride, rows, rows * row_stride, n_slots);
+}
+
 // IQ4_NL down projection of the routed slots (K = 640, one expert per slot) for
 // decode and short verifies. A wave owns four rows and each lane takes five
 // 16-weight halves of their blocks, so all 32 lanes work on every row; the
@@ -1074,11 +1237,16 @@ void mul_mat_vec_moe_dispatch(const void* weights, ggml_type type,
                              const block_q8_1* input, const int32_t* ids, float* output,
                              int k, int rows, int tokens, int experts_used,
                              int input_stride, hipStream_t stream,
-                             const int32_t* dst_slots) {
+                             const int32_t* dst_slots,
+                             const int32_t* down_groups) {
     // dst_slots (expert-ordered slot rows) is only used by the down view.
     GGML_ASSERT(!dst_slots || (k == 640 && experts_used == 1 && tokens > 1 &&
                                (type == GGML_TYPE_Q5_1 ||
                                 type == GGML_TYPE_Q8_0)));
+    GGML_ASSERT(!down_groups || (experts_used == 1 && tokens > 8 &&
+                                 (type == GGML_TYPE_Q4_K ||
+                                  type == GGML_TYPE_Q5_K ||
+                                  type == GGML_TYPE_Q6_K)));
     switch (type) {
         case GGML_TYPE_Q5_1:
           // Down projection slots have independent inputs. Wider row tiles
@@ -1111,14 +1279,32 @@ void mul_mat_vec_moe_dispatch(const void* weights, ggml_type type,
                                           experts_used, input_stride, stream);
             break;
         case GGML_TYPE_Q4_K:
+            if (down_groups) {
+              launch_moe_down_grouped<GGML_TYPE_Q4_K>(
+                  weights, input, down_groups, output, k, rows, tokens,
+                  input_stride, stream);
+              break;
+            }
             launch_moe<GGML_TYPE_Q4_K>(weights, input, ids, output, k, rows, tokens,
                                           experts_used, input_stride, stream);
             break;
         case GGML_TYPE_Q5_K:
+            if (down_groups) {
+              launch_moe_down_grouped<GGML_TYPE_Q5_K>(
+                  weights, input, down_groups, output, k, rows, tokens,
+                  input_stride, stream);
+              break;
+            }
             launch_moe<GGML_TYPE_Q5_K>(weights, input, ids, output, k, rows, tokens,
                                       experts_used, input_stride, stream);
             break;
         case GGML_TYPE_Q6_K:
+            if (down_groups) {
+              launch_moe_down_grouped<GGML_TYPE_Q6_K>(
+                  weights, input, down_groups, output, k, rows, tokens,
+                  input_stride, stream);
+              break;
+            }
             launch_moe<GGML_TYPE_Q6_K>(weights, input, ids, output, k, rows, tokens,
                                        experts_used, input_stride, stream);
             break;

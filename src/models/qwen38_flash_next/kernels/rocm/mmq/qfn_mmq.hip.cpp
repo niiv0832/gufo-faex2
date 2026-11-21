@@ -506,8 +506,18 @@ static int moe_vector_projection(int weight_type, const void* W,
       !gated && !W_b && !X_q8 &&
       (type == GGML_TYPE_Q5_1 || type == GGML_TYPE_Q8_0) && K == 640 &&
       n_expert_used == 1 && n_tokens > 1;
+  // For K-quant down_exps (K = 512, n_expert_used = 1, > 8 slot rows), fuse
+  // leader-anchor group construction into quantize_q8_1 and deduplicate
+  // repeated expert reads across the batch.
+  const bool down_grouped =
+      !gated && !W_b && !X_q8 &&
+      (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K ||
+       type == GGML_TYPE_Q6_K) &&
+      K == 512 && n_expert_used == 1 && n_tokens > 8 &&
+      n_tokens <= kMoeDownMaxSlots;
   const size_t group_bytes =
       by_expert ? 2 * size_t(n_tokens) * sizeof(int32_t)
+      : down_grouped ? mmvq_moe_down_group_bytes(n_tokens)
       : gated && n_tokens > 1
           ? (n_tokens > MMVQ_MAX_BATCH_SIZE
                  ? sizeof(int32_t) +
@@ -529,6 +539,9 @@ static int moe_vector_projection(int weight_type, const void* W,
       by_expert ? reinterpret_cast<int32_t*>(src1_q8_1_ptr + input_bytes)
                 : nullptr;
   int32_t* const slot_of_rank = by_expert ? sorted_ids + n_tokens : nullptr;
+  int32_t* const down_groups =
+      down_grouped ? reinterpret_cast<int32_t*>(src1_q8_1_ptr + input_bytes)
+                   : nullptr;
   if (by_expert) {
     quantize_row_q8_1_by_expert_hip(X_f32, ids, (void*)src1_q8_1_ptr,
                                     sorted_ids, slot_of_rank, K, K,
@@ -537,6 +550,16 @@ static int moe_vector_projection(int weight_type, const void* W,
     if (err != hipSuccess) {
       fprintf(stderr, "%s: quantize_row_q8_1_by_expert_hip failed: %s\n", tag,
               hipGetErrorString(err));
+      return -2;
+    }
+  } else if (down_grouped) {
+    quantize_row_q8_1_and_down_groups_hip(X_f32, ids, (void*)src1_q8_1_ptr,
+                                          down_groups, K, K, ne10_padded,
+                                          n_tokens, stream);
+    err = hipGetLastError();
+    if (err != hipSuccess) {
+      fprintf(stderr, "%s: quantize_row_q8_1_and_down_groups_hip failed: %s\n",
+              tag, hipGetErrorString(err));
       return -2;
     }
   } else if (!X_q8) {
@@ -578,7 +601,7 @@ static int moe_vector_projection(int weight_type, const void* W,
     mul_mat_vec_moe_dispatch(weights, type, input,
                              by_expert ? sorted_ids : ids, output, K, M,
                              n_tokens, n_expert_used, input_stride, stream,
-                             slot_of_rank);
+                             slot_of_rank, down_groups);
 
     err = hipGetLastError();
     if (err != hipSuccess) {

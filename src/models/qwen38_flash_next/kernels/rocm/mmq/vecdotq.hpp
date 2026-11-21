@@ -1290,8 +1290,15 @@ struct Q4MoeFragment {
   uint16_t aux[2];
   half2 dm;
 
+  __device__ __forceinline__ Q4MoeFragment() = default;
+
   __device__ __forceinline__ Q4MoeFragment(const void* weights, int block,
                                           int iqs) {
+    Load(weights, block, iqs);
+  }
+
+  __device__ __forceinline__ void Load(const void* weights, int block,
+                                       int iqs) {
     const auto* w = static_cast<const block_q4_K*>(weights) + block;
     const int offset = QR4_K * ((iqs / 2) / (QI8_1 / 2));
     const auto* q = reinterpret_cast<const int*>(
@@ -1317,4 +1324,101 @@ struct Q4MoeFragment {
     const auto* sc = reinterpret_cast<const uint8_t*>(aux);
     return vec_dot_q4_K_q8_1_impl_vmmq(v, u, sc, sc + 2, dm, d8);
   }
+};
+
+struct Q5KMoeFragment {
+  int vl[2];
+  int vh[2];
+  uint16_t aux[2];
+  half2 dm;
+
+  __device__ __forceinline__ void Load(const void* weights, int block,
+                                       int iqs) {
+    const auto* bq5_K = static_cast<const block_q5_K*>(weights) + block;
+    const int bq8_offset = QR5_K * ((iqs / 2) / (QI8_1 / 2));
+    const auto* ql = reinterpret_cast<const int*>(
+        bq5_K->qs + 16 * bq8_offset + 4 * ((iqs / 2) % 4));
+    const auto* qh =
+        reinterpret_cast<const int*>(bq5_K->qh + 4 * ((iqs / 2) % 4));
+    vl[0] = ql[0];
+    vl[1] = ql[4];
+    vh[0] = qh[0] >> bq8_offset;
+    vh[1] = qh[4] >> bq8_offset;
+    dm = bq5_K->dm;
+    q4_K_scale_pair(reinterpret_cast<const block_q4_K*>(bq5_K), bq8_offset / 2,
+                    aux);
+  }
+
+  __device__ __forceinline__ float Dot(const block_q8_1* bq8_1, int iqs) const {
+    int u[2 * QR5_K];
+    float d8[QR5_K];
+    const int bq8_offset = QR5_K * ((iqs / 2) / (QI8_1 / 2));
+#pragma unroll
+    for (int i = 0; i < QR5_K; ++i) {
+      const block_q8_1* bq8i = bq8_1 + bq8_offset + i;
+      d8[i] = __low2float(bq8i->ds);
+      const auto* q8 =
+          reinterpret_cast<const int*>(bq8i->qs) + ((iqs / 2) % 4);
+      u[2 * i + 0] = q8[0];
+      u[2 * i + 1] = q8[4];
+    }
+    const auto* sc = reinterpret_cast<const uint8_t*>(aux);
+    const uint8_t* m = sc + 2;
+    return vec_dot_q5_K_q8_1_impl_vmmq(vl, vh, u, sc, m, dm, d8);
+  }
+};
+
+struct Q6KMoeFragment {
+  int vi0;
+  int vi1;
+  int sc0;
+  int sc1;
+  float d;
+
+  __device__ __forceinline__ void Load(const void* weights, int block,
+                                       int iqs) {
+    const auto* bq6_K = static_cast<const block_q6_K*>(weights) + block;
+    const int scale_offset =
+        (QI6_K / 4) * (iqs / (QI6_K / 2)) + (iqs % (QI6_K / 2)) / (QI6_K / 8);
+    const int vh_shift = 2 * ((iqs % (QI6_K / 2)) / (QI6_K / 4));
+    const int vl = get_int_b2(bq6_K->ql, iqs);
+    const int vh = get_int_b2(bq6_K->qh, (QI6_K / 4) * (iqs / (QI6_K / 2)) +
+                                             iqs % (QI6_K / 4)) >>
+                   vh_shift;
+    sc0 = bq6_K->scales[scale_offset + 0];
+    sc1 = bq6_K->scales[scale_offset + 4];
+    vi0 = __vsubss4(((vl >> 0) & 0x0F0F0F0F) | (((vh >> 0) << 4) & 0x30303030),
+                    0x20202020);
+    vi1 = __vsubss4(((vl >> 4) & 0x0F0F0F0F) | (((vh >> 4) << 4) & 0x30303030),
+                    0x20202020);
+    d = __half2float(bq6_K->d);
+  }
+
+  __device__ __forceinline__ float Dot(const block_q8_1* bq8_1, int iqs) const {
+    const int bq8_offset =
+        2 * QR6_K * (iqs / (QI6_K / 2)) + (iqs % (QI6_K / 2)) / (QI6_K / 4);
+    const int u0 = get_int_b4(bq8_1[bq8_offset + 0].qs, iqs % QI8_1);
+    const int u1 = get_int_b4(bq8_1[bq8_offset + 2].qs, iqs % QI8_1);
+    const float d8_0 = __low2float(bq8_1[bq8_offset + 0].ds);
+    const float d8_1 = __low2float(bq8_1[bq8_offset + 2].ds);
+    float sumf = 0.0f;
+    sumf += d8_0 * (ggml_hip_dp4a(vi0, u0, 0) * sc0);
+    sumf += d8_1 * (ggml_hip_dp4a(vi1, u1, 0) * sc1);
+    return d * sumf;
+  }
+};
+
+template <ggml_type type>
+struct MoeKQuantFragment;
+template <>
+struct MoeKQuantFragment<GGML_TYPE_Q4_K> {
+  using Type = Q4MoeFragment;
+};
+template <>
+struct MoeKQuantFragment<GGML_TYPE_Q5_K> {
+  using Type = Q5KMoeFragment;
+};
+template <>
+struct MoeKQuantFragment<GGML_TYPE_Q6_K> {
+  using Type = Q6KMoeFragment;
 };

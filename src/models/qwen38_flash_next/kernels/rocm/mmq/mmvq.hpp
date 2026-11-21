@@ -13,6 +13,24 @@ struct MoeBatchGroup {
   uint32_t slots[MMVQ_MAX_BATCH_SIZE];
 };
 
+// Leader-anchor group for down_exps (1 expert per slot row).
+// Each leader holds up to kMoeDownGroupCols slot rows routed to the same
+// expert; inactive slot rows (expert < 0) form a single-slot group with
+// expert = -2 so their destination row is explicitly zeroed.
+constexpr int kMoeDownMaxSlots = 512;
+constexpr int kMoeDownGroupCols = 8;
+
+struct MoeDownGroup {
+  int32_t expert;
+  int32_t count;
+  int32_t slots[kMoeDownGroupCols];
+};
+
+constexpr size_t mmvq_moe_down_group_bytes(int n_slots) {
+  return sizeof(int32_t) + size_t(n_slots) * sizeof(int32_t) +
+         size_t(n_slots) * sizeof(MoeDownGroup);
+}
+
 // Tuned routed-vector batch limits for gfx1151.
 constexpr __host__ __device__ int mmvq_moe_max_batch(ggml_type type) {
     return type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K ? 4 : 8;
@@ -35,7 +53,8 @@ void mul_mat_vec_moe_dispatch(const void* weights, ggml_type type,
                              const block_q8_1* input, const int32_t* ids, float* output,
                              int k, int rows, int tokens, int experts_used,
                              int input_stride, hipStream_t stream,
-                             const int32_t* dst_slots = nullptr);
+                             const int32_t* dst_slots = nullptr,
+                             const int32_t* down_groups = nullptr);
 // Scratch ints mul_mat_vec_moe_gated needs for 2..MMVQ_MAX_BATCH_SIZE tokens:
 // a group per slot and two anchor lists.
 constexpr int mmvq_moe_group_ints(int tokens, int experts_used) {

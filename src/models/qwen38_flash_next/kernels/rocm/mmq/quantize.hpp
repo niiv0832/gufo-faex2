@@ -23,6 +23,12 @@ void quantize_row_q8_1_by_expert_hip(
         int32_t * slot_of_rank, int64_t ne00, int64_t s01, int64_t ne0,
         int slots, hipStream_t stream);
 
+// quantize_row_q8_1_hip for `slots` one-expert rows while block (0, 0, 0)
+// builds the compact leader-anchor MoeDownGroup table in `down_groups`.
+void quantize_row_q8_1_and_down_groups_hip(
+        const float * x, const int32_t * ids, void * vy, int32_t * down_groups,
+        int64_t ne00, int64_t s01, int64_t ne0, int slots, hipStream_t stream);
+
 void quantize_mmq_q8_1_hip(
         const float * x, const int32_t * ids, void * vy,
         ggml_type type_src0, int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
