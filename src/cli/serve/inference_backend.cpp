@@ -519,6 +519,35 @@ public:
       verifier_ = std::make_unique<speculative::SpeculativeVerifier>(
           *executor_, std::move(draft_backend), speculative_options);
     }
+    WarmIdlePipeline();
+  }
+
+  /// Pays the lazy kernel, workspace and plan costs of this session before
+  /// the first request, while the pool is still being created before the
+  /// HTTP listener opens (W0.2). Each pooled session warms its own executor:
+  /// the per-session MoE warm of the decode path is otherwise paid on that
+  /// session's first decode, which is the 27–39 ms burst of the fourth
+  /// concurrent request. GUFO_WARMUP=0 restores the lazy behavior.
+  void WarmIdlePipeline() {
+    const char* disabled = std::getenv("GUFO_WARMUP");
+    if (disabled != nullptr && disabled[0] == '0') {
+      return;
+    }
+    const auto started = std::chrono::steady_clock::now();
+    try {
+      executor_->WarmIdlePipeline();
+    } catch (const std::exception& failure) {
+      // A failed warm is not a failed load: the executor is reset again by
+      // the callee, so serving falls back to the previous lazy behavior.
+      Logger::Warn("loader", std::string("event=serve_warmup_failed reason=") +
+                                 failure.what());
+      return;
+    }
+    const auto elapsed = std::chrono::duration<double>(
+                             std::chrono::steady_clock::now() - started)
+                             .count();
+    Logger::Info("loader", "event=serve_warmup_completed elapsed_ms=" +
+                               std::to_string(elapsed * 1000.0));
   }
 
   void SetCancellationCheck(const CancellationCheck& check) override {

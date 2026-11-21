@@ -721,6 +721,14 @@ public:
   /// Resets GPU state. Any reset failure is retained and rethrown by the next
   /// fallible operation; invalidation/cleanup itself remains noexcept.
   void Reset() noexcept;
+  /// Pays the lazy start-up costs of a serving session on idle buffers: the
+  /// MoE expert kernels' workspace pool, the prefill kernel modules and
+  /// hipBLASLt plans, and one autoregressive decode step. The state is reset
+  /// afterwards, so no request-visible bit changes; the point is that the
+  /// first request after a session is created no longer loads modules or
+  /// grows workspaces. Graph captures are deliberately not kept: they are
+  /// destroyed at every request boundary anyway.
+  void WarmIdlePipeline();
   void SaveState(std::uint32_t valid_context);
   void RestoreState();
   /// Ends replay capture after the last verification chunk.

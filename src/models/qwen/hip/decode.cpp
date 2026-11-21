@@ -119,5 +119,33 @@ tokenization::TokenId QwenGpuExecutor::ForwardToken(
   return CheckedSampleToken(next_token_id, config.vocab_size);
 }
 
+void QwenGpuExecutor::WarmIdlePipeline() {
+  CheckReset();
+  try {
+    const auto& config = weights_.config;
+    // The expert kernels draw their workspace from a growing pool; growing it
+    // here keeps the growth out of the first real decode (and out of any
+    // graph capture, which is why decode.cpp defers this warm in the first
+    // place).
+    if (config.IsMoe() && !moe_warmed_) {
+      WarmMoeDecode(weights_, config, arena_.moe, arena_.d_normed,
+                    arena_.stream);
+      moe_warmed_ = true;
+    }
+    // One idle prefill chunk and one decode step load the lazy kernel modules
+    // and the hipBLASLt plans of the serving shapes on this session's stream.
+    // The reset restores the pristine state, so the bits of real requests are
+    // unchanged; the graph captured below is deliberately discarded with it.
+    const tokenization::TokenId idle = 0;
+    (void)ForwardPromptChunk(std::span(&idle, 1), 0, false);
+    (void)ForwardToken(idle, 1, true);
+    HIP_CHECK(hipStreamSynchronize(arena_.stream));
+  } catch (...) {
+    Reset();
+    throw;
+  }
+  Reset();
+}
+
 }  // namespace gufo::hip
 #endif  // defined(ENGINE_ENABLE_HIP)
