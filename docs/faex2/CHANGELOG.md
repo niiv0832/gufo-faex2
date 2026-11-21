@@ -4,6 +4,12 @@
 
 ## 2026-11-21
 
+### Продакшен переведён на `3ab05ad7` (`W0.2` + `W0.4`, launcher v18, 14:38 МСК)
+
+- **Сборка и установка:** по поручению владельца собран чистый release-бинарник `3ab05ad7acb8e853ab8b2e92d6d47c512a481547` (`RelWithDebInfo`, HIP `gfx1151`, `BUILD_TESTING=OFF`, `therock-10.1.0`), SHA-256 **`920a9fefc586221e8d2185a0ddeddd66e78166dbe9a6501adf07b33cecd10700`**, установлен в `/home/truezero/gufo-release/3ab05ad7-920a9fef/{bin/gufo,MANIFEST.json}`.
+- **Launcher v18 (бэкап v17 в `~/gufo-release/launcher-backup-b81812aa-3ab05ad7/`):** `main` → `main-3ab05ad7-920a9fef`, `recovery` → `recovery-b81812aa-e5af3a93` (прежний рабочий бинарник `b81812aa` сохранён на диске для мгновенного отката без пересборки).
+- **Верификация (14:38 МСК):** `gufo-faex2.service` `active`, `READY`, `owner PID 162617`, `child PID 162619`, `owner_identity_matches: true`, `child_identity_matches: true`, `/proc/162619/exe` SHA = `920a9fef…`, 4× `event=serve_warmup_completed` (`256,1 / 87,3 / 87,3 / 86,8 мс`), первый живой streaming-запрос `"28+28="` → `'56'` за **`108,4 мс` TTFT** (`prefill 99,7 мс`), красный PNG → `'Красный'`, LAN `192.168.3.80:13336` OK, `/slots` 4 idle, `/metrics` активны, `journalctl -k` CLEAN (`0` amdgpu fault/reset/OOM); временная папка сборки и bundle удалены (`674 GiB` свободно). `git push` не выполнялся.
+
 ### `W1.2` п. 2: живая проба 2×-downscale / multi-scale OCR для `big-text` — `W1.2` закрыт полностью
 
 - **Эксперимент (продовый `b81812aa` `13336`, без простоя прода):** проверены 6 режимов масштабирования (`A_orig`, `B_naive2x`, `C_pad2x`, `D_pad3x`, `E_orig+pad2x`, `F_orig+pad3x`) на (а) 6 ступенчатых `5×7` bitmap-картинках (`big-gufo-518`, `big-owl-274`, `scale=10..16`), (б) штатных OCR-таблицах/чеках/формулах (`faex2_appset.jsonl`) и (в) 7 настоящих сглаженных TrueType-баннерах (`Helvetica 12–120 pt`, латиница и кириллица).
