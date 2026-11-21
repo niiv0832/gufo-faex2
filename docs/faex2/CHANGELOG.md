@@ -4,6 +4,13 @@
 
 ## 2026-11-22
 
+### Продакшен переведён на `4560072c` (`W2.2` + `W1.4`, launcher v19, 01:38 МСК) + `git push`
+
+- **Публикация:** по явному поручению владельца ветка `faex2` запушена в `origin` до `4560072c0a8162cb813ecf842a3b1f646a190385` (`git ls-remote` подтвердил SHA; постоянный защитный `pushurl` сохранён).
+- **Сборка и установка:** собран чистый release-бинарник `4560072c0a8162cb813ecf842a3b1f646a190385` (`RelWithDebInfo`, HIP `gfx1151`, `BUILD_TESTING=OFF`, `therock-10.1.0`), SHA-256 **`c47ace56a2dcbefab393e50526755f8a6b38774bd20073c563a8941a85a208cb`**, установлен в `/home/truezero/gufo-release/4560072c-c47ace56/{bin/gufo,MANIFEST.json}`.
+- **Launcher v19 (бэкап v18 в `~/gufo-release/launcher-backup-3ab05ad7-4560072c/`):** штатная остановка под v18 → установка v19 → старт (`main` → `main-4560072c-c47ace56`, `recovery` → `recovery-3ab05ad7-920a9fef`, прежний `3ab05ad7` `920a9fef…` сохранён на диске для мгновенного отката).
+- **Верификация (01:38 МСК, простой 25 с):** `gufo-faex2.service` `active`, `READY`, `owner PID 248441`, `child PID 248443`, `owner_identity_matches: true`, `child_identity_matches: true`, `/proc/248443/exe` SHA = `c47ace56…`, 4× `event=serve_warmup_completed` (`260,7 / 85,7 / 85,6 / 85,2 мс`), первый живой streaming-запрос `"28+28="` → `'56'` за **`108,5 мс` TTFT** (`prompt_ms 97,6 мс`, `92,6 tok/s`, `draft 1/1`), красный PNG → `'Красный'`, LAN `192.168.3.80:13336/props` → `development (4560072c…)` / `slots: 4` / `vision: True`, `/slots` 4 idle, `gufo_device_lost_total 0`, `journalctl -k` CLEAN (`0` amdgpu fault/reset/OOM); временная сборка `~/gufo-w22-w14-deploy-20261122` и `~/.cache/deploy-tmp` удалены (`669 GiB` свободно).
+
 ### Реализация и стендовая верификация `W1.4`: побитовая векторизация и фьюзинг плотных `Q8_0` GEMV / Small-Batch GEMM ядер (`8c3a76d8`)
 
 - **Профиль и потолок железа (Фаза 1 на `e7186b26`):** на `gfx1151` (`20 WGP = 40 CU`, потолок DRAM read **252,2 ГБ/с**) в `Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf` все плотные проекции (`lm_head`, `mtp`, `attn_q/k/v/output`, `ssm_in/out`, `ffn_*_shexp`) квантованы в `Q8_0`, а `ssm_alpha`/`ssm_beta` — в `F32`. В исходном коде `Q8KBlockGEMVKernel_2Rows` читал веса побайтово, `Wave32FusedQuantSwiGLUGEMVKernel` проваливался в тяжёлый шаблонный `<kF32,kF32>` путь (`9 093` инструкций в ISA), `down_shexp` (`K=512`) шёл на `113–160 ГБ/с`, а в батчевом декоде (`Batch=2..8`) `ssm_in` (`4` запуска), `qkv` (`3` запуска) и `swiglu` (`3` запуска) запускались раздельно.
