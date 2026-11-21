@@ -4,6 +4,42 @@
 
 ## 2026-11-21
 
+### Реализованы W0.2 (прогрев), W0.4 (MoE-skew) и основание W1.2 — CPU-этап, стенд и прод не трогались
+
+- **W1.2 (оснение 36/36):** по сохранённому логу `vision-diag-full.log` подготовлено
+  [таблица-основание](VISION_RESYNC_W12_2026-11-21.md) по всем 4 критериям п. 8 `Q1`
+  (KL `0,001963` ✅, maxΔ `0,513805` ✅, near-tie `0,030/0,070` ✅; ре-синхронизация:
+  сдвиг 1 токен, 2 несовпадающих токена, Levenshtein обрезанных окон 3 — на решение
+  владельца) и CPU-скрипт `tools/prof/vision_resync.py` (`tests/tools/vision_resync_test.py`).
+  Решение по `36/36` — за владельцем; строгий тест не менялся.
+- **W0.2 (`7b76e58c`):** каждая сессия `QwenTextRunnerState` при создании (все — до
+  открытия HTTP-приёма) прогревает `WarmMoeDecode`, один холостой prefill-чанк и один
+  холостой AR-шаг (`QwenGpuExecutor::WarmIdlePipeline`), затем возвращается в чистое
+  состояние `Reset()`; `GUFO_WARMUP=0` возвращает ленивое поведение; длительность —
+  `event=serve_warmup_completed elapsed_ms=…` (метрику в `/metrics` не добавляли:
+  строгий парсер `server_metrics.py` отвергает новые имена — по решению владельца
+  только лог). Сбой прогрева деградирует в прежнее ленивое поведение
+  (`event=serve_warmup_failed`). Осознанно **не** покрыто: холостые verify (T=2)/MTP-шаги
+  (требуют драйва `SpeculativeVerifier` на сфабрикованном состоянии; захваты графов
+  всё равно стираются на границе каждого запроса) и hipBLASLt-планы grouped-prefill
+  форм — оценить остаток по замеру окна.
+- **W0.4 (`60c0a6cb`):** телеметрия роутера под `GUFO_QWEN_MOE_SKEW` (unset/`0` — 0
+  накладных расходов, буферы не выделяются; `1` → `moe_skew.jsonl`, иное значение — путь):
+  `MoeSkewRecordKernel` после каждого `MoeRouterTopK` пишет в фиксированные device-буферы
+  (graph-safe) послойную гистограмму выбранных экспертов по бакетам числа строк
+  (1/2/3/4/5–8/>8 — разделяет AR, verify T=2/3/4 и крупные батчи), массу по слотам
+  (масса 7–8-го эксперта), дубликаты экспертов между строками батча и overlap соседних
+  токенов (`prev_ids`); offload — один JSONL-рекорд на запрос в `Reset()`, сброс буферов
+  и файла — при деструкторе исполнителя. Офлайн-отчёт — `tools/prof/moe_skew.py`
+  (Gini, hot-масса, hot-set 80 %, дубликаты, overlap, масса хвоста),
+  CPU-тест — `tests/tools/moe_skew_test.py`. Арифметика и `CacheIdentity` не менялись.
+  Не покрыто: сгруппированный prefill-роутер (`MoePrefillFfn` → `QwenMoePrefill::Run`).
+- **Проверки (Mac, только CPU):** `tools/ci/check-format.py` (**PASS, 729 файлов**),
+  `tests/tools/check_docs_test.py` (**OK**), `git diff --check` (**OK**),
+  `tests/tools/vision_resync_test.py` (**PASS**), `tests/tools/moe_skew_test.py` (**PASS**).
+  HIP-ветка на Mac не компилируется (нет ROCm) — синтаксис и поведение проверяются
+  изолированной сборкой на стенде; GPU, прод `b81812aa` и `push` не затрагивались.
+
 ### Аудит `W1.1`/`W0.3`/`W0.5` и допрофиль `rocprofv3` (`window8_rocprof`, `02:22–02:26 MSK`) — `W0.3` закрыт полностью
 
 - **Подтверждение `W1.1 FAIL` и корневая причина в коде:** все числа `Q1`, Б2 (`long-facts 21/24 < 22`, `only_b = 2`) и matched-pair (`completion_tokens = 64` у всех строк) подтверждены по сырым JSON. Найдена причина регрессии MTP1 (+33…+209 %): [`src/models/qwen/hip/kernels/attention_sparse.hip:765-777`](../../src/models/qwen/hip/kernels/attention_sparse.hip#L765-L777) вызывает `LaunchQwenSparseDecodeAttention` только при `batch_size == 1`, а при `batch_size >= 2` проваливается в prefill-ядро `SparseWmmaCausalAttention` (`tiles = 1`, 8 блоков на 40 CU). Вердикт **FAIL** неизменен (качество провалено отдельно).
