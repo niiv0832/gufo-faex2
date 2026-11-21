@@ -27,6 +27,46 @@ struct Q8_0Block {
 };
 static_assert(sizeof(Q8_0Block) == 34, "block_q8_0 must be 34 bytes");
 
+// Immediate XOR masks avoid the lane-address calculation of __shfl_xor while
+// preserving the exact descending butterfly order of scalar decoding.
+template<int Offset = 16>
+__device__ __forceinline__ float ReduceWaveXor(float value) {
+  const int other = __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, value),
+                                                (Offset << 10) | 31);
+  const float sum = value + __builtin_bit_cast(float, other);
+  if constexpr (Offset > 1) {
+    return ReduceWaveXor<Offset / 2>(sum);
+  } else {
+    return sum;
+  }
+}
+
+// Computes the unscaled 32-element FP32 dot product for one Q8_0 block in
+// strict left-to-right order (i = 0..31), matching scalar decoding bit for bit.
+__device__ __forceinline__ float Q8_0BlockDotFp32(
+    const Q8_0Block& blk, const float* __restrict__ xb) {
+  const auto* xv = reinterpret_cast<const float4*>(xb);
+  float blk_dot = 0.0F;
+#pragma unroll
+  for (int group = 0; group < 8; ++group) {
+    std::uint32_t packed;
+    __builtin_memcpy(&packed, blk.qs + (group * 4), sizeof(std::uint32_t));
+    const float4 x4 = xv[group];
+    blk_dot +=
+        static_cast<float>(static_cast<std::int8_t>(packed & 0xFFU)) * x4.x;
+    blk_dot +=
+        static_cast<float>(static_cast<std::int8_t>((packed >> 8U) & 0xFFU)) *
+        x4.y;
+    blk_dot +=
+        static_cast<float>(static_cast<std::int8_t>((packed >> 16U) & 0xFFU)) *
+        x4.z;
+    blk_dot +=
+        static_cast<float>(static_cast<std::int8_t>((packed >> 24U) & 0xFFU)) *
+        x4.w;
+  }
+  return blk_dot;
+}
+
 // opt-r4-q5k-q6k: block_q5_K layout ({half d; half dmin; uint8 scales[12];
 // uint8 qh[32]; uint8 qs[128]; }, 176 bytes, QK_K=256). Dequant-to-fp path:
 // Q5KValue read a fp16 d/dmin and the packed 4-bit qs + qh sign bits, then

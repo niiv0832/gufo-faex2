@@ -24,6 +24,15 @@ void LaunchFusedQKVProjections(const void* q_w, core::GgmlType q_type,
                                std::size_t kv_dim, std::size_t hidden_size,
                                hipStream_t stream = nullptr);
 
+/// Exact fused Q8_0 Q/K/V projections for small verification batches
+/// (2 <= batch_size <= 8), sharing activation staging in a single launch.
+/// Returns false without launching when unsupported.
+[[nodiscard]] bool TryLaunchBatchedQ8_0FusedQKV(
+    const void* q_w, const void* k_w, const void* v_w, const float* x,
+    float* q_out, float* k_out, float* v_out, std::size_t batch_size,
+    std::size_t q_dim, std::size_t kv_dim, std::size_t hidden_size,
+    hipStream_t stream = nullptr);
+
 /// Writes one position's K and V rows into every non-null cache, exactly as
 /// LaunchAttention does before it reads them.
 void LaunchDecodeKvWrite(const float* k, const float* v, float* k_cache,

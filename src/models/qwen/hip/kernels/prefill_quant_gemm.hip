@@ -1966,6 +1966,138 @@ void LaunchBatchedQuantGEMMFp32(core::GgmlType type, const void* w,
                stream>>>(w, fp32_x, y, m, k);
         return;
       }
+      if (batch == 1) {
+        LaunchQ8KBlockGEMV(w, core::GgmlType::kQ8_0, fp32_x, y, m, k, stream);
+        return;
+      }
+      const std::size_t row_bytes = (k / kQ8_0BlockSize) * sizeof(Q8_0Block);
+      if (FitsSmallBatch32BitIndices(batch, m, k, row_bytes)) {
+        if (k == 512) {
+          const auto launch_l16 =
+              [&]<std::size_t Batch, std::size_t RowsPerWave>() {
+                constexpr std::uint32_t kWaves = 4;
+                constexpr std::size_t kRowsPerBlock =
+                    kWaves * 2 * RowsPerWave;
+                SmallBatchQ8_0ExactFp32L16NoLdsKernel<kWaves, Batch,
+                                                      RowsPerWave>
+                    <<<static_cast<unsigned int>((m + kRowsPerBlock - 1) /
+                                                 kRowsPerBlock),
+                       kWaves * 32, 0, stream>>>(w, fp32_x, y,
+                                                 static_cast<std::uint32_t>(m));
+              };
+          switch (batch) {
+            case 2:
+              launch_l16.template operator()<2, 1>();
+              return;
+            case 3:
+              launch_l16.template operator()<3, 2>();
+              return;
+            case 4:
+              launch_l16.template operator()<4, 2>();
+              return;
+            case 5:
+              launch_l16.template operator()<5, 2>();
+              return;
+            case 6:
+              launch_l16.template operator()<6, 2>();
+              return;
+            case 7:
+              launch_l16.template operator()<7, 2>();
+              return;
+            default:
+              launch_l16.template operator()<8, 2>();
+              return;
+          }
+        }
+        const auto launch_narrow =
+            [&]<std::uint32_t Waves, std::size_t Batch, std::size_t Rows,
+                bool XorStage, std::size_t Step = Batch>() {
+              constexpr std::size_t kRowsPerBlock = Waves * Rows;
+              SmallBatchQ8_0ExactFp32VecGEMMKernel<Waves, Batch, Rows, true,
+                                                   XorStage, 32, 1, Step>
+                  <<<static_cast<unsigned int>((m + kRowsPerBlock - 1) /
+                                               kRowsPerBlock),
+                     Waves * 32, 0, stream>>>(w, fp32_x, y, m, k);
+            };
+        if (m >= 100000 && k >= 1024) {
+          switch (batch) {
+            case 2:
+              launch_narrow.template operator()<4, 2, 1, true>();
+              return;
+            case 3:
+              launch_narrow.template operator()<4, 3, 2, true>();
+              return;
+            case 4:
+              launch_narrow.template operator()<4, 4, 2, true>();
+              return;
+            default:
+              break;
+          }
+        }
+        if (m == 2048 && k == 4096) {
+          switch (batch) {
+            case 2:
+              launch_narrow.template operator()<16, 2, 1, false>();
+              return;
+            case 3:
+              launch_narrow.template operator()<8, 3, 4, true>();
+              return;
+            case 4:
+              launch_narrow.template operator()<8, 4, 2, false>();
+              return;
+            default:
+              break;
+          }
+        }
+        if (m <= 512) {
+          switch (batch) {
+            case 2:
+              launch_narrow.template operator()<8, 2, 2, true>();
+              return;
+            case 3:
+              launch_narrow.template operator()<8, 3, 2, true>();
+              return;
+            case 4:
+              launch_narrow.template operator()<8, 4, 2, true>();
+              return;
+            case 5:
+              launch_narrow.template operator()<8, 5, 2, true>();
+              return;
+            case 6:
+              launch_narrow.template operator()<8, 6, 2, true>();
+              return;
+            case 7:
+              launch_narrow.template operator()<8, 7, 2, true>();
+              return;
+            default:
+              launch_narrow.template operator()<8, 8, 2, true, 2>();
+              return;
+          }
+        }
+        switch (batch) {
+          case 2:
+            launch_narrow.template operator()<16, 2, 2, true>();
+            return;
+          case 3:
+            launch_narrow.template operator()<16, 3, 2, true>();
+            return;
+          case 4:
+            launch_narrow.template operator()<16, 4, 2, true>();
+            return;
+          case 5:
+            launch_narrow.template operator()<16, 5, 2, true>();
+            return;
+          case 6:
+            launch_narrow.template operator()<16, 6, 2, true>();
+            return;
+          case 7:
+            launch_narrow.template operator()<16, 7, 2, true>();
+            return;
+          default:
+            launch_narrow.template operator()<16, 8, 2, true>();
+            return;
+        }
+      }
       constexpr std::size_t kVecRowsPerWave = 2;
       constexpr std::size_t kVecRowsPerBlock =
           kVecWarpsPerBlock * kVecRowsPerWave;

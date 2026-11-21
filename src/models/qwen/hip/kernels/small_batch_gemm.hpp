@@ -428,6 +428,96 @@ __launch_bounds__(WavesPerBlock * 32, 1) __global__
   }
 }
 
+// Half-wave (16-lane) no-LDS Q8_0 small-batch GEMM for K == 512 (16 Q8_0
+// blocks/row). Eliminates the 16 idle lanes and both workgroup barriers while
+// reproducing the 32-lane kernel bit for bit (the +0.0F step matches the
+// offset-16 butterfly partner of +0.0F for -0.0F sign semantics).
+template<std::uint32_t WavesPerBlock, std::size_t Batch,
+         std::size_t RowsPerWave>
+__launch_bounds__(WavesPerBlock * 32, 4) __global__
+    void SmallBatchQ8_0ExactFp32L16NoLdsKernel(const void* __restrict__ w,
+                                               const float* __restrict__ x,
+                                               float* __restrict__ y,
+                                               std::uint32_t m) {
+  constexpr std::uint32_t kBlocks = 16;
+  constexpr std::uint32_t kK = kBlocks * kQ8_0BlockSize;
+  const std::uint32_t lane = threadIdx.x & 15u;
+  const std::uint32_t half_id = threadIdx.x >> 4u;
+  const std::uint32_t row_base =
+      ((blockIdx.x * (WavesPerBlock * 2u)) + half_id) * RowsPerWave;
+  if (row_base >= m) {
+    return;
+  }
+
+  const auto* base = static_cast<const Q8_0Block*>(w);
+  const Q8_0Block* rows[RowsPerWave];
+  float scale[RowsPerWave];
+#pragma unroll
+  for (std::uint32_t r = 0; r < RowsPerWave; ++r) {
+    const std::uint32_t row = row_base + r;
+    const std::uint32_t safe_row = row < m ? row : m - 1u;
+    rows[r] = &base[(safe_row * kBlocks) + lane];
+    scale[r] = __half2float(rows[r]->d);
+  }
+
+  float block_dots[RowsPerWave][Batch] = {};
+#pragma unroll
+  for (std::uint32_t group = 0; group < 8; ++group) {
+    std::uint32_t packed[RowsPerWave];
+#pragma unroll
+    for (std::uint32_t r = 0; r < RowsPerWave; ++r) {
+      __builtin_memcpy(&packed[r], rows[r]->qs + (group * 4),
+                       sizeof(std::uint32_t));
+    }
+#pragma unroll
+    for (std::uint32_t token = 0; token < Batch; ++token) {
+      const float4 xv = *reinterpret_cast<const float4*>(
+          x + (token * kK) + (lane * kQ8_0BlockSize) + (group * 4u));
+#pragma unroll
+      for (std::uint32_t r = 0; r < RowsPerWave; ++r) {
+        const std::uint32_t p = packed[r];
+        block_dots[r][token] +=
+            static_cast<float>(static_cast<std::int8_t>(p & 0xFFU)) * xv.x;
+        block_dots[r][token] +=
+            static_cast<float>(static_cast<std::int8_t>((p >> 8U) & 0xFFU)) *
+            xv.y;
+        block_dots[r][token] +=
+            static_cast<float>(static_cast<std::int8_t>((p >> 16U) & 0xFFU)) *
+            xv.z;
+        block_dots[r][token] +=
+            static_cast<float>(static_cast<std::int8_t>((p >> 24U) & 0xFFU)) *
+            xv.w;
+      }
+    }
+  }
+
+  float sums[RowsPerWave][Batch];
+#pragma unroll
+  for (std::uint32_t r = 0; r < RowsPerWave; ++r) {
+#pragma unroll
+    for (std::uint32_t token = 0; token < Batch; ++token) {
+      float sum = 0.0F;
+      sum += scale[r] * block_dots[r][token];
+      sum += 0.0F;
+      sums[r][token] = ReduceKQuantWave<8>(sum);
+    }
+  }
+
+  if (lane == 0) {
+#pragma unroll
+    for (std::uint32_t r = 0; r < RowsPerWave; ++r) {
+      const std::uint32_t row = row_base + r;
+      if (row >= m) {
+        continue;
+      }
+#pragma unroll
+      for (std::uint32_t token = 0; token < Batch; ++token) {
+        y[(token * m) + row] = sums[r][token];
+      }
+    }
+  }
+}
+
 // Wave64 groups of eight, fourteen or sixteen tokens distribute their stores.
 template<std::size_t Batch, core::GgmlType WType,
          std::uint32_t HardwareWaveSize>

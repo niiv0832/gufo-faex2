@@ -5,12 +5,72 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 
 #include "src/core/gguf_reader.hpp"
 #include "src/models/qwen/hip/ops/gemm.hpp"
 #include "src/models/qwen/hip/quant_ops.hpp"
 
 namespace gufo::hip {
+
+// Specialized 1-row-per-wave Q8_0 GEMV: drops the multi-format type switch and
+// keeps exact per-block left-to-right FP32 FMA order plus descending butterfly
+// reduction, matching Q8KBlockGEMVKernel_2Rows bit for bit.
+template<std::uint32_t WavesPerBlock>
+__launch_bounds__(WavesPerBlock * 32, 4) __global__
+    void Q8_0BlockGEMVKernel_1Row(const Q8_0Block* __restrict__ A,
+                                  const float* __restrict__ x,
+                                  float* __restrict__ y, std::size_t M,
+                                  std::size_t K) {
+  const std::uint32_t lane_id = threadIdx.x & 31u;
+  const std::uint32_t warp_id = threadIdx.x >> 5u;
+  const std::size_t m =
+      (static_cast<std::size_t>(blockIdx.x) * WavesPerBlock) + warp_id;
+  if (m >= M) {
+    return;
+  }
+  const std::uint32_t num_blocks = static_cast<std::uint32_t>(K / kQ8_0BlockSize);
+  const Q8_0Block* row_blocks = A + (m * num_blocks);
+  float sum = 0.0F;
+  for (std::uint32_t b = lane_id; b < num_blocks; b += 32u) {
+    const Q8_0Block& wblk = row_blocks[b];
+    const float d = __half2float(wblk.d);
+    const float blk_dot = Q8_0BlockDotFp32(wblk, x + (b * kQ8_0BlockSize));
+    sum += d * blk_dot;
+  }
+  sum = ReduceWaveXor<16>(sum);
+  if (lane_id == 0) {
+    y[m] = sum;
+  }
+}
+
+// Half-wave (16-lane) Q8_0 GEMV for K == 512 (16 blocks/row): assigns two rows
+// per 32-lane wave so lanes 16..31 do useful work instead of idling. Adding
+// +0.0F before the 8..1 butterfly reproduces the 32-lane offset-16 step with
+// idle +0.0F partner lanes bit for bit (including -0.0F sign semantics).
+template<std::uint32_t WavesPerBlock>
+__launch_bounds__(WavesPerBlock * 32, 4) __global__
+    void Q8_0BlockGEMVKernel_1Row_L16(const Q8_0Block* __restrict__ A,
+                                      const float* __restrict__ x,
+                                      float* __restrict__ y, std::size_t M) {
+  constexpr std::uint32_t kBlocks = 16;
+  const std::uint32_t lane = threadIdx.x & 15u;
+  const std::uint32_t half_id = threadIdx.x >> 4u;
+  const std::size_t m =
+      (static_cast<std::size_t>(blockIdx.x) * (WavesPerBlock * 2)) + half_id;
+  if (m >= M) {
+    return;
+  }
+  const Q8_0Block& wblk = A[(m * kBlocks) + lane];
+  const float d = __half2float(wblk.d);
+  float sum = 0.0F;
+  sum += d * Q8_0BlockDotFp32(wblk, x + (lane * kQ8_0BlockSize));
+  sum += 0.0F;
+  sum = ReduceWaveXor<8>(sum);
+  if (lane == 0) {
+    y[m] = sum;
+  }
+}
 
 template<std::uint32_t WavesPerBlock>
 __launch_bounds__(WavesPerBlock * 32, 4) __global__
@@ -164,6 +224,22 @@ void LaunchQ8KBlockGEMV(const void* A, core::GgmlType type, const float* x,
                         hipStream_t stream) {
   constexpr std::uint32_t kWavesPerBlock = 4;
   constexpr std::uint32_t kBlockThreads = kWavesPerBlock * 32;
+
+  if (type == core::GgmlType::kQ8_0 && K % kQ8_0BlockSize == 0 &&
+      (K / kQ8_0BlockSize) <= std::numeric_limits<std::uint32_t>::max()) {
+    const auto* q8 = static_cast<const Q8_0Block*>(A);
+    if (K == 512) {
+      constexpr std::uint32_t kRowsPerBlock = kWavesPerBlock * 2;
+      const std::size_t grid = (M + kRowsPerBlock - 1U) / kRowsPerBlock;
+      Q8_0BlockGEMVKernel_1Row_L16<kWavesPerBlock>
+          <<<grid, kBlockThreads, 0, stream>>>(q8, x, y, M);
+      return;
+    }
+    const std::size_t grid = (M + kWavesPerBlock - 1U) / kWavesPerBlock;
+    Q8_0BlockGEMVKernel_1Row<kWavesPerBlock>
+        <<<grid, kBlockThreads, 0, stream>>>(q8, x, y, M, K);
+    return;
+  }
 
   // The K-quants take one row per warp: the two-row kernel runs its rows one
   // after the other, so it only halves the warps in flight. Q4_K ssm_out

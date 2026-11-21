@@ -145,12 +145,22 @@ void LaunchMoeFfnRows(const models::QwenLayerWeights& layer,
                       stream, nullptr, nullptr) != 0) {
     throw std::runtime_error("qwen35moe expert projection failed");
   }
-  LaunchProjection(layer.ffn_gate_shexp, x, s.shared_gate, rows, shared_ff,
-                   hidden, stream);
-  LaunchProjection(layer.ffn_up_shexp, x, s.shared_up, rows, shared_ff, hidden,
-                   stream);
-  LaunchBatchedSwiGLUActivation(s.shared_gate, s.shared_up, s.shared_act,
-                                nullptr, rows * shared_ff, stream);
+  if (rows == 1) {
+    LaunchFusedSwiGLUGEMV(layer.ffn_gate_shexp.data, layer.ffn_gate_shexp.type,
+                          layer.ffn_up_shexp.data, layer.ffn_up_shexp.type, x,
+                          s.shared_act, shared_ff, hidden, stream);
+  } else if (!(layer.ffn_gate_shexp.type == core::GgmlType::kQ8_0 &&
+               layer.ffn_up_shexp.type == core::GgmlType::kQ8_0 &&
+               TryLaunchBatchedQ8_0FusedSwiGLU(
+                   layer.ffn_gate_shexp.data, layer.ffn_up_shexp.data, x,
+                   s.shared_act, rows, shared_ff, hidden, stream))) {
+    LaunchProjection(layer.ffn_gate_shexp, x, s.shared_gate, rows, shared_ff,
+                     hidden, stream);
+    LaunchProjection(layer.ffn_up_shexp, x, s.shared_up, rows, shared_ff,
+                     hidden, stream);
+    LaunchBatchedSwiGLUActivation(s.shared_gate, s.shared_up, s.shared_act,
+                                  nullptr, rows * shared_ff, stream);
+  }
   LaunchProjection(layer.ffn_down_shexp, s.shared_act, s.shared_out, rows,
                    hidden, shared_ff, stream);
   // A null `out` leaves the expert outputs for MoeFfnFinishRows.
@@ -200,6 +210,57 @@ SsmControls LaunchSsmControls(const models::QwenLayerWeights& layer,
   return {scratch.ssm.alpha.data(), scratch.ssm.beta.data(), time_step_rank};
 }
 
+void LaunchAttentionQkvProjections(const models::QwenLayerWeights& layer,
+                                   const float* input, float* q_out,
+                                   float* k_out, float* v_out,
+                                   std::size_t batch_size,
+                                   std::size_t q_projection_size,
+                                   std::size_t kv_size, std::size_t hidden_size,
+                                   hipStream_t stream) {
+  if (layer.attn_q.type == core::GgmlType::kQ8_0 &&
+      layer.attn_k.type == core::GgmlType::kQ8_0 &&
+      layer.attn_v.type == core::GgmlType::kQ8_0 &&
+      TryLaunchBatchedQ8_0FusedQKV(layer.attn_q.data, layer.attn_k.data,
+                                   layer.attn_v.data, input, q_out, k_out,
+                                   v_out, batch_size, q_projection_size,
+                                   kv_size, hidden_size, stream)) {
+    return;
+  }
+  LaunchProjection(layer.attn_q, input, q_out, batch_size, q_projection_size,
+                   hidden_size, stream);
+  LaunchProjection(layer.attn_k, input, k_out, batch_size, kv_size, hidden_size,
+                   stream);
+  LaunchProjection(layer.attn_v, input, v_out, batch_size, kv_size, hidden_size,
+                   stream);
+}
+
+SsmControls LaunchSsmInputProjections(
+    const models::QwenLayerWeights& layer, const QwenGpuScratchView& scratch,
+    std::size_t batch_size, std::size_t ssm_qkv_size,
+    std::size_t ssm_inner_size, std::size_t time_step_rank,
+    std::size_t hidden_size, hipStream_t stream) {
+  if (layer.attn_qkv.type == core::GgmlType::kQ8_0 &&
+      layer.attn_gate.type == core::GgmlType::kQ8_0 &&
+      layer.ssm_alpha.type == core::GgmlType::kF32 &&
+      layer.ssm_beta.type == core::GgmlType::kF32 &&
+      TryLaunchBatchedQ8_0FusedSSMInput(
+          layer.attn_qkv.data, layer.attn_gate.data, layer.ssm_alpha.data,
+          layer.ssm_beta.data, scratch.decode.normed.data(),
+          scratch.ssm.qkv.data(), scratch.ssm.gate.data(),
+          scratch.ssm.alpha.data(), scratch.ssm.beta.data(), batch_size,
+          hidden_size, ssm_qkv_size, ssm_inner_size, time_step_rank, stream)) {
+    return {scratch.ssm.alpha.data(), scratch.ssm.beta.data(), time_step_rank};
+  }
+  LaunchProjection(layer.attn_qkv, scratch.decode.normed.data(),
+                   scratch.ssm.qkv.data(), batch_size, ssm_qkv_size,
+                   hidden_size, stream);
+  LaunchProjection(layer.attn_gate, scratch.decode.normed.data(),
+                   scratch.ssm.gate.data(), batch_size, ssm_inner_size,
+                   hidden_size, stream);
+  return LaunchSsmControls(layer, scratch, batch_size, time_step_rank,
+                           hidden_size, stream);
+}
+
 }  // namespace
 
 void LaunchDecodeRowsSsmControls(const models::QwenTensorRef& alpha,
@@ -208,6 +269,12 @@ void LaunchDecodeRowsSsmControls(const models::QwenTensorRef& alpha,
                                  float* beta_output, std::size_t rows,
                                  std::size_t time_step_rank,
                                  std::size_t hidden_size, hipStream_t stream) {
+  if (alpha.type == core::GgmlType::kF32 && beta.type == core::GgmlType::kF32 &&
+      TryLaunchBatchedF32SsmControls(alpha.data, beta.data, input, alpha_output,
+                                     beta_output, rows, time_step_rank,
+                                     hidden_size, stream)) {
+    return;
+  }
   // Single-token decode computes the controls in its fused input projection,
   // whose sum tree differs from the plain GEMV and from the shared row
   // projections. Run that kernel for the two control matrices alone, for
@@ -364,15 +431,10 @@ std::vector<tokenization::TokenId> QwenGpuExecutor::ForwardTokenBatch(
     }
 
     if (layer.is_full_attention) {
-      LaunchProjection(layer.attn_q, scratch.decode.normed.data(),
-                       scratch.ssm.qkv.data(), batch_size, q_projection_size,
-                       hidden_size, arena.stream);
-      LaunchProjection(layer.attn_k, scratch.decode.normed.data(),
-                       scratch.attention.k.data(), batch_size, kv_size,
-                       hidden_size, arena.stream);
-      LaunchProjection(layer.attn_v, scratch.decode.normed.data(),
-                       scratch.attention.v.data(), batch_size, kv_size,
-                       hidden_size, arena.stream);
+      LaunchAttentionQkvProjections(
+          layer, scratch.decode.normed.data(), scratch.ssm.qkv.data(),
+          scratch.attention.k.data(), scratch.attention.v.data(), batch_size,
+          q_projection_size, kv_size, hidden_size, arena.stream);
       LaunchBatchedUnpackQG(scratch.ssm.qkv.data(), scratch.attention.q.data(),
                             scratch.ssm.gate.data(), batch_size,
                             config.num_attention_heads, config.head_dim,
@@ -428,15 +490,9 @@ std::vector<tokenization::TokenId> QwenGpuExecutor::ForwardTokenBatch(
                        scratch.attention.output.data(), batch_size, hidden_size,
                        attention_size, arena.stream);
     } else {
-      LaunchProjection(layer.attn_qkv, scratch.decode.normed.data(),
-                       scratch.ssm.qkv.data(), batch_size, ssm_qkv_size,
-                       hidden_size, arena.stream);
-      LaunchProjection(layer.attn_gate, scratch.decode.normed.data(),
-                       scratch.ssm.gate.data(), batch_size, ssm_inner_size,
-                       hidden_size, arena.stream);
-      const auto controls =
-          LaunchSsmControls(layer, scratch, batch_size, time_step_rank,
-                            hidden_size, arena.stream);
+      const auto controls = LaunchSsmInputProjections(
+          layer, scratch, batch_size, ssm_qkv_size, ssm_inner_size,
+          time_step_rank, hidden_size, arena.stream);
 
       LaunchSSMConvRecurrenceBatch(
           scratch.ssm.qkv.data(),
@@ -716,15 +772,10 @@ QwenGpuExecutor::ForwardVerificationBatch(
     }
 
     if (layer.is_full_attention) {
-      LaunchProjection(layer.attn_q, scratch.decode.normed.data(),
-                       scratch.ssm.qkv.data(), batch_size, q_projection_size,
-                       hidden_size, arena_.stream);
-      LaunchProjection(layer.attn_k, scratch.decode.normed.data(),
-                       scratch.attention.k.data(), batch_size, kv_size,
-                       hidden_size, arena_.stream);
-      LaunchProjection(layer.attn_v, scratch.decode.normed.data(),
-                       scratch.attention.v.data(), batch_size, kv_size,
-                       hidden_size, arena_.stream);
+      LaunchAttentionQkvProjections(
+          layer, scratch.decode.normed.data(), scratch.ssm.qkv.data(),
+          scratch.attention.k.data(), scratch.attention.v.data(), batch_size,
+          q_projection_size, kv_size, hidden_size, arena_.stream);
       LaunchBatchedUnpackQG(scratch.ssm.qkv.data(), scratch.attention.q.data(),
                             scratch.ssm.gate.data(), batch_size,
                             config.num_attention_heads, config.head_dim,
@@ -861,15 +912,9 @@ QwenGpuExecutor::ForwardVerificationBatch(
                        scratch.attention.output.data(), batch_size, hidden_size,
                        attention_size, arena_.stream);
     } else {
-      LaunchProjection(layer.attn_qkv, scratch.decode.normed.data(),
-                       scratch.ssm.qkv.data(), batch_size, ssm_qkv_size,
-                       hidden_size, arena_.stream);
-      LaunchProjection(layer.attn_gate, scratch.decode.normed.data(),
-                       scratch.ssm.gate.data(), batch_size, ssm_inner_size,
-                       hidden_size, arena_.stream);
-      const auto controls =
-          LaunchSsmControls(layer, scratch, batch_size, time_step_rank,
-                            hidden_size, arena_.stream);
+      const auto controls = LaunchSsmInputProjections(
+          layer, scratch, batch_size, ssm_qkv_size, ssm_inner_size,
+          time_step_rank, hidden_size, arena_.stream);
       LaunchSSMConvRecurrenceBatch(
           scratch.ssm.qkv.data(),
           static_cast<const float*>(layer.ssm_conv1d.data),

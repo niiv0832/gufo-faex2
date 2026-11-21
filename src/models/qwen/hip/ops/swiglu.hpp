@@ -40,6 +40,15 @@ bool TryLaunchPackedQuantSwiGLUFp32(core::GgmlType type, const void* gate_up,
                                     std::size_t hidden_size,
                                     hipStream_t stream = nullptr);
 
+/// Exact fused Q8_0 gate + up projection and SwiGLU for small verification
+/// batches (2 <= batch_size <= 8), sharing activation staging and eliminating
+/// intermediate gate/up buffers. Returns false without launching if
+/// unsupported.
+[[nodiscard]] bool TryLaunchBatchedQ8_0FusedSwiGLU(
+    const void* gate_w, const void* up_w, const float* input, float* output,
+    std::size_t batch_size, std::size_t intermediate_size,
+    std::size_t hidden_size, hipStream_t stream = nullptr);
+
 }  // namespace gufo::hip
 
 #endif  // defined(ENGINE_ENABLE_HIP)

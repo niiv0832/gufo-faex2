@@ -11,6 +11,7 @@
 #include "src/core/gguf_reader.hpp"
 #include "src/core/hip/detail/dispatch_telemetry.hpp"
 #include "src/core/hip/detail/gemv_dispatcher.hpp"
+#include "src/models/qwen/hip/kernels/small_batch_gemm.hpp"
 #include "src/models/qwen/hip/ops/swiglu.hpp"
 #include "src/models/qwen/hip/quant_ops.hpp"
 
@@ -482,11 +483,316 @@ __launch_bounds__(WavesPerBlock * 32, 4) __global__
   }
 }
 
+// Specialized single-token Q8_0 + Q8_0 fused SwiGLU GEMV: removes the generic
+// QuantWarpBlockDot switch (cutting VGPR pressure from 95 to ~50) while
+// preserving the exact left-to-right FP32 FMA and butterfly reduction order.
+template<std::uint32_t WavesPerBlock>
+__launch_bounds__(WavesPerBlock * 32, 4) __global__
+    void Wave32FusedQ8_0SwiGLUGEMVKernel_2Rows(
+        const Q8_0Block* __restrict__ gate_w,
+        const Q8_0Block* __restrict__ up_w, const float* __restrict__ x,
+        float* __restrict__ out, std::size_t M, std::size_t K) {
+  const std::uint32_t lane_id = threadIdx.x & 31u;
+  const std::uint32_t warp_id = threadIdx.x >> 5u;
+  const std::size_t pair_idx =
+      (static_cast<std::size_t>(blockIdx.x) * WavesPerBlock) + warp_id;
+  const std::size_t m0 = pair_idx * 2;
+  const std::size_t m1 = m0 + 1;
+  if (m0 >= M) {
+    return;
+  }
+
+  const std::uint32_t num_blocks = static_cast<std::uint32_t>(K / kQ8_0BlockSize);
+  const Q8_0Block* g0_blocks = gate_w + (m0 * num_blocks);
+  const Q8_0Block* u0_blocks = up_w + (m0 * num_blocks);
+  const Q8_0Block* g1_blocks = (m1 < M) ? gate_w + (m1 * num_blocks) : nullptr;
+  const Q8_0Block* u1_blocks = (m1 < M) ? up_w + (m1 * num_blocks) : nullptr;
+
+  float sum_g0 = 0.0F;
+  float sum_u0 = 0.0F;
+  float sum_g1 = 0.0F;
+  float sum_u1 = 0.0F;
+
+  for (std::uint32_t b = lane_id; b < num_blocks; b += 32u) {
+    const float* xb = x + (b * kQ8_0BlockSize);
+    const Q8_0Block& gb0 = g0_blocks[b];
+    const Q8_0Block& ub0 = u0_blocks[b];
+    sum_g0 += __half2float(gb0.d) * Q8_0BlockDotFp32(gb0, xb);
+    sum_u0 += __half2float(ub0.d) * Q8_0BlockDotFp32(ub0, xb);
+    if (g1_blocks != nullptr) {
+      const Q8_0Block& gb1 = g1_blocks[b];
+      const Q8_0Block& ub1 = u1_blocks[b];
+      sum_g1 += __half2float(gb1.d) * Q8_0BlockDotFp32(gb1, xb);
+      sum_u1 += __half2float(ub1.d) * Q8_0BlockDotFp32(ub1, xb);
+    }
+  }
+
+  sum_g0 = ReduceWaveXor<16>(sum_g0);
+  sum_u0 = ReduceWaveXor<16>(sum_u0);
+  sum_g1 = ReduceWaveXor<16>(sum_g1);
+  sum_u1 = ReduceWaveXor<16>(sum_u1);
+
+  if (lane_id == 0) {
+    const float sig_g0 = 1.0F / (1.0F + expf(-sum_g0));
+    out[m0] = (sum_g0 * sig_g0) * sum_u0;
+    if (m1 < M) {
+      const float sig_g1 = 1.0F / (1.0F + expf(-sum_g1));
+      out[m1] = (sum_g1 * sig_g1) * sum_u1;
+    }
+  }
+}
+
+template<std::uint32_t WavesPerBlock>
+__launch_bounds__(WavesPerBlock * 32, 4) __global__
+    void Wave32FusedQ8_0SwiGLUGEMVKernel_1Row(
+        const Q8_0Block* __restrict__ gate_w,
+        const Q8_0Block* __restrict__ up_w, const float* __restrict__ x,
+        float* __restrict__ out, std::size_t M, std::size_t K) {
+  const std::uint32_t lane_id = threadIdx.x & 31u;
+  const std::uint32_t warp_id = threadIdx.x >> 5u;
+  const std::size_t m =
+      (static_cast<std::size_t>(blockIdx.x) * WavesPerBlock) + warp_id;
+  if (m >= M) {
+    return;
+  }
+
+  const std::uint32_t num_blocks = static_cast<std::uint32_t>(K / kQ8_0BlockSize);
+  const Q8_0Block* g_blocks = gate_w + (m * num_blocks);
+  const Q8_0Block* u_blocks = up_w + (m * num_blocks);
+
+  float sum_g = 0.0F;
+  float sum_u = 0.0F;
+  for (std::uint32_t b = lane_id; b < num_blocks; b += 32u) {
+    const float* xb = x + (b * kQ8_0BlockSize);
+    const Q8_0Block& gb = g_blocks[b];
+    const Q8_0Block& ub = u_blocks[b];
+    sum_g += __half2float(gb.d) * Q8_0BlockDotFp32(gb, xb);
+    sum_u += __half2float(ub.d) * Q8_0BlockDotFp32(ub, xb);
+  }
+
+  sum_g = ReduceWaveXor<16>(sum_g);
+  sum_u = ReduceWaveXor<16>(sum_u);
+
+  if (lane_id == 0) {
+    const float sig_g = 1.0F / (1.0F + expf(-sum_g));
+    out[m] = (sum_g * sig_g) * sum_u;
+  }
+}
+
+// Exact fused Q8_0 gate + up projection and SwiGLU activation for small
+// verification batches. Each output keeps the scalar Q8_0 block dot, descending
+// butterfly reduction, and BatchedSwiGLUActivationKernel formula bit for bit.
+template<std::uint32_t WavesPerBlock, std::size_t Batch,
+         std::size_t RowsPerWave, bool XorStage,
+         std::size_t TokensPerStep = Batch>
+__launch_bounds__(WavesPerBlock * 32, 1) __global__
+    void SmallBatchQ8_0FusedSwiGLUKernel(const Q8_0Block* __restrict__ gate_w,
+                                         const Q8_0Block* __restrict__ up_w,
+                                         const float* __restrict__ x,
+                                         float* __restrict__ y, std::uint32_t m,
+                                         std::uint32_t k) {
+  static_assert(TokensPerStep > 0 && Batch % TokensPerStep == 0);
+  constexpr std::uint32_t kBlocksPerTile = 32;
+  constexpr std::uint32_t kVectorsPerBlock = kQ8_0BlockSize / 4;
+  constexpr std::uint32_t kStride = kQ8_0BlockSize + (XorStage ? 0 : 4);
+  constexpr std::uint32_t kTileStride = kBlocksPerTile * kStride;
+  __shared__ float staged_x[Batch * kTileStride];
+
+  const std::uint32_t lane = threadIdx.x & 31u;
+  const std::uint32_t warp_id = threadIdx.x >> 5u;
+  const std::uint32_t row_base =
+      ((blockIdx.x * WavesPerBlock) + warp_id) * RowsPerWave;
+  const std::uint32_t num_blocks = k / kQ8_0BlockSize;
+  float sums_g[RowsPerWave][Batch] = {};
+  float sums_u[RowsPerWave][Batch] = {};
+
+  for (std::uint32_t tile_base = 0; tile_base < num_blocks;
+       tile_base += kBlocksPerTile) {
+    constexpr std::uint32_t kTileVectors =
+        Batch * kBlocksPerTile * kVectorsPerBlock;
+    for (std::uint32_t flat = threadIdx.x; flat < kTileVectors;
+         flat += blockDim.x) {
+      const std::uint32_t token = flat / (kBlocksPerTile * kVectorsPerBlock);
+      const std::uint32_t within = flat % (kBlocksPerTile * kVectorsPerBlock);
+      const std::uint32_t block = within / kVectorsPerBlock;
+      const std::uint32_t vector = within % kVectorsPerBlock;
+      const std::uint32_t source_block = tile_base + block;
+      float4 value = {0.0F, 0.0F, 0.0F, 0.0F};
+      if (source_block < num_blocks) {
+        value = *reinterpret_cast<const float4*>(
+            x + (token * k) + (source_block * kQ8_0BlockSize) + (vector * 4u));
+      }
+      *reinterpret_cast<float4*>(
+          staged_x + (token * kTileStride) +
+          (XorStage ? (vector * 128u) + ((block ^ vector) * 4u)
+                    : (block * kStride) + (vector * 4u))) = value;
+    }
+    SyncKQuantTile();
+
+    const std::uint32_t block = tile_base + lane;
+    if (block < num_blocks) {
+      const Q8_0Block* g_rows[RowsPerWave];
+      const Q8_0Block* u_rows[RowsPerWave];
+      float dg[RowsPerWave];
+      float du[RowsPerWave];
+#pragma unroll
+      for (std::uint32_t r = 0; r < RowsPerWave; ++r) {
+        const std::uint32_t row = row_base + r;
+        const std::uint32_t safe_row = row < m ? row : m - 1u;
+        g_rows[r] = &gate_w[(safe_row * num_blocks) + block];
+        u_rows[r] = &up_w[(safe_row * num_blocks) + block];
+        dg[r] = __half2float(g_rows[r]->d);
+        du[r] = __half2float(u_rows[r]->d);
+      }
+      constexpr bool kPreloadWeights = TokensPerStep < Batch;
+      constexpr std::uint32_t kPackedGroups =
+          kPreloadWeights ? kVectorsPerBlock : 1;
+      std::uint32_t packed_g[RowsPerWave][kPackedGroups];
+      std::uint32_t packed_u[RowsPerWave][kPackedGroups];
+      if constexpr (kPreloadWeights) {
+#pragma unroll
+        for (std::uint32_t r = 0; r < RowsPerWave; ++r) {
+#pragma unroll
+          for (std::uint32_t group = 0; group < kVectorsPerBlock; ++group) {
+            __builtin_memcpy(&packed_g[r][group], g_rows[r]->qs + (group * 4),
+                             sizeof(std::uint32_t));
+            __builtin_memcpy(&packed_u[r][group], u_rows[r]->qs + (group * 4),
+                             sizeof(std::uint32_t));
+          }
+        }
+      }
+#pragma unroll
+      for (std::uint32_t token_base = 0; token_base < Batch;
+           token_base += TokensPerStep) {
+        if constexpr (kPreloadWeights) {
+          __builtin_amdgcn_sched_barrier(0);
+        }
+        float dots_g[RowsPerWave][TokensPerStep] = {};
+        float dots_u[RowsPerWave][TokensPerStep] = {};
+#pragma unroll
+        for (std::uint32_t group = 0; group < kVectorsPerBlock; ++group) {
+          if constexpr (!kPreloadWeights) {
+#pragma unroll
+            for (std::uint32_t r = 0; r < RowsPerWave; ++r) {
+              __builtin_memcpy(&packed_g[r][0], g_rows[r]->qs + (group * 4),
+                               sizeof(std::uint32_t));
+              __builtin_memcpy(&packed_u[r][0], u_rows[r]->qs + (group * 4),
+                               sizeof(std::uint32_t));
+            }
+          }
+#pragma unroll
+          for (std::uint32_t lt = 0; lt < TokensPerStep; ++lt) {
+            const std::uint32_t token = token_base + lt;
+            const float4 xv = *reinterpret_cast<const float4*>(
+                staged_x + (token * kTileStride) +
+                (XorStage ? (group * 128u) + ((lane ^ group) * 4u)
+                          : (lane * kStride) + (group * 4u)));
+#pragma unroll
+            for (std::uint32_t r = 0; r < RowsPerWave; ++r) {
+              const std::uint32_t pg = packed_g[r][kPreloadWeights ? group : 0];
+              const std::uint32_t pu = packed_u[r][kPreloadWeights ? group : 0];
+              dots_g[r][lt] +=
+                  static_cast<float>(static_cast<std::int8_t>(pg & 0xFFU)) *
+                  xv.x;
+              dots_u[r][lt] +=
+                  static_cast<float>(static_cast<std::int8_t>(pu & 0xFFU)) *
+                  xv.x;
+              dots_g[r][lt] +=
+                  static_cast<float>(
+                      static_cast<std::int8_t>((pg >> 8U) & 0xFFU)) *
+                  xv.y;
+              dots_u[r][lt] +=
+                  static_cast<float>(
+                      static_cast<std::int8_t>((pu >> 8U) & 0xFFU)) *
+                  xv.y;
+              dots_g[r][lt] +=
+                  static_cast<float>(
+                      static_cast<std::int8_t>((pg >> 16U) & 0xFFU)) *
+                  xv.z;
+              dots_u[r][lt] +=
+                  static_cast<float>(
+                      static_cast<std::int8_t>((pu >> 16U) & 0xFFU)) *
+                  xv.z;
+              dots_g[r][lt] +=
+                  static_cast<float>(
+                      static_cast<std::int8_t>((pg >> 24U) & 0xFFU)) *
+                  xv.w;
+              dots_u[r][lt] +=
+                  static_cast<float>(
+                      static_cast<std::int8_t>((pu >> 24U) & 0xFFU)) *
+                  xv.w;
+            }
+          }
+        }
+#pragma unroll
+        for (std::uint32_t r = 0; r < RowsPerWave; ++r) {
+#pragma unroll
+          for (std::uint32_t lt = 0; lt < TokensPerStep; ++lt) {
+            sums_g[r][token_base + lt] += dg[r] * dots_g[r][lt];
+            sums_u[r][token_base + lt] += du[r] * dots_u[r][lt];
+          }
+        }
+      }
+    }
+    SyncKQuantTile();
+  }
+
+#pragma unroll
+  for (std::uint32_t r = 0; r < RowsPerWave; ++r) {
+#pragma unroll
+    for (std::uint32_t token = 0; token < Batch; ++token) {
+      sums_g[r][token] = ReduceKQuantWave<16>(sums_g[r][token]);
+      sums_u[r][token] = ReduceKQuantWave<16>(sums_u[r][token]);
+    }
+  }
+
+  if (lane == 0) {
+#pragma unroll
+    for (std::uint32_t r = 0; r < RowsPerWave; ++r) {
+      const std::uint32_t row = row_base + r;
+      if (row >= m) {
+        continue;
+      }
+#pragma unroll
+      for (std::uint32_t token = 0; token < Batch; ++token) {
+        const float g = sums_g[r][token];
+        const float u = sums_u[r][token];
+        const float sig_g = 1.0F / (1.0F + expf(-g));
+        y[(token * m) + row] = (g * sig_g) * u;
+      }
+    }
+  }
+}
+
 void LaunchFusedSwiGLUGEMV(const void* gate_w, core::GgmlType gate_type,
                            const void* up_w, core::GgmlType up_type,
                            const float* x, float* out,
                            std::size_t intermediate_size,
                            std::size_t hidden_size, hipStream_t stream) {
+  if (gate_type == core::GgmlType::kQ8_0 && up_type == core::GgmlType::kQ8_0 &&
+      (hidden_size % kQ8_0BlockSize == 0) &&
+      (hidden_size / kQ8_0BlockSize) <=
+          std::numeric_limits<std::uint32_t>::max()) {
+    constexpr std::uint32_t kWavesPerBlock = 4;
+    constexpr std::uint32_t kBlockThreads = kWavesPerBlock * 32;
+    const auto* gw = static_cast<const Q8_0Block*>(gate_w);
+    const auto* uw = static_cast<const Q8_0Block*>(up_w);
+    if (intermediate_size >= 2 && (intermediate_size % 2 == 0)) {
+      const std::size_t num_pairs = intermediate_size / 2;
+      const std::size_t grid =
+          (num_pairs + kWavesPerBlock - 1U) / kWavesPerBlock;
+      Wave32FusedQ8_0SwiGLUGEMVKernel_2Rows<kWavesPerBlock>
+          <<<grid, kBlockThreads, 0, stream>>>(gw, uw, x, out,
+                                               intermediate_size, hidden_size);
+      return;
+    }
+    const std::size_t grid =
+        (intermediate_size + kWavesPerBlock - 1U) / kWavesPerBlock;
+    Wave32FusedQ8_0SwiGLUGEMVKernel_1Row<kWavesPerBlock>
+        <<<grid, kBlockThreads, 0, stream>>>(gw, uw, x, out, intermediate_size,
+                                             hidden_size);
+    return;
+  }
   if (gate_type == core::GgmlType::kBF16 && up_type == core::GgmlType::kBF16 &&
       (hidden_size % 8 == 0)) {
     constexpr std::uint32_t kWavesPerBlock = 4;
@@ -587,6 +893,61 @@ void LaunchFusedSwiGLUGEMV(const void* gate_w, core::GgmlType gate_type,
 
   FastFusedSwiGLUGEMVBlockKernel<<<intermediate_size, 512, 0, stream>>>(
       gate_w, gate_type, up_w, up_type, x, out, intermediate_size, hidden_size);
+}
+
+bool TryLaunchBatchedQ8_0FusedSwiGLU(const void* gate_w, const void* up_w,
+                                     const float* input, float* output,
+                                     std::size_t batch_size,
+                                     std::size_t intermediate_size,
+                                     std::size_t hidden_size,
+                                     hipStream_t stream) {
+  if (batch_size < 2 || batch_size > 8 || intermediate_size == 0 ||
+      hidden_size == 0 || (hidden_size % kQ8_0BlockSize) != 0) {
+    return false;
+  }
+  const std::size_t row_bytes =
+      (hidden_size / kQ8_0BlockSize) * sizeof(Q8_0Block);
+  if (!FitsSmallBatch32BitIndices(batch_size, intermediate_size, hidden_size,
+                                  row_bytes)) {
+    return false;
+  }
+  const auto* gw = static_cast<const Q8_0Block*>(gate_w);
+  const auto* uw = static_cast<const Q8_0Block*>(up_w);
+  const auto m = static_cast<std::uint32_t>(intermediate_size);
+  const auto k = static_cast<std::uint32_t>(hidden_size);
+  const auto launch = [&]<std::size_t Batch, bool XorStage,
+                          std::size_t Step = Batch>() {
+    constexpr std::uint32_t kWaves = 8;
+    constexpr std::size_t kRows = 1;
+    constexpr std::size_t kRowsPerBlock = kWaves * kRows;
+    SmallBatchQ8_0FusedSwiGLUKernel<kWaves, Batch, kRows, XorStage, Step>
+        <<<static_cast<unsigned int>((intermediate_size + kRowsPerBlock - 1) /
+                                     kRowsPerBlock),
+           kWaves * 32, 0, stream>>>(gw, uw, input, output, m, k);
+  };
+  switch (batch_size) {
+    case 2:
+      launch.template operator()<2, true, 2>();
+      return true;
+    case 3:
+      launch.template operator()<3, false, 3>();
+      return true;
+    case 4:
+      launch.template operator()<4, true, 2>();
+      return true;
+    case 5:
+      launch.template operator()<5, true, 5>();
+      return true;
+    case 6:
+      launch.template operator()<6, true, 2>();
+      return true;
+    case 7:
+      launch.template operator()<7, true, 7>();
+      return true;
+    default:
+      launch.template operator()<8, true, 2>();
+      return true;
+  }
 }
 
 }  // namespace gufo::hip

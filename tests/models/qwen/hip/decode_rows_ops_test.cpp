@@ -246,6 +246,26 @@ int main(int argc, char** argv) {
                      2 * attention);
         check.Report(name + ",attn_k", &layer.attn_k, k, batched_k, kRows, kv);
         check.Report(name + ",attn_v", &layer.attn_v, v, batched_v, kRows, kv);
+        if (layer.attn_q.type == gufo::core::GgmlType::kQ8_0 &&
+            layer.attn_k.type == gufo::core::GgmlType::kQ8_0 &&
+            layer.attn_v.type == gufo::core::GgmlType::kQ8_0) {
+          for (const std::size_t b :
+               {std::size_t{2}, std::size_t{3}, std::size_t{4}, kRows}) {
+            if (!gufo::hip::TryLaunchBatchedQ8_0FusedQKV(
+                    layer.attn_q.data, layer.attn_k.data, layer.attn_v.data,
+                    x.data(), batched_q.data(), batched_k.data(),
+                    batched_v.data(), b, 2 * attention, kv, hidden,
+                    arena.stream)) {
+              throw std::runtime_error(name + ": fused batched QKV refused");
+            }
+            check.Report(name + ",fused_attn_q", &layer.attn_q, q, batched_q, b,
+                         2 * attention);
+            check.Report(name + ",fused_attn_k", &layer.attn_k, k, batched_k, b,
+                         kv);
+            check.Report(name + ",fused_attn_v", &layer.attn_v, v, batched_v, b,
+                         kv);
+          }
+        }
         check.Projection(name + ",attn_output", layer.attn_output, hidden,
                          attention, seed);
       } else {
@@ -285,7 +305,54 @@ int main(int argc, char** argv) {
                      kRows, rank);
         check.Report(name + ",ssm_beta", &layer.ssm_beta, s_beta, b_beta, kRows,
                      rank);
+        if (layer.attn_qkv.type == gufo::core::GgmlType::kQ8_0 &&
+            layer.attn_gate.type == gufo::core::GgmlType::kQ8_0 &&
+            layer.ssm_alpha.type == gufo::core::GgmlType::kF32 &&
+            layer.ssm_beta.type == gufo::core::GgmlType::kF32) {
+          for (const std::size_t b :
+               {std::size_t{2}, std::size_t{3}, std::size_t{4}, kRows}) {
+            if (!gufo::hip::TryLaunchBatchedQ8_0FusedSSMInput(
+                    layer.attn_qkv.data, layer.attn_gate.data,
+                    layer.ssm_alpha.data, layer.ssm_beta.data, x.data(),
+                    b_qkv.data(), b_gate.data(), b_alpha.data(), b_beta.data(),
+                    b, hidden, qkv, inner, rank, arena.stream)) {
+              throw std::runtime_error(name + ": fused batched SSM refused");
+            }
+            check.Report(name + ",fused_attn_qkv", &layer.attn_qkv, s_qkv,
+                         b_qkv, b, qkv);
+            check.Report(name + ",fused_attn_gate", &layer.attn_gate, s_gate,
+                         b_gate, b, inner);
+            check.Report(name + ",fused_ssm_alpha", &layer.ssm_alpha, s_alpha,
+                         b_alpha, b, rank);
+            check.Report(name + ",fused_ssm_beta", &layer.ssm_beta, s_beta,
+                         b_beta, b, rank);
+          }
+        }
         check.Projection(name + ",ssm_out", layer.ssm_out, hidden, inner, seed);
+      }
+      if (config.IsMoe() &&
+          layer.ffn_gate_shexp.type == gufo::core::GgmlType::kQ8_0 &&
+          layer.ffn_up_shexp.type == gufo::core::GgmlType::kQ8_0) {
+        const std::size_t shared_ff = config.shared_expert_ff;
+        const DeviceBuffer s_act(kRows * shared_ff);
+        const DeviceBuffer b_act(kRows * shared_ff);
+        for (std::size_t row = 0; row < kRows; ++row) {
+          gufo::hip::LaunchFusedSwiGLUGEMV(
+              layer.ffn_gate_shexp.data, layer.ffn_gate_shexp.type,
+              layer.ffn_up_shexp.data, layer.ffn_up_shexp.type,
+              x.data() + (row * hidden), s_act.data() + (row * shared_ff),
+              shared_ff, hidden, arena.stream);
+        }
+        for (const std::size_t b :
+             {std::size_t{2}, std::size_t{3}, std::size_t{4}, kRows}) {
+          if (!gufo::hip::TryLaunchBatchedQ8_0FusedSwiGLU(
+                  layer.ffn_gate_shexp.data, layer.ffn_up_shexp.data, x.data(),
+                  b_act.data(), b, shared_ff, hidden, arena.stream)) {
+            throw std::runtime_error(name + ": fused batched SwiGLU refused");
+          }
+          check.Report(name + ",fused_shared_swiglu", &layer.ffn_gate_shexp,
+                       s_act, b_act, b, shared_ff);
+        }
       }
     }
     check.Projection("output_head", weights.output, config.vocab_size, hidden,

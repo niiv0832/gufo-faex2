@@ -73,6 +73,24 @@ void LaunchFusedSSMInputProjections(
     std::size_t hidden_size, std::size_t qkv_size, std::size_t inner_size,
     std::size_t time_step_rank, hipStream_t stream = nullptr);
 
+/// Exact fused Q8_0 (qkv, gate) + F32 (alpha, beta) SSM input projections for
+/// small verification batches (2 <= batch_size <= 8) in a single launch.
+/// Returns false without launching when shapes or types are unsupported.
+[[nodiscard]] bool TryLaunchBatchedQ8_0FusedSSMInput(
+    const void* qkv_w, const void* gate_w, const void* alpha_w,
+    const void* beta_w, const float* x, float* qkv_out, float* gate_out,
+    float* alpha_out, float* beta_out, std::size_t batch_size,
+    std::size_t hidden_size, std::size_t qkv_size, std::size_t inner_size,
+    std::size_t time_step_rank, hipStream_t stream = nullptr);
+
+/// Exact batched F32 SSM alpha/beta control projections in a single launch,
+/// preserving the per-row F32 reduction tree of LaunchFusedSSMInputProjections.
+/// Returns false without launching when unsupported.
+[[nodiscard]] bool TryLaunchBatchedF32SsmControls(
+    const void* alpha_w, const void* beta_w, const float* x, float* alpha_out,
+    float* beta_out, std::size_t batch_size, std::size_t time_step_rank,
+    std::size_t hidden_size, hipStream_t stream = nullptr);
+
 /// Runs `rows` consecutive verification rows through the conv and DeltaNet
 /// recurrence in a single pair of launches. Each row's arithmetic and its order
 /// are identical to the one-row-per-launch form, so the result is bit-exact;
