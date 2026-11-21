@@ -76,6 +76,7 @@ if (ENGINE_ENABLE_HIP)
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/decode.cpp
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/decode_step.cpp
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/executor.cpp
+    ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/moe_skew.cpp
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/model_loader.cpp
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/moe_ffn.cpp
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/moe_prefill_ffn.cpp

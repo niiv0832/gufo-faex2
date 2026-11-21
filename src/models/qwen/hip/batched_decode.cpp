@@ -12,6 +12,7 @@
 #include "src/models/qwen/hip/detail/decode_step.hpp"
 #include "src/models/qwen/hip/executor.hpp"
 #include "src/models/qwen/hip/moe_ffn.hpp"
+#include "src/models/qwen/hip/moe_skew.hpp"
 #include "src/models/qwen/hip/ops.hpp"
 #include "src/models/qwen/hip/ops/moe.hpp"
 #include "src/models/qwen/hip/ops/moe_vec.hpp"
@@ -102,7 +103,8 @@ void LaunchFfnActivation(const models::QwenLayerWeights& layer,
 // expert through the exact shared projections, and one combine pass.
 void LaunchMoeFfnRows(const models::QwenLayerWeights& layer,
                       const core::ModelConfig& config, QwenGpuArena& arena,
-                      const float* x, float* out, std::size_t rows) {
+                      const float* x, float* out, std::size_t rows,
+                      std::uint32_t layer_index) {
   constexpr std::size_t kChunkRows = 8;
   const auto& s = arena.moe;
   const int experts = static_cast<int>(config.num_experts);
@@ -121,6 +123,9 @@ void LaunchMoeFfnRows(const models::QwenLayerWeights& layer,
                       s.shared_weight, static_cast<std::uint32_t>(experts),
                       static_cast<std::uint32_t>(used),
                       static_cast<std::uint32_t>(rows), stream);
+  if (s.skew != nullptr) {
+    LaunchMoeSkewRecord(*s.skew, layer_index, rows, s.ids, s.weights, stream);
+  }
   for (std::size_t first = 0; first < rows; first += kChunkRows) {
     const int n = static_cast<int>(std::min(kChunkRows, rows - first));
     const float* chunk_x = x + (first * hidden);
@@ -224,12 +229,13 @@ void LaunchDecodeRowsProjection(const models::QwenTensorRef& weight,
 
 void MoeFfnRows(const models::QwenLayerWeights& layer,
                 const core::ModelConfig& config, QwenGpuArena& arena,
-                const float* x, float* out, std::size_t rows) {
+                const float* x, float* out, std::size_t rows,
+                std::uint32_t layer_index) {
   const std::size_t hidden = config.hidden_size;
   for (std::size_t first = 0; first < rows; first += kMoeFfnScratchRows) {
     const std::size_t count = std::min(kMoeFfnScratchRows, rows - first);
     LaunchMoeFfnRows(layer, config, arena, x + (first * hidden),
-                     out + (first * hidden), count);
+                     out + (first * hidden), count, layer_index);
   }
 }
 
@@ -469,7 +475,7 @@ std::vector<tokenization::TokenId> QwenGpuExecutor::ForwardTokenBatch(
       // Combine the experts, add the residual and normalize for the next
       // layer, or for the head, in one launch.
       LaunchMoeFfnRows(layer, config, arena, scratch.decode.normed.data(),
-                       nullptr, batch_size);
+                       nullptr, batch_size, layer_index);
       MoeFfnFinishRows(config, arena.moe, scratch.decode.hidden.data(),
                        static_cast<const float*>(
                            layer_index + 1 < config.num_layers
@@ -478,7 +484,7 @@ std::vector<tokenization::TokenId> QwenGpuExecutor::ForwardTokenBatch(
                        scratch.decode.normed.data(), batch_size, arena.stream);
     } else if (config.IsMoe()) {
       LaunchMoeFfnRows(layer, config, arena, scratch.decode.normed.data(),
-                       scratch.ffn.out.data(), batch_size);
+                       scratch.ffn.out.data(), batch_size, layer_index);
     } else {
       LaunchFfnActivation(layer, scratch, batch_size, intermediate_size,
                           hidden_size, arena.stream);
@@ -901,7 +907,7 @@ QwenGpuExecutor::ForwardVerificationBatch(
       // Combine the experts, add the residual and normalize for the next
       // layer, or for the head, in one launch.
       LaunchMoeFfnRows(layer, config, arena_, scratch.decode.normed.data(),
-                       nullptr, batch_size);
+                       nullptr, batch_size, layer_index);
       MoeFfnFinishRows(config, arena_.moe, scratch.decode.hidden.data(),
                        static_cast<const float*>(
                            layer_index + 1 < config.num_layers
@@ -910,7 +916,7 @@ QwenGpuExecutor::ForwardVerificationBatch(
                        scratch.decode.normed.data(), batch_size, arena_.stream);
     } else if (config.IsMoe()) {
       LaunchMoeFfnRows(layer, config, arena_, scratch.decode.normed.data(),
-                       scratch.ffn.out.data(), batch_size);
+                       scratch.ffn.out.data(), batch_size, layer_index);
     } else {
       LaunchFfnActivation(layer, scratch, batch_size, intermediate_size,
                           hidden_size, arena_.stream);

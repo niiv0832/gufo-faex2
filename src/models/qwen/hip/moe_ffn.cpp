@@ -6,6 +6,7 @@
 #include <stdexcept>
 
 #include "src/core/hip/hip_utils.hpp"
+#include "src/models/qwen/hip/moe_skew.hpp"
 #include "src/models/qwen/hip/ops/gemm.hpp"
 #include "src/models/qwen/hip/ops/moe.hpp"
 #include "src/models/qwen/hip/ops/moe_vec.hpp"
@@ -16,7 +17,8 @@ namespace gufo::hip {
 void MoeFfnDecodeToken(const models::QwenLayerWeights& layer,
                        const core::ModelConfig& config,
                        const QwenMoeScratch& scratch, const float* x,
-                       float* out, hipStream_t stream) {
+                       float* out, hipStream_t stream,
+                       std::uint32_t layer_index) {
   const int experts = static_cast<int>(config.num_experts);
   const int used = static_cast<int>(config.num_experts_used);
   const int ff = static_cast<int>(config.expert_ff);
@@ -31,6 +33,10 @@ void MoeFfnDecodeToken(const models::QwenLayerWeights& layer,
                       scratch.weights, scratch.shared_weight,
                       static_cast<std::uint32_t>(experts),
                       static_cast<std::uint32_t>(used), 1, stream);
+  if (scratch.skew != nullptr) {
+    LaunchMoeSkewRecord(*scratch.skew, layer_index, 1, scratch.ids,
+                        scratch.weights, stream);
+  }
   // activation[s] = SiLU(gate_e x) * (up_e x) for the selected experts e.
   if (qfn_mmq_moe_gated_vec(static_cast<int>(layer.ffn_gate_exps.type),
                             layer.ffn_gate_exps.data, layer.ffn_up_exps.data, x,

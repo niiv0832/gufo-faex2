@@ -261,13 +261,13 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
     const bool fuse_tail = fused_moe_tail && next_norm != nullptr;
     if (fuse_tail) {
       MoeFfnDecodeToken(layer, config, arena.moe, decode_scratch.normed.data(),
-                        nullptr, arena.stream);
+                        nullptr, arena.stream, l);
       MoeFfnFinishRows(config, arena.moe, decode_scratch.hidden.data(),
                        next_norm, decode_scratch.normed.data(), 1,
                        arena.stream);
     } else if (config.IsMoe()) {
       MoeFfnDecodeToken(layer, config, arena.moe, decode_scratch.normed.data(),
-                        ffn_scratch.out.data(), arena.stream);
+                        ffn_scratch.out.data(), arena.stream, l);
     } else {
       // Non-fused FFN, routed through the module. Same fused SwiGLU kernel +
       // same down GEMV as the former inline calls; behavior identical. The

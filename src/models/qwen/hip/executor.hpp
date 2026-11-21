@@ -32,6 +32,7 @@
 #include "src/models/qwen/hip/detail/prefill_task.hpp"
 #include "src/models/qwen/hip/execution_policy.hpp"
 #include "src/models/qwen/hip/moe_prefill.hpp"
+#include "src/models/qwen/hip/moe_skew.hpp"
 #include "src/models/qwen/hip/npu_ffn.hpp"
 #include "src/models/qwen/hip/numerical_overrides.hpp"
 #include "src/models/qwen/hip/ops/attention.hpp"
@@ -317,6 +318,8 @@ struct QwenPrefillBank {
 };
 
 /// Device scratch of the single-token MoE feed-forward (qwen35moe decode).
+struct QwenMoeSkewDevice;
+
 struct QwenMoeScratch {
   float* router_logits{nullptr};
   float* shared_logit{nullptr};
@@ -329,6 +332,9 @@ struct QwenMoeScratch {
   float* shared_up{nullptr};
   float* shared_act{nullptr};
   float* shared_out{nullptr};
+  /// GUFO_QWEN_MOE_SKEW=1 recording buffers; null (and never launched)
+  /// when the diagnostic flag is unset (W0.4).
+  struct QwenMoeSkewDevice* skew{nullptr};
 };
 
 /// Device scratch of the batched qwen35moe prefill feed-forward.
@@ -798,6 +804,10 @@ private:
   bool capture_prompt_hidden_{false};
   bool replaying_ssm_state_{false};
   bool moe_warmed_{false};
+  /// GUFO_QWEN_MOE_SKEW=1 buffers; null (and never allocated) when the
+  /// diagnostic flag is unset (W0.4).
+  std::unique_ptr<QwenMoeSkewHost> moe_skew_;
+  void InitMoeSkew();
 };
 
 }  // namespace gufo::hip

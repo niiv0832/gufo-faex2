@@ -9,6 +9,7 @@
 #include "src/core/hip/detail/dispatch_telemetry.hpp"
 #include "src/core/hip/hip_utils.hpp"
 #include "src/models/qwen/hip/detail/memory_layout.hpp"
+#include "src/models/qwen/hip/moe_skew.hpp"
 
 namespace gufo::hip {
 namespace {
@@ -69,10 +70,32 @@ QwenGpuExecutor::QwenGpuExecutor(std::shared_ptr<const QwenGpuModel> model,
   AllocateGpuSamplingWorkspace(&sampling_workspace_, weights_.config.vocab_size,
                                max_context);
   detail::EmitQwenExecutionPolicy(policy_.Fingerprint());
+  InitMoeSkew();
+}
+
+void QwenGpuExecutor::InitMoeSkew() {
+  if (!MoeSkewEnabled()) {
+    return;
+  }
+  const auto& config = weights_.config;
+  if (config.num_layers > kMoeSkewMaxLayers ||
+      config.num_experts > kMoeSkewMaxExperts ||
+      config.num_experts_used > kMoeSkewMaxUsed) {
+    // Shape outside the fixed telemetry layout: no buffers, no launches.
+    return;
+  }
+  moe_skew_ = std::make_unique<QwenMoeSkewHost>(
+      config.num_layers, config.num_experts, config.num_experts_used,
+      MoeSkewPath(), arena_.stream);
+  arena_.moe.skew = moe_skew_->device();
 }
 
 QwenGpuExecutor::~QwenGpuExecutor() {
   (void)hipStreamSynchronize(arena_.stream);
+  // Flush before the stream and the device buffers go away.
+  if (moe_skew_) {
+    moe_skew_->Flush();
+  }
   for (const auto event : prefill_events_) {
     if (event)
       (void)hipEventDestroy(event);
@@ -162,6 +185,11 @@ void QwenGpuExecutor::Reset() noexcept {
   h_last_hidden_.clear();
   last_verification_rows_ = 0;
   last_hidden_offset_ = 0;
+  // One record per served request: dump what accumulated since the last
+  // reset before the arena clears its state (W0.4).
+  if (moe_skew_) {
+    moe_skew_->OnReset(arena_.stream);
+  }
   try {
     arena_.Reset();
     reset_failure_ = nullptr;

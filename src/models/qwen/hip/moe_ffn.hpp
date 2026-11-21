@@ -22,7 +22,8 @@ inline constexpr std::size_t kMoeFfnScratchRows = 64;
 /// short for the grouped-expert prefill use it.
 void MoeFfnRows(const models::QwenLayerWeights& layer,
                 const core::ModelConfig& config, QwenGpuArena& arena,
-                const float* x, float* out, std::size_t rows);
+                const float* x, float* out, std::size_t rows,
+                std::uint32_t layer_index = 0);
 
 /// The last steps of a MoE layer for `rows` rows whose expert outputs are in
 /// the arena's MoE scratch (MoeFfnDecodeToken or the batched rows with a null
@@ -39,7 +40,8 @@ void MoeFfnFinishRows(const core::ModelConfig& config,
 void MoeFfnDecodeToken(const models::QwenLayerWeights& layer,
                        const core::ModelConfig& config,
                        const QwenMoeScratch& scratch, const float* x,
-                       float* out, hipStream_t stream);
+                       float* out, hipStream_t stream,
+                       std::uint32_t layer_index = 0);
 
 /// Router and shared-gate logits of the grouped-expert prefill when the split
 /// BF16 GEMM is unavailable: router_logits [rows][experts] and shared_logit

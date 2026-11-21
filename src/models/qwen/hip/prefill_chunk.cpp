@@ -739,7 +739,7 @@ detail::PrefillTask QwenGpuExecutor::PrefillChunkTask(
       // with decode's own expert arithmetic, then take the residual step.
       if (!MoePrefillFfn(layer, l, batch_size)) {
         MoeFfnRows(layer, config, arena_, arena_.d_normed, arena_.d_ffn_out,
-                   batch_size);
+                   batch_size, l);
       }
       LaunchBatchedResidualAdd(arena_.d_hidden, arena_.d_ffn_out,
                                arena_.d_hidden, batch_size, hidden_size,
