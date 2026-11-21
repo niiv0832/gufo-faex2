@@ -1,4 +1,7 @@
 #if defined(ENGINE_ENABLE_HIP)
+#include <algorithm>
+#include <array>
+#include <span>
 #include <stdexcept>
 
 #include "src/core/hip/detail/dispatch_telemetry.hpp"
@@ -121,6 +124,14 @@ tokenization::TokenId QwenGpuExecutor::ForwardToken(
 
 void QwenGpuExecutor::WarmIdlePipeline() {
   CheckReset();
+  // Keep warmup traffic out of GUFO_QWEN_MOE_SKEW telemetry (W0.4): otherwise
+  // the trailing Reset() would dump an idle synthetic record per session.
+  const auto* const saved_skew = arena_.moe.skew;
+  arena_.moe.skew = nullptr;
+  const auto restore_and_reset = [&]() noexcept {
+    arena_.moe.skew = saved_skew;
+    Reset();
+  };
   try {
     const auto& config = weights_.config;
     // The expert kernels draw their workspace from a growing pool; growing it
@@ -132,19 +143,36 @@ void QwenGpuExecutor::WarmIdlePipeline() {
                     arena_.stream);
       moe_warmed_ = true;
     }
-    // One idle prefill chunk and one decode step load the lazy kernel modules
-    // and the hipBLASLt plans of the serving shapes on this session's stream.
-    // The reset restores the pristine state, so the bits of real requests are
-    // unchanged; the graph captured below is deliberately discarded with it.
-    const tokenization::TokenId idle = 0;
-    (void)ForwardPromptChunk(std::span(&idle, 1), 0, false);
-    (void)ForwardToken(idle, 1, true);
+    // 16 idle tokens cross MoePrefillFfn's kMinGroupedRows threshold so each
+    // session allocates Qwen35MoePrefill's per-stream scratch and loads the
+    // hipBLASLt router-split and WMMA prefill plans before HTTP opens. Follow
+    // with AR (T=1) and verify (T=2) to warm decode and verification paths
+    // (including d_verification_logits_). Reset() restores the pristine state.
+    const std::size_t max_context = arena_.GetMaxContext();
+    const std::size_t max_batch = arena_.GetMaxBatch();
+    const std::size_t prompt_len =
+        max_context > 3
+            ? std::min<std::size_t>({16, max_batch, max_context - 3})
+            : 1;
+    std::array<tokenization::TokenId, 16> idle_prompt{};
+    (void)ForwardPromptChunk(
+        std::span<const tokenization::TokenId>(idle_prompt.data(), prompt_len),
+        0, false);
+    if (prompt_len < max_context) {
+      (void)ForwardToken(idle_prompt[0], static_cast<std::uint32_t>(prompt_len),
+                         true);
+    }
+    if (prompt_len + 3 <= max_context && max_batch >= 2) {
+      const std::array<tokenization::TokenId, 2> verify_tokens = {0, 0};
+      (void)ForwardDecodeEquivalentVerificationChunk(
+          verify_tokens, static_cast<std::uint32_t>(prompt_len + 1), false);
+    }
     HIP_CHECK(hipStreamSynchronize(arena_.stream));
   } catch (...) {
-    Reset();
+    restore_and_reset();
     throw;
   }
-  Reset();
+  restore_and_reset();
 }
 
 }  // namespace gufo::hip

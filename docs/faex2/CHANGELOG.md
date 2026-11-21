@@ -4,9 +4,24 @@
 
 ## 2026-11-21
 
+### Аудит и исправления W0.2, W0.4 и W1.2 перед сборкой на стенде (CPU-этап, прод не трогался)
+
+- **Критические исправления `W0.4` (MoE-skew):**
+  - **Deadlock GPU в `MoeSkewRecordKernel` (`src/models/qwen/hip/kernels/moe.hip`):** ранее `block_total(shared)` с `__syncthreads()` вызывался внутри `if (tid == 0)` на ветке `rows > 1`, что вызвало бы зависание GPU на первом же verify/batch-вызове; переписано на безусловную 128-поточную tree-редукцию `block_sum()` без warp-size предположений и `__shfl_xor(int64_t)`.
+  - **Ошибки компиляции Linux LP64 / C++:** переведены 64-битные счётчики `QwenMoeSkewDevice` на `unsigned long long*` (единственная 64-битная перегрузка HIP `atomicAdd` на LP64 Linux), добавлены `#if defined(ENGINE_ENABLE_HIP)` и `#include <cstddef>/<vector>` в `moe_skew.hpp`, исправлен `const`-конфликт `arena_.moe.skew` (`const QwenMoeSkewDevice*`), добавлена проверка `config.IsMoe()` в `InitMoeSkew()`.
+  - **Схема JSON, многопоточность и потери на остановке (`src/models/qwen/hip/moe_skew.cpp`):** исправлена ошибка `bucket_join`, из-за которой `rows`/`dup`/`hist`/`slot_weights` писались плоскими массивами вместо вложенных `[layers][buckets]` (падало в `moe_skew.py`); добавлен процессный `std::mutex` и немедленный `Flush()` в `OnReset()` (плюс вызовы `OnReset()` в `RestoreSnapshot`/`RestoreCompactSnapshot`), чтобы 4 сессии не перемешивали ~150 КБ JSONL-строки и не теряли рекорды при остановке сервера.
+  - **Точность метрик `W2.2`/`W3.5`/`W5.3`:** исправлено завышение знаменателя `overlap_rows` на первом токене запроса (когда `prev_ids == -1`), добавлены `tokens`, `unique_experts` (`dedup_saving = 1 - unique / (tokens * used)` для `W2.2`) и `tail_lt1pct` (доля токенов с весом 7-го и 8-го эксперта `< 1 %` для `W5.3`); исправлен Usage в `tools/prof/moe_skew.py` и усреднение Gini только по активным слоям; расширен `tests/tools/moe_skew_test.py`.
+- **Доработка и защита `W0.2` (прогрев до HTTP-приёма):**
+  - В `QwenGpuExecutor::WarmIdlePipeline()` (`src/models/qwen/hip/decode.cpp`) добавлен RAII-сброс `arena_.moe.skew = nullptr` на время прогрева (иначе прогрев писал 4 фиктивных рекорда в `moe_skew.jsonl`), прогрев расширен с 1 токена до **16 токенов** (переходит порог `kMinGroupedRows = 16` → ленивые `hipMalloc`/`hipHostMalloc` в `Qwen35MoePrefill`, планы `hipBLASLt` и WMMA), плюс `AR (T=1)` и **`verify (T=2)`** (`ForwardDecodeEquivalentVerificationChunk` + `d_verification_logits_`).
+  - В `QwenTextRunnerState::WarmIdlePipeline()` (`src/cli/serve/inference_backend.cpp`) добавлен холостой прогрев `QwenMtpGpuDraftBackend` (`PrimeTargetContext` + `Propose` + `verifier_->Reset()`), а проверка `GUFO_WARMUP=0` исправлена на точное сравнение `std::string_view == "0"`.
+- **Исправления `W1.2` (`vision_resync.py` и `VISION_RESYNC_W12_2026-11-21.md`):**
+  - Исправлен off-by-one в `tools/prof/vision_resync.py`: `common_prefix_steps` теперь включает шаг переворота (`steps[:divergence + 1]` → `4`, совпадает со строкой `vision-diag: common_prefix_steps=4` и не пропускает нарушения `KL`/`maxΔ` на шаге переворота); исправлена граница `start = max(lo, divergence, divergence - shift)` (исключены отрицательные `unaligned`) и добавлен `edit_distance_without_tail` (`= 2`).
+  - В [VISION_RESYNC_W12_2026-11-21.md](VISION_RESYNC_W12_2026-11-21.md) исправлены индексы и список токенов до ре-синхронизации: совпадение начинается с **шага 5 (`cached`) / шага 4 (`cold`)**, невыровнены `11, 430` у `cached` (2 токена) и `1892` у `cold` (1 токен), `edit_distance_without_tail = 2`, формальный Levenshtein 16-шаговых окон = `3`.
+- **Проверки (Mac, только CPU + строгий C++23 round-trip и LP64-синтаксис):** `tools/ci/check-format.py` (**PASS, 729 файлов**), `tests/tools/vision_resync_test.py` (**PASS**), прогон `vision_resync.py` по `vision-diag-full.log` (`common_prefix_steps=4`, `edit_distance_without_tail=2`), `tests/tools/moe_skew_test.py` (**PASS**), сквозной C++23-компил `moe_skew.cpp` → реальный JSONL → `tools/prof/moe_skew.py` (**PASS**) и проверка `MoeSkewRecordKernel` на строгом LP64-наборе `atomicAdd` (**PASS**), `tests/tools/check_docs_test.py` (**11/11 OK**), `git diff --check` (**OK**).
+
 ### Реализованы W0.2 (прогрев), W0.4 (MoE-skew) и основание W1.2 — CPU-этап, стенд и прод не трогались
 
-- **W1.2 (оснение 36/36):** по сохранённому логу `vision-diag-full.log` подготовлено
+- **W1.2 (основание 36/36):** по сохранённому логу `vision-diag-full.log` подготовлено
   [таблица-основание](VISION_RESYNC_W12_2026-11-21.md) по всем 4 критериям п. 8 `Q1`
   (KL `0,001963` ✅, maxΔ `0,513805` ✅, near-tie `0,030/0,070` ✅; ре-синхронизация:
   сдвиг 1 токен, 2 несовпадающих токена, Levenshtein обрезанных окон 3 — на решение

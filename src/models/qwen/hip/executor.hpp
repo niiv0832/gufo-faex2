@@ -334,7 +334,7 @@ struct QwenMoeScratch {
   float* shared_out{nullptr};
   /// GUFO_QWEN_MOE_SKEW=1 recording buffers; null (and never launched)
   /// when the diagnostic flag is unset (W0.4).
-  struct QwenMoeSkewDevice* skew{nullptr};
+  const QwenMoeSkewDevice* skew{nullptr};
 };
 
 /// Device scratch of the batched qwen35moe prefill feed-forward.

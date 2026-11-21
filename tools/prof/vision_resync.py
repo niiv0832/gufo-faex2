@@ -112,9 +112,9 @@ def realignment(cached: list[int], cold: list[int], divergence: int,
     for shift in range(-max_shift, max_shift + 1):
         lo = max(0, -shift)
         hi = min(len(cached), len(cold) - shift)
-        if hi <= max(lo, divergence):
+        start = max(lo, divergence, divergence - shift)
+        if hi <= start:
             continue
-        start = max(lo, divergence)
         mismatches = [index for index in range(start, hi)
                       if cached[index] != cold[index + shift]]
         last = mismatches[-1] if mismatches else start - 1
@@ -130,15 +130,23 @@ def realignment(cached: list[int], cold: list[int], divergence: int,
             "cold_resync_index": resync_index + shift,
             "cached_unaligned": resync_index - divergence,
             "cold_unaligned": (resync_index + shift) - divergence,
+            "edit_distance_without_tail": levenshtein(
+                cached[divergence:hi], cold[divergence:hi + shift]),
             # The matched suffix runs to `hi` on the cached side; anything the
             # streams emitted beyond that is a capture-window tail.
             "cached_tail": len(cached) - hi,
             "cold_tail": len(cold) - (hi + shift),
         }
-        if best is None or max(candidate["cached_unaligned"],
-                               candidate["cold_unaligned"]) < max(
-                                   best["cached_unaligned"],
-                                   best["cold_unaligned"]):
+        cand_key = (
+            max(candidate["cached_unaligned"], candidate["cold_unaligned"]),
+            candidate["cached_unaligned"] + candidate["cold_unaligned"],
+            abs(candidate["shift"]),
+        )
+        if best is None or cand_key < (
+            max(best["cached_unaligned"], best["cold_unaligned"]),
+            best["cached_unaligned"] + best["cold_unaligned"],
+            abs(best["shift"]),
+        ):
             best = candidate
     return best
 
@@ -148,7 +156,10 @@ def evaluate(steps: list[dict], resync_token_limit: int = RESYNC_TOKEN_LIMIT,
     cached = [record["cached_token"] for record in steps]
     cold = [record["cold_token"] for record in steps]
     divergence = first_divergence(cached, cold)
-    common = steps if divergence is None else steps[:divergence]
+    # At `step == divergence` both streams still share the exact same input
+    # prefix; its logits are where the near-tie flip occurs (matching the
+    # engine's `common_prefix_steps = divergence + 1`).
+    common = steps if divergence is None else steps[:divergence + 1]
     result = {
         "steps": len(steps),
         "common_prefix_steps": len(common),
@@ -231,7 +242,9 @@ def format_report(result: dict) -> str:
             "resync: shift={shift} cached_resync_index="
             "{cached_resync_index} cold_resync_index={cold_resync_index} "
             "cached_unaligned={cached_unaligned} "
-            "cold_unaligned={cold_unaligned} cached_tail={cached_tail} "
+            "cold_unaligned={cold_unaligned} "
+            "edit_distance_without_tail={edit_distance_without_tail} "
+            "cached_tail={cached_tail} "
             "cold_tail={cold_tail}".format(**resync))
     for name, verdict in result["verdicts"].items():
         lines.append(f"{name}: {verdict}")

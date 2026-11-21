@@ -524,21 +524,43 @@ public:
 
   /// Pays the lazy kernel, workspace and plan costs of this session before
   /// the first request, while the pool is still being created before the
-  /// HTTP listener opens (W0.2). Each pooled session warms its own executor:
-  /// the per-session MoE warm of the decode path is otherwise paid on that
-  /// session's first decode, which is the 27–39 ms burst of the fourth
-  /// concurrent request. GUFO_WARMUP=0 restores the lazy behavior.
+  /// HTTP listener opens (W0.2). Each pooled session warms its own executor
+  /// (grouped prefill + hipBLASLt plans, AR T=1, verify T=2) and, when MTP is
+  /// configured, one idle MTP prime+propose step before Reset(). GUFO_WARMUP=0
+  /// restores the lazy behavior.
   void WarmIdlePipeline() {
     const char* disabled = std::getenv("GUFO_WARMUP");
-    if (disabled != nullptr && disabled[0] == '0') {
+    if (disabled != nullptr && std::string_view(disabled) == "0") {
       return;
     }
     const auto started = std::chrono::steady_clock::now();
     try {
       executor_->WarmIdlePipeline();
+      if (auto* mtp =
+              dynamic_cast<hip::QwenMtpGpuDraftBackend*>(draft_backend_);
+          mtp != nullptr && executor_->GetMaxContext() >= 4) {
+        const std::array<tokenization::TokenId, 2> warm_tokens = {0, 0};
+        const std::size_t hidden = model_->GetConfig().hidden_size;
+        std::vector<float> warm_hidden(warm_tokens.size() * hidden, 0.0F);
+        const speculative::DraftTargetContext context{
+            .prompt_tokens = warm_tokens,
+            .prompt_hidden_states = warm_hidden,
+            .hidden_size = hidden,
+        };
+        if (mtp->PrimeTargetContext(context)) {
+          (void)mtp->Propose(warm_tokens,
+                             static_cast<std::uint32_t>(warm_tokens.size()), 1);
+        }
+        if (verifier_ != nullptr) {
+          verifier_->Reset();
+        }
+      }
     } catch (const std::exception& failure) {
-      // A failed warm is not a failed load: the executor is reset again by
-      // the callee, so serving falls back to the previous lazy behavior.
+      // A failed warm is not a failed load: both executor and verifier are
+      // reset, so serving falls back to the previous lazy behavior.
+      if (verifier_ != nullptr) {
+        verifier_->Reset();
+      }
       Logger::Warn("loader", std::string("event=serve_warmup_failed reason=") +
                                  failure.what());
       return;

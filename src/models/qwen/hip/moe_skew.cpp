@@ -2,27 +2,40 @@
 #include "src/models/qwen/hip/moe_skew.hpp"
 
 #include <algorithm>
-#include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <mutex>
 #include <stdexcept>
+#include <string_view>
 
 #include "src/core/hip/hip_utils.hpp"
 
 namespace gufo::hip {
+namespace {
+
+std::mutex& SkewFileMutex() noexcept {
+  static std::mutex mutex;
+  return mutex;
+}
+
+bool IsDisabledFlag(const char* flag) noexcept {
+  return flag == nullptr || flag[0] == '\0' || std::string_view(flag) == "0";
+}
+
+}  // namespace
 
 bool MoeSkewEnabled() {
-  const char* const flag = std::getenv("GUFO_QWEN_MOE_SKEW");
-  return flag != nullptr && flag[0] != '\0' && flag[0] != '0';
+  return !IsDisabledFlag(std::getenv("GUFO_QWEN_MOE_SKEW"));
 }
 
 std::string MoeSkewPath() {
   const char* const flag = std::getenv("GUFO_QWEN_MOE_SKEW");
-  if (flag == nullptr || flag[0] == '\0' || flag[0] == '0') {
+  if (IsDisabledFlag(flag)) {
     return {};
   }
   // "1" records next to the working directory; anything else is a path.
-  if (flag[0] == '1' && flag[1] == '\0') {
+  if (std::string_view(flag) == "1") {
     return "moe_skew.jsonl";
   }
   return flag;
@@ -42,37 +55,49 @@ QwenMoeSkewHost::QwenMoeSkewHost(std::uint32_t layers, std::uint32_t experts,
 }
 
 bool QwenMoeSkewHost::AllocBuffers(hipStream_t stream) {
-  const size_t hist_count = size_t(layers_) * kMoeSkewBuckets * experts_;
-  const size_t slot_count = size_t(layers_) * kMoeSkewBuckets * used_;
+  const std::size_t lb_count = static_cast<std::size_t>(layers_) *
+                               static_cast<std::size_t>(kMoeSkewBuckets);
+  const std::size_t hist_count = lb_count * experts_;
+  const std::size_t slot_count = lb_count * used_;
+  const std::size_t tail_count = lb_count * 2;
   if (hipMalloc(reinterpret_cast<void**>(&device_.hist),
                 hist_count * sizeof(std::int32_t)) != hipSuccess ||
       hipMalloc(reinterpret_cast<void**>(&device_.slot_weights),
                 slot_count * sizeof(float)) != hipSuccess ||
       hipMalloc(reinterpret_cast<void**>(&device_.rows),
-                size_t(layers_) * kMoeSkewBuckets * sizeof(std::uint64_t)) !=
-          hipSuccess ||
+                lb_count * sizeof(unsigned long long)) != hipSuccess ||
+      hipMalloc(reinterpret_cast<void**>(&device_.tokens),
+                lb_count * sizeof(unsigned long long)) != hipSuccess ||
+      hipMalloc(reinterpret_cast<void**>(&device_.unique_experts),
+                lb_count * sizeof(unsigned long long)) != hipSuccess ||
+      hipMalloc(reinterpret_cast<void**>(&device_.tail_lt1pct),
+                tail_count * sizeof(unsigned long long)) != hipSuccess ||
       hipMalloc(reinterpret_cast<void**>(&device_.dup),
-                size_t(layers_) * kMoeSkewBuckets * sizeof(std::int64_t)) !=
-          hipSuccess ||
+                lb_count * sizeof(unsigned long long)) != hipSuccess ||
       hipMalloc(reinterpret_cast<void**>(&device_.dup_pairs),
-                size_t(layers_) * kMoeSkewBuckets * sizeof(std::uint64_t)) !=
-          hipSuccess ||
+                lb_count * sizeof(unsigned long long)) != hipSuccess ||
       hipMalloc(reinterpret_cast<void**>(&device_.prev_ids),
-                size_t(layers_) * used_ * sizeof(std::int32_t)) != hipSuccess ||
+                static_cast<std::size_t>(layers_) * used_ *
+                    sizeof(std::int32_t)) != hipSuccess ||
       hipMalloc(reinterpret_cast<void**>(&device_.overlap),
-                size_t(layers_) * sizeof(std::int64_t)) != hipSuccess ||
+                static_cast<std::size_t>(layers_) *
+                    sizeof(unsigned long long)) != hipSuccess ||
       hipMalloc(reinterpret_cast<void**>(&device_.overlap_rows),
-                size_t(layers_) * sizeof(std::uint64_t)) != hipSuccess) {
+                static_cast<std::size_t>(layers_) *
+                    sizeof(unsigned long long)) != hipSuccess) {
     return false;
   }
   hist_.assign(hist_count, 0);
   slot_weights_.assign(slot_count, 0.0F);
-  rows_.assign(size_t(layers_) * kMoeSkewBuckets, 0);
-  dup_.assign(size_t(layers_) * kMoeSkewBuckets, 0);
-  dup_pairs_.assign(size_t(layers_) * kMoeSkewBuckets, 0);
-  prev_ids_.assign(size_t(layers_) * used_, 0);
-  overlap_.assign(size_t(layers_), 0);
-  overlap_rows_.assign(size_t(layers_), 0);
+  rows_.assign(lb_count, 0);
+  tokens_.assign(lb_count, 0);
+  unique_experts_.assign(lb_count, 0);
+  tail_lt1pct_.assign(tail_count, 0);
+  dup_.assign(lb_count, 0);
+  dup_pairs_.assign(lb_count, 0);
+  prev_ids_.assign(static_cast<std::size_t>(layers_) * used_, -1);
+  overlap_.assign(layers_, 0);
+  overlap_rows_.assign(layers_, 0);
   Rearm(stream);
   return true;
 }
@@ -81,6 +106,9 @@ void QwenMoeSkewHost::FreeBuffers() noexcept {
   (void)hipFree(device_.hist);
   (void)hipFree(device_.slot_weights);
   (void)hipFree(device_.rows);
+  (void)hipFree(device_.tokens);
+  (void)hipFree(device_.unique_experts);
+  (void)hipFree(device_.tail_lt1pct);
   (void)hipFree(device_.dup);
   (void)hipFree(device_.dup_pairs);
   (void)hipFree(device_.prev_ids);
@@ -97,34 +125,44 @@ QwenMoeSkewHost::~QwenMoeSkewHost() {
 void QwenMoeSkewHost::CopyOut(hipStream_t stream) noexcept {
   // Same-stream copies order after the recording kernels; the trailing sync
   // makes the host mirror valid before the record is built.
-  const size_t hist_bytes =
-      size_t(layers_) * kMoeSkewBuckets * experts_ * sizeof(std::int32_t);
-  (void)hipMemcpyAsync(hist_.data(), device_.hist, hist_bytes,
+  const std::size_t lb_count = static_cast<std::size_t>(layers_) *
+                               static_cast<std::size_t>(kMoeSkewBuckets);
+  (void)hipMemcpyAsync(hist_.data(), device_.hist,
+                       lb_count * experts_ * sizeof(std::int32_t),
                        hipMemcpyDeviceToHost, stream);
-  (void)hipMemcpyAsync(
-      slot_weights_.data(), device_.slot_weights,
-      size_t(layers_) * kMoeSkewBuckets * used_ * sizeof(float),
-      hipMemcpyDeviceToHost, stream);
-  (void)hipMemcpyAsync(
-      rows_.data(), device_.rows,
-      size_t(layers_) * kMoeSkewBuckets * sizeof(std::uint64_t),
-      hipMemcpyDeviceToHost, stream);
+  (void)hipMemcpyAsync(slot_weights_.data(), device_.slot_weights,
+                       lb_count * used_ * sizeof(float), hipMemcpyDeviceToHost,
+                       stream);
+  (void)hipMemcpyAsync(rows_.data(), device_.rows,
+                       lb_count * sizeof(unsigned long long),
+                       hipMemcpyDeviceToHost, stream);
+  (void)hipMemcpyAsync(tokens_.data(), device_.tokens,
+                       lb_count * sizeof(unsigned long long),
+                       hipMemcpyDeviceToHost, stream);
+  (void)hipMemcpyAsync(unique_experts_.data(), device_.unique_experts,
+                       lb_count * sizeof(unsigned long long),
+                       hipMemcpyDeviceToHost, stream);
+  (void)hipMemcpyAsync(tail_lt1pct_.data(), device_.tail_lt1pct,
+                       lb_count * 2 * sizeof(unsigned long long),
+                       hipMemcpyDeviceToHost, stream);
   (void)hipMemcpyAsync(dup_.data(), device_.dup,
-                       size_t(layers_) * kMoeSkewBuckets * sizeof(std::int64_t),
+                       lb_count * sizeof(unsigned long long),
+                       hipMemcpyDeviceToHost, stream);
+  (void)hipMemcpyAsync(dup_pairs_.data(), device_.dup_pairs,
+                       lb_count * sizeof(unsigned long long),
                        hipMemcpyDeviceToHost, stream);
   (void)hipMemcpyAsync(
-      dup_pairs_.data(), device_.dup_pairs,
-      size_t(layers_) * kMoeSkewBuckets * sizeof(std::uint64_t),
+      prev_ids_.data(), device_.prev_ids,
+      static_cast<std::size_t>(layers_) * used_ * sizeof(std::int32_t),
       hipMemcpyDeviceToHost, stream);
-  (void)hipMemcpyAsync(prev_ids_.data(), device_.prev_ids,
-                       size_t(layers_) * used_ * sizeof(std::int32_t),
-                       hipMemcpyDeviceToHost, stream);
-  (void)hipMemcpyAsync(overlap_.data(), device_.overlap,
-                       size_t(layers_) * sizeof(std::int64_t),
-                       hipMemcpyDeviceToHost, stream);
-  (void)hipMemcpyAsync(overlap_rows_.data(), device_.overlap_rows,
-                       size_t(layers_) * sizeof(std::uint64_t),
-                       hipMemcpyDeviceToHost, stream);
+  (void)hipMemcpyAsync(
+      overlap_.data(), device_.overlap,
+      static_cast<std::size_t>(layers_) * sizeof(unsigned long long),
+      hipMemcpyDeviceToHost, stream);
+  (void)hipMemcpyAsync(
+      overlap_rows_.data(), device_.overlap_rows,
+      static_cast<std::size_t>(layers_) * sizeof(unsigned long long),
+      hipMemcpyDeviceToHost, stream);
   (void)hipStreamSynchronize(stream);
 }
 
@@ -132,33 +170,54 @@ void QwenMoeSkewHost::AppendRecord() {
   ++ordinal_;
   auto layer_join = [&](auto&& render) {
     std::string out;
-    for (size_t layer = 0; layer < layers_; ++layer) {
+    for (std::size_t layer = 0; layer < layers_; ++layer) {
       out += render(layer);
       out += layer + 1 < layers_ ? "," : "";
     }
     return out;
   };
-  auto bucket_join = [&](size_t layer, auto&& render) {
-    std::string out;
+  auto bucket_join = [&](std::size_t layer, auto&& render) {
+    std::string out = "[";
     for (int bucket = 0; bucket < kMoeSkewBuckets; ++bucket) {
-      out += render(layer, size_t(bucket));
+      out += render(layer, static_cast<std::size_t>(bucket));
       out += bucket + 1 < kMoeSkewBuckets ? "," : "";
     }
+    out += "]";
     return out;
+  };
+  auto render_float = [](float value) {
+    return std::to_string(std::isfinite(value) ? value : 0.0F);
   };
   std::string record =
       "{\"ordinal\":" + std::to_string(ordinal_) +
       ",\"layers\":" + std::to_string(layers_) +
       ",\"experts\":" + std::to_string(experts_) +
       ",\"used\":" + std::to_string(used_) + ",\"rows\":[" +
-      layer_join([&](size_t layer) {
-        return bucket_join(layer, [&](size_t l, size_t b) {
+      layer_join([&](std::size_t layer) {
+        return bucket_join(layer, [&](std::size_t l, std::size_t b) {
           return std::to_string(rows_[l * kMoeSkewBuckets + b]);
         });
       }) +
-      "],\"hist\":[" + layer_join([&](size_t layer) {
-        return bucket_join(layer, [&](size_t l, size_t b) {
-          const size_t base = (l * kMoeSkewBuckets + b) * experts_;
+      "],\"tokens\":[" + layer_join([&](std::size_t layer) {
+        return bucket_join(layer, [&](std::size_t l, std::size_t b) {
+          return std::to_string(tokens_[l * kMoeSkewBuckets + b]);
+        });
+      }) +
+      "],\"unique_experts\":[" + layer_join([&](std::size_t layer) {
+        return bucket_join(layer, [&](std::size_t l, std::size_t b) {
+          return std::to_string(unique_experts_[l * kMoeSkewBuckets + b]);
+        });
+      }) +
+      "],\"tail_lt1pct\":[" + layer_join([&](std::size_t layer) {
+        return bucket_join(layer, [&](std::size_t l, std::size_t b) {
+          const std::size_t base = (l * kMoeSkewBuckets + b) * 2;
+          return "[" + std::to_string(tail_lt1pct_[base + 0]) + "," +
+                 std::to_string(tail_lt1pct_[base + 1]) + "]";
+        });
+      }) +
+      "],\"hist\":[" + layer_join([&](std::size_t layer) {
+        return bucket_join(layer, [&](std::size_t l, std::size_t b) {
+          const std::size_t base = (l * kMoeSkewBuckets + b) * experts_;
           std::string row = "[";
           for (std::uint32_t expert = 0; expert < experts_; ++expert) {
             row += std::to_string(hist_[base + expert]);
@@ -167,31 +226,31 @@ void QwenMoeSkewHost::AppendRecord() {
           return row + "]";
         });
       }) +
-      "],\"slot_weights\":[" + layer_join([&](size_t layer) {
-        return bucket_join(layer, [&](size_t l, size_t b) {
-          const size_t base = (l * kMoeSkewBuckets + b) * used_;
+      "],\"slot_weights\":[" + layer_join([&](std::size_t layer) {
+        return bucket_join(layer, [&](std::size_t l, std::size_t b) {
+          const std::size_t base = (l * kMoeSkewBuckets + b) * used_;
           std::string row = "[";
           for (std::uint32_t slot = 0; slot < used_; ++slot) {
-            row += std::to_string(slot_weights_[base + slot]);
+            row += render_float(slot_weights_[base + slot]);
             row += slot + 1 < used_ ? "," : "";
           }
           return row + "]";
         });
       }) +
-      "],\"dup\":[" + layer_join([&](size_t layer) {
-        return bucket_join(layer, [&](size_t l, size_t b) {
+      "],\"dup\":[" + layer_join([&](std::size_t layer) {
+        return bucket_join(layer, [&](std::size_t l, std::size_t b) {
           return std::to_string(dup_[l * kMoeSkewBuckets + b]);
         });
       }) +
-      "],\"dup_pairs\":[" + layer_join([&](size_t layer) {
-        return bucket_join(layer, [&](size_t l, size_t b) {
+      "],\"dup_pairs\":[" + layer_join([&](std::size_t layer) {
+        return bucket_join(layer, [&](std::size_t l, std::size_t b) {
           return std::to_string(dup_pairs_[l * kMoeSkewBuckets + b]);
         });
       }) +
-      "],\"overlap\":[" + layer_join([&](size_t layer) {
+      "],\"overlap\":[" + layer_join([&](std::size_t layer) {
         return std::to_string(overlap_[layer]);
       }) +
-      "],\"overlap_rows\":[" + layer_join([&](size_t layer) {
+      "],\"overlap_rows\":[" + layer_join([&](std::size_t layer) {
         return std::to_string(overlap_rows_[layer]);
       }) +
       "]}\n";
@@ -199,28 +258,34 @@ void QwenMoeSkewHost::AppendRecord() {
 }
 
 void QwenMoeSkewHost::Rearm(hipStream_t stream) noexcept {
-  const size_t hist_bytes =
-      size_t(layers_) * kMoeSkewBuckets * experts_ * sizeof(std::int32_t);
-  (void)hipMemsetAsync(device_.hist, 0, hist_bytes, stream);
-  (void)hipMemsetAsync(
-      device_.slot_weights, 0,
-      size_t(layers_) * kMoeSkewBuckets * used_ * sizeof(float), stream);
-  (void)hipMemsetAsync(
-      device_.rows, 0,
-      size_t(layers_) * kMoeSkewBuckets * sizeof(std::uint64_t), stream);
-  (void)hipMemsetAsync(device_.dup, 0,
-                       size_t(layers_) * kMoeSkewBuckets * sizeof(std::int64_t),
+  const std::size_t lb_count = static_cast<std::size_t>(layers_) *
+                               static_cast<std::size_t>(kMoeSkewBuckets);
+  (void)hipMemsetAsync(device_.hist, 0,
+                       lb_count * experts_ * sizeof(std::int32_t), stream);
+  (void)hipMemsetAsync(device_.slot_weights, 0,
+                       lb_count * used_ * sizeof(float), stream);
+  (void)hipMemsetAsync(device_.rows, 0, lb_count * sizeof(unsigned long long),
                        stream);
-  (void)hipMemsetAsync(
-      device_.dup_pairs, 0,
-      size_t(layers_) * kMoeSkewBuckets * sizeof(std::uint64_t), stream);
+  (void)hipMemsetAsync(device_.tokens, 0, lb_count * sizeof(unsigned long long),
+                       stream);
+  (void)hipMemsetAsync(device_.unique_experts, 0,
+                       lb_count * sizeof(unsigned long long), stream);
+  (void)hipMemsetAsync(device_.tail_lt1pct, 0,
+                       lb_count * 2 * sizeof(unsigned long long), stream);
+  (void)hipMemsetAsync(device_.dup, 0, lb_count * sizeof(unsigned long long),
+                       stream);
+  (void)hipMemsetAsync(device_.dup_pairs, 0,
+                       lb_count * sizeof(unsigned long long), stream);
   // prev_ids = -1: no previous token yet.
-  (void)hipMemsetAsync(device_.prev_ids, 0xFF,
-                       size_t(layers_) * used_ * sizeof(std::int32_t), stream);
-  (void)hipMemsetAsync(device_.overlap, 0,
-                       size_t(layers_) * sizeof(std::int64_t), stream);
-  (void)hipMemsetAsync(device_.overlap_rows, 0,
-                       size_t(layers_) * sizeof(std::uint64_t), stream);
+  (void)hipMemsetAsync(
+      device_.prev_ids, 0xFF,
+      static_cast<std::size_t>(layers_) * used_ * sizeof(std::int32_t), stream);
+  (void)hipMemsetAsync(
+      device_.overlap, 0,
+      static_cast<std::size_t>(layers_) * sizeof(unsigned long long), stream);
+  (void)hipMemsetAsync(
+      device_.overlap_rows, 0,
+      static_cast<std::size_t>(layers_) * sizeof(unsigned long long), stream);
 }
 
 void QwenMoeSkewHost::OnReset(hipStream_t stream) noexcept {
@@ -234,17 +299,18 @@ void QwenMoeSkewHost::OnReset(hipStream_t stream) noexcept {
     // neighbor ids still have to be re-armed for the next request.
     rows_probe_.assign(rows_.size(), 0);
     (void)hipMemcpyAsync(rows_probe_.data(), device_.rows,
-                         rows_.size() * sizeof(std::uint64_t),
+                         rows_.size() * sizeof(unsigned long long),
                          hipMemcpyDeviceToHost, stream);
     (void)hipStreamSynchronize(stream);
-    const bool any = std::any_of(rows_probe_.begin(), rows_probe_.end(),
-                                 [](std::uint64_t rows) { return rows != 0; });
+    const bool any =
+        std::any_of(rows_probe_.begin(), rows_probe_.end(),
+                    [](unsigned long long rows) { return rows != 0; });
     if (any) {
       CopyOut(stream);
       AppendRecord();
     }
     Rearm(stream);
-    if (records_.size() >= 32) {
+    if (!records_.empty()) {
       Flush();
     }
   } catch (...) {
@@ -256,12 +322,14 @@ void QwenMoeSkewHost::Flush() noexcept {
     return;
   }
   try {
-    // Append; several executors (sessions) of one process share the file,
-    // each record is self-contained.
+    // Serialize multi-session appends: each JSONL line is ~150 KB and must
+    // never interleave across concurrent pooled sessions.
+    const std::lock_guard lock(SkewFileMutex());
     if (FILE* file = std::fopen(path_.c_str(), "a")) {
       for (const auto& record : records_) {
         std::fwrite(record.data(), 1, record.size(), file);
       }
+      std::fflush(file);
       std::fclose(file);
     }
     records_.clear();

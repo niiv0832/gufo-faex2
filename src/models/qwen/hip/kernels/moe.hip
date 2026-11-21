@@ -367,53 +367,84 @@ __global__ void RouterSplitLogitsKernel(const float* __restrict__ y,
 }
 
 // One block records the router decisions of one layer call: the selection
-// histogram and slot weights per row-count bucket, the experts shared between
-// the rows of a batched call, and -- for single-row calls -- the overlap with
-// the layer's previous token. Buffers have fixed addresses (W0.4), so the
-// recorded launches are legal inside captured HIP graphs.
+// histogram and slot weights per row-count bucket, distinct experts per call
+// (W2.2), 7th/8th slot <1% tail counts (W5.3), experts shared between the rows
+// of a batched call, and -- for single-row calls -- the overlap with the
+// layer's previous token. Buffers have fixed addresses (W0.4), so the recorded
+// launches are legal inside captured HIP graphs.
 __global__ void MoeSkewRecordKernel(const QwenMoeSkewDevice skew,
                                     const std::int32_t* __restrict__ ids,
                                     const float* __restrict__ weights,
                                     std::uint32_t layer_index,
                                     std::uint32_t rows) {
-  __shared__ std::int64_t s_warp_totals[32];
-  if (rows == 0) {
+  __shared__ std::uint32_t s_reduce[128];
+  __shared__ std::uint32_t s_seen[kMoeSkewMaxExperts];
+  if (rows == 0 || layer_index >= skew.layers ||
+      skew.experts > kMoeSkewMaxExperts) {
     return;
   }
   const std::uint32_t bucket = rows <= 4 ? rows - 1 : (rows <= 8 ? 4 : 5);
   const std::uint32_t used = skew.used;
   const std::uint32_t tid = threadIdx.x;
   const std::uint32_t block_threads = blockDim.x;
-  const size_t layer_base = size_t(layer_index) * kMoeSkewBuckets;
-  // Block-wide sum of a per-thread partial; thread 0 returns the total.
-  // The trailing sync keeps the scratch valid until every thread has passed,
-  // so a second reduction cannot overwrite an unread total.
-  auto block_total = [&](std::int64_t value) -> std::int64_t {
-    for (int offset = 16; offset > 0; offset >>= 1) {
-      value += __shfl_xor(value, offset);
-    }
-    const std::uint32_t warp = tid >> 5;
-    if ((tid & 31U) == 0) {
-      s_warp_totals[warp] = value;
-    }
+  const std::size_t layer_base =
+      static_cast<std::size_t>(layer_index) * kMoeSkewBuckets;
+  // Block-wide sum of a per-thread partial; every thread in the 128-thread
+  // block must execute this lambda unconditionally so all barriers match.
+  auto block_sum = [&](std::uint32_t value) -> std::uint32_t {
+    s_reduce[tid] = value;
     __syncthreads();
-    std::int64_t total = 0;
-    if (tid == 0) {
-      for (std::uint32_t w = 0; w < block_threads >> 5; ++w) {
-        total += s_warp_totals[w];
+    for (std::uint32_t stride = block_threads >> 1; stride > 0; stride >>= 1) {
+      if (tid < stride) {
+        s_reduce[tid] += s_reduce[tid + stride];
       }
+      __syncthreads();
     }
+    const std::uint32_t total = s_reduce[0];
     __syncthreads();
     return total;
   };
-  for (std::uint32_t index = tid; index < rows * used;
-       index += block_threads) {
+  for (std::uint32_t e = tid; e < skew.experts; e += block_threads) {
+    s_seen[e] = 0U;
+  }
+  __syncthreads();
+  std::uint32_t local_tail7 = 0;
+  std::uint32_t local_tail8 = 0;
+  for (std::uint32_t index = tid; index < rows * used; index += block_threads) {
     const std::uint32_t slot = index % used;
     const std::int32_t id = ids[index];
+    const float w = weights[index];
     if (id >= 0 && static_cast<std::uint32_t>(id) < skew.experts) {
       atomicAdd(&skew.hist[(layer_base + bucket) * skew.experts + id], 1);
-      atomicAdd(&skew.slot_weights[(layer_base + bucket) * used + slot],
-                weights[index]);
+      atomicAdd(&skew.slot_weights[(layer_base + bucket) * used + slot], w);
+      s_seen[id] = 1U;
+    }
+    if (used >= 2) {
+      if (slot == used - 2 && w < 0.01F) {
+        ++local_tail7;
+      } else if (slot == used - 1 && w < 0.01F) {
+        ++local_tail8;
+      }
+    }
+  }
+  __syncthreads();
+  std::uint32_t local_unique = 0;
+  for (std::uint32_t e = tid; e < skew.experts; e += block_threads) {
+    local_unique += s_seen[e];
+  }
+  const std::uint32_t total_unique = block_sum(local_unique);
+  const std::uint32_t total_tail7 = block_sum(local_tail7);
+  const std::uint32_t total_tail8 = block_sum(local_tail8);
+  if (tid == 0) {
+    atomicAdd(&skew.unique_experts[layer_base + bucket],
+              static_cast<unsigned long long>(total_unique));
+    if (total_tail7 != 0) {
+      atomicAdd(&skew.tail_lt1pct[(layer_base + bucket) * 2 + 0],
+                static_cast<unsigned long long>(total_tail7));
+    }
+    if (total_tail8 != 0) {
+      atomicAdd(&skew.tail_lt1pct[(layer_base + bucket) * 2 + 1],
+                static_cast<unsigned long long>(total_tail8));
     }
   }
   // Experts shared between two rows of one call: every pair contributes the
@@ -421,9 +452,8 @@ __global__ void MoeSkewRecordKernel(const QwenMoeSkewDevice skew,
   // (first, second) with first < second row by row.
   if (rows > 1) {
     const std::uint32_t pair_count = rows * (rows - 1) / 2;
-    std::int64_t shared = 0;
-    for (std::uint32_t pair = tid; pair < pair_count;
-         pair += block_threads) {
+    std::uint32_t shared = 0;
+    for (std::uint32_t pair = tid; pair < pair_count; pair += block_threads) {
       std::uint32_t first = 0;
       std::uint32_t rest = pair;
       while (rest >= rows - 1 - first) {
@@ -444,32 +474,39 @@ __global__ void MoeSkewRecordKernel(const QwenMoeSkewDevice skew,
         }
       }
     }
+    const std::uint32_t total_shared = block_sum(shared);
     if (tid == 0) {
-      atomicAdd(&skew.dup[layer_base + bucket], block_total(shared));
+      atomicAdd(&skew.dup[layer_base + bucket],
+                static_cast<unsigned long long>(total_shared));
       atomicAdd(&skew.dup_pairs[layer_base + bucket],
-                static_cast<std::uint64_t>(pair_count));
+                static_cast<unsigned long long>(pair_count));
     }
   }
   // Neighbor-token overlap: single-row calls compare against the ids of the
-  // layer's previous single-row call, then become the new previous ids. The
-  // block reduction syncs separate the reads of the old ids from the writes.
+  // layer's previous single-row call (skipping the first token when prev_ids
+  // is -1), then become the new previous ids. The block reduction syncs
+  // separate the reads of the old ids from the writes.
   if (rows == 1) {
-    std::int32_t shared = 0;
-    for (std::uint32_t a = tid; a < used; a += block_threads) {
-      const std::int32_t id = ids[a];
-      if (id < 0) {
-        continue;
-      }
-      for (std::uint32_t b = 0; b < used; ++b) {
-        if (skew.prev_ids[layer_index * used + b] == id) {
-          ++shared;
-          break;
+    const bool has_prev = skew.prev_ids[layer_index * used] >= 0;
+    std::uint32_t shared = 0;
+    if (has_prev) {
+      for (std::uint32_t a = tid; a < used; a += block_threads) {
+        const std::int32_t id = ids[a];
+        if (id < 0) {
+          continue;
+        }
+        for (std::uint32_t b = 0; b < used; ++b) {
+          if (skew.prev_ids[layer_index * used + b] == id) {
+            ++shared;
+            break;
+          }
         }
       }
     }
-    const std::int64_t total = block_total(shared);
-    if (tid == 0) {
-      atomicAdd(&skew.overlap[layer_index], total);
+    const std::uint32_t total_overlap = block_sum(shared);
+    if (tid == 0 && has_prev) {
+      atomicAdd(&skew.overlap[layer_index],
+                static_cast<unsigned long long>(total_overlap));
       atomicAdd(&skew.overlap_rows[layer_index], 1ULL);
     }
     for (std::uint32_t a = tid; a < used; a += block_threads) {
@@ -478,6 +515,8 @@ __global__ void MoeSkewRecordKernel(const QwenMoeSkewDevice skew,
   }
   if (tid == 0) {
     atomicAdd(&skew.rows[layer_base + bucket], 1ULL);
+    atomicAdd(&skew.tokens[layer_base + bucket],
+              static_cast<unsigned long long>(rows));
   }
 }
 
@@ -538,7 +577,8 @@ void LaunchMoeRouterTopK(const float* router_logits, const float* shared_logit,
                          std::int32_t* expert_ids, float* expert_weights,
                          float* shared_weight, std::uint32_t num_experts,
                          std::uint32_t num_used, std::uint32_t rows,
-                         hipStream_t stream) {  const std::size_t shared_bytes =
+                         hipStream_t stream) {
+  const std::size_t shared_bytes =
       static_cast<std::size_t>(num_experts) * sizeof(float);
   MoeRouterTopKKernel<<<rows, kMoeRouterThreads, shared_bytes, stream>>>(
       router_logits, shared_logit, expert_ids, expert_weights, shared_weight,

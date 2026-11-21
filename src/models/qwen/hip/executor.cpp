@@ -78,10 +78,12 @@ void QwenGpuExecutor::InitMoeSkew() {
     return;
   }
   const auto& config = weights_.config;
-  if (config.num_layers > kMoeSkewMaxLayers ||
+  if (!config.IsMoe() || config.num_experts == 0 ||
+      config.num_experts_used == 0 || config.num_layers > kMoeSkewMaxLayers ||
       config.num_experts > kMoeSkewMaxExperts ||
       config.num_experts_used > kMoeSkewMaxUsed) {
-    // Shape outside the fixed telemetry layout: no buffers, no launches.
+    // Dense model or shape outside the fixed telemetry layout: no buffers,
+    // no launches.
     return;
   }
   moe_skew_ = std::make_unique<QwenMoeSkewHost>(
@@ -229,6 +231,9 @@ void QwenGpuExecutor::RestoreSnapshot(const QwenGpuSnapshot& snapshot) {
   h_last_hidden_.clear();
   last_verification_rows_ = 0;
   last_hidden_offset_ = 0;
+  if (moe_skew_) {
+    moe_skew_->OnReset(arena_.stream);
+  }
   arena_.RestoreSnapshot(snapshot);
   vision_input_.RestoreLayout(snapshot.vision_layout_, arena_.stream);
   graph_executor_.Reset();
@@ -246,6 +251,9 @@ void QwenGpuExecutor::RestoreCompactSnapshot(
   h_last_hidden_.clear();
   last_verification_rows_ = 0;
   last_hidden_offset_ = 0;
+  if (moe_skew_) {
+    moe_skew_->OnReset(arena_.stream);
+  }
   arena_.RestoreCompactSnapshot(payload, expected_valid_context);
   vision_input_.RestoreLayout(QwenGpuSnapshot::ReadRopeLayout(payload),
                               arena_.stream);

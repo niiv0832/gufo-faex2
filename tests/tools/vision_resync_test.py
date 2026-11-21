@@ -46,13 +46,39 @@ def test_single_flip_resync():
              for i, (a, b) in enumerate(zip(cached, cold))]
     result = vr.evaluate(steps)
     check(result["first_divergence_step"] == 3, "divergence at step 3")
+    check(result["common_prefix_steps"] == 4,
+          "common prefix includes step 3 where input context is still identical")
     check(result["resync"]["shift"] == -1, "streams settle into a shift of 1")
-    check(result["resync"]["cached_unaligned"] == 2, "two cached tokens unaligned")
-    check(result["resync"]["cold_unaligned"] == 1, "one cold token unaligned")
+    check(result["resync"]["cached_resync_index"] == 5,
+          "cached realigns at step 5")
+    check(result["resync"]["cold_resync_index"] == 4,
+          "cold realigns at step 4")
+    check(result["resync"]["cached_unaligned"] == 2,
+          "two cached tokens unaligned (11, 430)")
+    check(result["resync"]["cold_unaligned"] == 1,
+          "one cold token unaligned (1892)")
+    check(result["resync"]["edit_distance_without_tail"] == 2,
+          "edit distance excluding window tail is 2")
     check(result["resync"]["cold_tail"] == 1, "trailing token reported as tail")
     check(result["levenshtein"] == 3, "windowed levenshtein is 3")
     check(result["verdicts"]["resync"] == "PASS", "resync within the limit")
     check(result["verdicts"]["near_tie"] == "PASS", "flip at a near-tie")
+
+
+def test_negative_shift_does_not_look_before_divergence():
+    # Even if cached[divergence] equals cold[divergence - 1], resync must not
+    # produce negative unaligned counts by matching before the divergence.
+    cached = [10, 20, 30, 30, 40, 50, 60]
+    cold = [10, 20, 30, 40, 50, 60, 70]
+    steps = [step(i, a, b, margin=0.02 if i == 3 else 1.0)
+             for i, (a, b) in enumerate(zip(cached, cold))]
+    result = vr.evaluate(steps)
+    check(result["resync"]["cached_unaligned"] == 1,
+          "one extra inserted token on cached side")
+    check(result["resync"]["cold_unaligned"] == 0,
+          "zero unaligned tokens on cold side (never negative)")
+    check(result["resync"]["edit_distance_without_tail"] == 1,
+          "single insertion has edit distance 1")
 
 
 def test_cascade_fails():
@@ -66,11 +92,13 @@ def test_cascade_fails():
 
 
 def test_thresholds():
-    # A common step carries the violation; the divergence step itself has no
-    # common-prefix aggregate, so it cannot fail those gates.
-    steps = [step(0, 7, 7, delta=1.5, kl=0.02),
-             step(1, 8, 9, margin=0.2)]
+    # A violation at the divergence step itself (where both inputs still match)
+    # must fail the KL and max_delta gates.
+    steps = [step(0, 7, 7, delta=0.1, kl=0.001),
+             step(1, 8, 9, margin=0.2, delta=1.5, kl=0.02)]
     result = vr.evaluate(steps)
+    check(result["common_prefix_steps"] == 2,
+          "divergence step is included in common prefix")
     check(result["verdicts"]["kl"] == "FAIL", "KL above the limit fails")
     check(result["verdicts"]["max_delta"] == "FAIL", "maxΔ above the limit fails")
     check(result["verdicts"]["near_tie"] == "FAIL",
@@ -92,14 +120,16 @@ def test_log_parsing():
     check(steps[1]["cold_token"] == 1892, "cold token parsed")
     check(steps[0]["max_delta"] == 0.513805, "max delta parsed")
     result = vr.evaluate(steps)
-    check(result["common_prefix_steps"] == 1, "common prefix is one step")
-    check(abs(result["common_max_kl"] - 0.001420) < 1e-12,
-          "KL aggregate covers only the common prefix")
+    check(result["common_prefix_steps"] == 2,
+          "common prefix covers steps 0 and 1 (same input prefix)")
+    check(abs(result["common_max_kl"] - 0.001826) < 1e-12,
+          "KL aggregate includes the divergence step")
 
 
 def main():
     test_identical_streams()
     test_single_flip_resync()
+    test_negative_shift_does_not_look_before_divergence()
     test_cascade_fails()
     test_thresholds()
     test_log_parsing()
