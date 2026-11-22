@@ -395,8 +395,7 @@ __global__ void LinearSpeculativeSamplingKernel(
     }
     draft_target_probability /= target_total;
     accepted =
-        acceptance_uniform * draft_token_probability <
-        draft_target_probability;
+        acceptance_uniform * draft_token_probability < draft_target_probability;
     *out_accepted = accepted ? 1U : 0U;
     if (accepted) {
       *out_token = draft_token;
@@ -413,8 +412,7 @@ __global__ void LinearSpeculativeSamplingKernel(
     if (!isfinite(value) || value < min_p_threshold) {
       continue;
     }
-    const float target_weight =
-        expf((value - maximum) * inverse_temperature);
+    const float target_weight = expf((value - maximum) * inverse_temperature);
     const float draft_probability = draft_probabilities[index];
     local_sum += fmaxf(target_weight - draft_probability * target_total, 0.0F);
   }
@@ -476,13 +474,11 @@ __global__ void LinearSpeculativeSamplingKernel(
       if (!isfinite(value) || value < min_p_threshold) {
         continue;
       }
-      const float target_weight =
-          expf((value - maximum) * inverse_temperature);
+      const float target_weight = expf((value - maximum) * inverse_temperature);
       float weight = target_weight;
       if (use_residual) {
         const float draft_probability = draft_probabilities[index];
-        weight =
-            fmaxf(target_weight - draft_probability * target_total, 0.0F);
+        weight = fmaxf(target_weight - draft_probability * target_total, 0.0F);
       }
       if (weight <= 0.0F) {
         continue;
@@ -829,8 +825,7 @@ __global__ void SortedSpeculativeSamplingKernel(
     }
     const float draft_target_probability = draft_target_weight / target_total;
     accepted =
-        acceptance_uniform * draft_token_probability <
-        draft_target_probability;
+        acceptance_uniform * draft_token_probability < draft_target_probability;
     *out_accepted = accepted ? 1U : 0U;
     if (accepted) {
       *out_token = draft_token;
@@ -905,8 +900,7 @@ __global__ void SortedSpeculativeSamplingKernel(
       if (use_residual) {
         const float draft_probability =
             draft_probabilities[sorted_token_ids[index]];
-        weight =
-            fmaxf(target_weight - draft_probability * target_total, 0.0F);
+        weight = fmaxf(target_weight - draft_probability * target_total, 0.0F);
       }
       if (weight <= 0.0F) {
         continue;
@@ -1054,15 +1048,264 @@ void LaunchBatchedGPUArgmax(const float* logits, std::uint32_t* out_tokens,
   }
 }
 
+namespace {
+
+// Exact total-order 32-bit key matching MtpTopKDistribution:
+//   NaN -> 0; -inf -> 0x007FFFFF; -0.0F/+0.0F -> 0x80000000; +inf ->
+//   0xFF800000.
+__device__ __forceinline__ std::uint32_t MtpOrderKey(float value) {
+  if (isnan(value)) {
+    return 0U;
+  }
+  if (value == 0.0F) {
+    value = 0.0F;
+  }
+  const std::uint32_t bits = __float_as_uint(value);
+  return (bits & 0x80000000U) != 0U ? ~bits : (bits | 0x80000000U);
+}
+
+// Single 64-bit unsigned descending sort key: higher MtpOrderKey wins, exact
+// ties break by smaller token id (~id is larger). 0ULL is strictly below every
+// valid (logit, id) pair since id < 0xFFFFFFFFU => ~id != 0.
+__device__ __forceinline__ std::uint64_t MtpPackedKey(float value,
+                                                      std::uint32_t id) {
+  return (static_cast<std::uint64_t>(MtpOrderKey(value)) << 32) |
+         static_cast<std::uint64_t>(~id);
+}
+
+template<int Offset>
+__device__ __forceinline__ std::uint64_t SwizzleXorU64(std::uint64_t value) {
+  const auto lo = static_cast<std::uint32_t>(value);
+  const auto hi = static_cast<std::uint32_t>(value >> 32);
+  const auto o_lo = static_cast<std::uint32_t>(
+      __builtin_amdgcn_ds_swizzle(static_cast<int>(lo), (Offset << 10) | 31));
+  const auto o_hi = static_cast<std::uint32_t>(
+      __builtin_amdgcn_ds_swizzle(static_cast<int>(hi), (Offset << 10) | 31));
+  return (static_cast<std::uint64_t>(o_hi) << 32) | o_lo;
+}
+
+template<int Offset>
+__device__ __forceinline__ std::uint64_t BitonicStepU64(std::uint64_t value,
+                                                        std::uint32_t lane,
+                                                        bool want_desc) {
+  const std::uint64_t other = SwizzleXorU64<Offset>(value);
+  const bool hi_lane = (lane & static_cast<std::uint32_t>(Offset)) != 0U;
+  const bool keep_max = want_desc ^ hi_lane;
+  return keep_max ? (value > other ? value : other)
+                  : (value < other ? value : other);
+}
+
+__device__ __forceinline__ std::uint64_t BitonicMergeDesc32(
+    std::uint64_t value, std::uint32_t lane) {
+  value = BitonicStepU64<16>(value, lane, true);
+  value = BitonicStepU64<8>(value, lane, true);
+  value = BitonicStepU64<4>(value, lane, true);
+  value = BitonicStepU64<2>(value, lane, true);
+  value = BitonicStepU64<1>(value, lane, true);
+  return value;
+}
+
+__device__ __forceinline__ std::uint64_t BitonicSort32(std::uint64_t value,
+                                                       std::uint32_t lane,
+                                                       bool desc) {
+  value = BitonicStepU64<1>(value, lane, ((lane & 2U) == 0U) ? desc : !desc);
+  {
+    const bool dir = ((lane & 4U) == 0U) ? desc : !desc;
+    value = BitonicStepU64<2>(value, lane, dir);
+    value = BitonicStepU64<1>(value, lane, dir);
+  }
+  {
+    const bool dir = ((lane & 8U) == 0U) ? desc : !desc;
+    value = BitonicStepU64<4>(value, lane, dir);
+    value = BitonicStepU64<2>(value, lane, dir);
+    value = BitonicStepU64<1>(value, lane, dir);
+  }
+  {
+    const bool dir = ((lane & 16U) == 0U) ? desc : !desc;
+    value = BitonicStepU64<8>(value, lane, dir);
+    value = BitonicStepU64<4>(value, lane, dir);
+    value = BitonicStepU64<2>(value, lane, dir);
+    value = BitonicStepU64<1>(value, lane, dir);
+  }
+  value = BitonicStepU64<16>(value, lane, desc);
+  value = BitonicStepU64<8>(value, lane, desc);
+  value = BitonicStepU64<4>(value, lane, desc);
+  value = BitonicStepU64<2>(value, lane, desc);
+  value = BitonicStepU64<1>(value, lane, desc);
+  return value;
+}
+
+__device__ __forceinline__ std::uint64_t ShflLane31U64(std::uint64_t value) {
+  const auto lo =
+      static_cast<std::uint32_t>(__shfl(static_cast<std::uint32_t>(value), 31));
+  const auto hi = static_cast<std::uint32_t>(
+      __shfl(static_cast<std::uint32_t>(value >> 32), 31));
+  return (static_cast<std::uint64_t>(hi) << 32) | lo;
+}
+
+// Each wave32 streams a contiguous 32-aligned slice of one logit row in
+// coalesced 128-byte loads and maintains its exact top-32 in registers via
+// Batcher's bitonic merge, with a wave-wide threshold skip (__any). Zero LDS,
+// zero __syncthreads(), zero atomics, and bounded O(N) worst-case runtime.
+template<bool DirectOutput>
+__global__ void MtpWaveTopKStage1Kernel(
+    const float* __restrict__ logits, std::uint64_t* __restrict__ partial_keys,
+    MtpTopKCandidate* __restrict__ out, std::size_t vocab_size,
+    std::uint32_t total_waves, std::uint32_t k) {
+  const std::uint32_t lane = threadIdx.x & 31U;
+  const std::uint32_t wave_in_block = threadIdx.x >> 5;
+  const std::uint32_t waves_per_block = blockDim.x >> 5;
+  const std::uint32_t wave_id = blockIdx.x * waves_per_block + wave_in_block;
+  if (wave_id >= total_waves) {
+    return;
+  }
+
+  const std::size_t row = blockIdx.y;
+  const float* const row_logits = logits + (row * vocab_size);
+  const std::size_t total_chunks = (vocab_size + 31U) >> 5;
+  const std::size_t chunks_per_wave =
+      (total_chunks + total_waves - 1U) / total_waves;
+  const std::size_t chunk_begin =
+      static_cast<std::size_t>(wave_id) * chunks_per_wave;
+  const std::size_t chunk_end = chunk_begin + chunks_per_wave < total_chunks
+                                    ? chunk_begin + chunks_per_wave
+                                    : total_chunks;
+
+  std::uint64_t best = 0ULL;
+  if (chunk_begin < chunk_end) {
+    {
+      const std::size_t index = (chunk_begin << 5) + lane;
+      const std::uint64_t key =
+          index < vocab_size ? MtpPackedKey(row_logits[index],
+                                            static_cast<std::uint32_t>(index))
+                             : 0ULL;
+      best = BitonicSort32(key, lane, true);
+    }
+    std::uint64_t kth = ShflLane31U64(best);
+    auto kth_key = static_cast<std::uint32_t>(kth >> 32);
+
+    for (std::size_t chunk = chunk_begin + 1U; chunk < chunk_end; ++chunk) {
+      const std::size_t index = (chunk << 5) + lane;
+      const bool valid = index < vocab_size;
+      const std::uint32_t okey = valid ? MtpOrderKey(row_logits[index]) : 0U;
+      if (__any(valid && okey >= kth_key)) {
+        const std::uint64_t key =
+            valid ? ((static_cast<std::uint64_t>(okey) << 32) |
+                     static_cast<std::uint64_t>(
+                         ~static_cast<std::uint32_t>(index)))
+                  : 0ULL;
+        if (__any(key > kth)) {
+          const std::uint64_t key_asc = BitonicSort32(key, lane, false);
+          const std::uint64_t merged = best > key_asc ? best : key_asc;
+          best = BitonicMergeDesc32(merged, lane);
+          kth = ShflLane31U64(best);
+          kth_key = static_cast<std::uint32_t>(kth >> 32);
+        }
+      }
+    }
+  }
+
+  if constexpr (DirectOutput) {
+    if (lane < k) {
+      const auto id = ~static_cast<std::uint32_t>(best);
+      out[row * k + lane] = {id, row_logits[id]};
+    }
+  } else {
+    partial_keys[((row * total_waves) + wave_id) * 32U + lane] = best;
+  }
+}
+
+// One wave32 per row merges `total_waves` already-descending 32-key partial
+// results using only the 5-step bitonic merge (flipping lane order via shuffle
+// to produce an ascending sequence without re-sorting).
+__global__ void MtpWaveTopKStage2Kernel(
+    const float* __restrict__ logits,
+    const std::uint64_t* __restrict__ partial_keys,
+    MtpTopKCandidate* __restrict__ out, std::size_t vocab_size,
+    std::uint32_t total_waves, std::uint32_t k) {
+  const std::uint32_t lane = threadIdx.x & 31U;
+  const std::size_t row = blockIdx.x;
+  const std::uint64_t* const src =
+      partial_keys + (row * static_cast<std::size_t>(total_waves) * 32U);
+
+  std::uint64_t best = src[lane];
+  std::uint64_t kth = ShflLane31U64(best);
+  for (std::uint32_t wave = 1U; wave < total_waves; ++wave) {
+    const std::uint64_t desc_chunk =
+        src[static_cast<std::size_t>(wave) * 32U + lane];
+    if (__any(desc_chunk > kth)) {
+      const auto rev_lo = static_cast<std::uint32_t>(__shfl(
+          static_cast<std::uint32_t>(desc_chunk), 31 - static_cast<int>(lane)));
+      const auto rev_hi = static_cast<std::uint32_t>(
+          __shfl(static_cast<std::uint32_t>(desc_chunk >> 32),
+                 31 - static_cast<int>(lane)));
+      const std::uint64_t asc_chunk =
+          (static_cast<std::uint64_t>(rev_hi) << 32) | rev_lo;
+      const std::uint64_t merged = best > asc_chunk ? best : asc_chunk;
+      best = BitonicMergeDesc32(merged, lane);
+      kth = ShflLane31U64(best);
+    }
+  }
+
+  if (lane < k) {
+    const auto id = ~static_cast<std::uint32_t>(best);
+    out[row * k + lane] = {id, logits[row * vocab_size + id]};
+  }
+}
+
+}  // namespace
+
+void LaunchMtpRowTopK(const float* logits, MtpTopKCandidate* out,
+                      std::size_t batch_size, std::size_t vocab_size,
+                      std::size_t k, std::span<float> scratch,
+                      hipStream_t stream) {
+  if (batch_size == 0 || vocab_size == 0 || k == 0) {
+    return;
+  }
+  if (logits == nullptr || out == nullptr || k > kMaxMtpRowTopK) {
+    throw std::invalid_argument("invalid MTP row top-k launch");
+  }
+  const auto out_k = static_cast<std::uint32_t>(std::min(k, vocab_size));
+
+  const auto raw_addr = reinterpret_cast<std::uintptr_t>(scratch.data());
+  const std::size_t align_pad =
+      (scratch.data() != nullptr && (raw_addr & 7U) != 0U) ? 1U : 0U;
+  const std::size_t avail_u64 =
+      scratch.size() > align_pad ? (scratch.size() - align_pad) / 2U : 0U;
+  const std::size_t max_waves = avail_u64 / (batch_size * 32U);
+  const std::size_t ideal_waves =
+      std::min<std::size_t>(128U, (vocab_size + 1023U) / 1024U);
+  const std::size_t total_waves = std::min(ideal_waves, max_waves);
+
+  if (vocab_size <= 2048U || total_waves < 2U) {
+    MtpWaveTopKStage1Kernel<true>
+        <<<dim3(1U, static_cast<unsigned>(batch_size)), 32U, 0, stream>>>(
+            logits, nullptr, out, vocab_size, 1U, out_k);
+    return;
+  }
+
+  auto* const partial_keys =
+      reinterpret_cast<std::uint64_t*>(scratch.data() + align_pad);
+  constexpr std::uint32_t kWavesPerBlock = 4U;
+  const auto waves = static_cast<std::uint32_t>(total_waves);
+  const std::uint32_t blocks = (waves + kWavesPerBlock - 1U) / kWavesPerBlock;
+  MtpWaveTopKStage1Kernel<false>
+      <<<dim3(blocks, static_cast<unsigned>(batch_size)), kWavesPerBlock * 32U,
+         0, stream>>>(logits, partial_keys, nullptr, vocab_size, waves, out_k);
+  MtpWaveTopKStage2Kernel<<<static_cast<unsigned>(batch_size), 32U, 0,
+                            stream>>>(logits, partial_keys, out, vocab_size,
+                                      waves, out_k);
+}
+
 std::size_t EstimateGpuSamplingWorkspaceBytes(std::size_t vocab_size,
                                               std::size_t penalty_capacity) {
   GpuSamplingWorkspace workspace;
   workspace.vocab_size = vocab_size;
   workspace.penalty_capacity = penalty_capacity;
   HIP_CHECK(hipcub::DeviceRadixSort::SortPairsDescending(
-      nullptr, workspace.sort_temp_storage_bytes,
-      workspace.adjusted_logits, workspace.sorted_logits,
-      workspace.token_ids, workspace.sorted_token_ids, vocab_size));
+      nullptr, workspace.sort_temp_storage_bytes, workspace.adjusted_logits,
+      workspace.sorted_logits, workspace.token_ids, workspace.sorted_token_ids,
+      vocab_size));
   return workspace.SizeBytes();
 }
 
@@ -1078,8 +1321,7 @@ void AllocateGpuSamplingWorkspace(GpuSamplingWorkspace* workspace,
   try {
     HIP_CHECK(
         hipMalloc(&workspace->adjusted_logits, vocab_size * sizeof(float)));
-    HIP_CHECK(
-        hipMalloc(&workspace->sorted_logits, vocab_size * sizeof(float)));
+    HIP_CHECK(hipMalloc(&workspace->sorted_logits, vocab_size * sizeof(float)));
     HIP_CHECK(
         hipMalloc(&workspace->token_ids, vocab_size * sizeof(std::uint32_t)));
     HIP_CHECK(hipMalloc(&workspace->sorted_token_ids,
@@ -1095,9 +1337,9 @@ void AllocateGpuSamplingWorkspace(GpuSamplingWorkspace* workspace,
     HIP_CHECK(
         hipMalloc(&workspace->speculative_accepted, sizeof(std::uint32_t)));
     HIP_CHECK(hipcub::DeviceRadixSort::SortPairsDescending(
-        nullptr, workspace->sort_temp_storage_bytes,
-        workspace->adjusted_logits, workspace->sorted_logits,
-        workspace->token_ids, workspace->sorted_token_ids, vocab_size));
+        nullptr, workspace->sort_temp_storage_bytes, workspace->adjusted_logits,
+        workspace->sorted_logits, workspace->token_ids,
+        workspace->sorted_token_ids, vocab_size));
     HIP_CHECK(hipMalloc(&workspace->sort_temp_storage,
                         workspace->sort_temp_storage_bytes));
   } catch (...) {
@@ -1200,9 +1442,8 @@ __device__ __forceinline__ void PickLargestKey(std::uint32_t* keys,
       const bool take =
           other_slot != 0xFFFFFFFFU &&
           (own_slot == 0xFFFFFFFFU || other_key > own_key ||
-           (other_key == own_key &&
-            (WithIds ? ids[other_slot] < ids[own_slot]
-                     : other_slot < own_slot)));
+           (other_key == own_key && (WithIds ? ids[other_slot] < ids[own_slot]
+                                             : other_slot < own_slot)));
       if (take) {
         reduce_key[tid] = other_key;
         reduce_slot[tid] = other_slot;
@@ -1251,8 +1492,7 @@ __global__ void SelectBlockCandidatesKernel(
 // The `picks` leading candidates of all blocks, as the head of the sorted row.
 __global__ void MergeBlockCandidatesKernel(
     const float* __restrict__ logits, const std::uint32_t* __restrict__ in_keys,
-    const std::uint32_t* __restrict__ in_ids,
-    float* __restrict__ sorted_logits,
+    const std::uint32_t* __restrict__ in_ids, float* __restrict__ sorted_logits,
     std::uint32_t* __restrict__ sorted_token_ids, std::uint32_t candidates,
     std::uint32_t picks) {
   __shared__ std::uint32_t keys[kSelectBlockKeys];
@@ -1314,8 +1554,7 @@ void LaunchOrderCandidates(GpuSamplingWorkspace* workspace,
         static_cast<std::uint32_t>(picks));
     MergeBlockCandidatesKernel<<<1, kSamplingThreads, 0, stream>>>(
         workspace->adjusted_logits, keys, ids, workspace->sorted_logits,
-        workspace->sorted_token_ids,
-        static_cast<std::uint32_t>(blocks * picks),
+        workspace->sorted_token_ids, static_cast<std::uint32_t>(blocks * picks),
         static_cast<std::uint32_t>(picks));
     return;
   }
@@ -1336,10 +1575,10 @@ void LaunchGPUOrderLeadingLogits(const float* logits,
     throw std::invalid_argument("invalid GPU candidate selection");
   }
   const auto size = workspace->vocab_size;
-  PrepareSamplingKernel<<<
-      static_cast<unsigned>((size + kSamplingThreads - 1) / kSamplingThreads),
-      kSamplingThreads, 0, stream>>>(logits, workspace->adjusted_logits,
-                                     workspace->token_ids, size);
+  PrepareSamplingKernel<<<static_cast<unsigned>((size + kSamplingThreads - 1) /
+                                                kSamplingThreads),
+                          kSamplingThreads, 0, stream>>>(
+      logits, workspace->adjusted_logits, workspace->token_ids, size);
   LaunchOrderCandidates(workspace, size, parameters, stream);
 }
 
@@ -1433,14 +1672,12 @@ void LaunchGPUSpeculativeSampling(
     throw std::invalid_argument("invalid GPU speculative sampling launch");
   }
 
+  HIP_CHECK(hipMemcpyAsync(workspace->draft_candidate_ids, draft_candidate_ids,
+                           draft_candidate_count * sizeof(std::uint32_t),
+                           hipMemcpyHostToDevice, stream));
   HIP_CHECK(hipMemcpyAsync(
-      workspace->draft_candidate_ids, draft_candidate_ids,
-      draft_candidate_count * sizeof(std::uint32_t), hipMemcpyHostToDevice,
-      stream));
-  HIP_CHECK(hipMemcpyAsync(
-      workspace->draft_candidate_probabilities,
-      draft_candidate_probabilities, draft_candidate_count * sizeof(float),
-      hipMemcpyHostToDevice, stream));
+      workspace->draft_candidate_probabilities, draft_candidate_probabilities,
+      draft_candidate_count * sizeof(float), hipMemcpyHostToDevice, stream));
 
   const bool has_penalties = penalty_count > 0;
   const bool needs_ordering =

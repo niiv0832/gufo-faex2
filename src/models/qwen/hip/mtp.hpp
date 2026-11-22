@@ -17,6 +17,8 @@
 #if defined(ENGINE_ENABLE_HIP)
 #include <hip/hip_runtime.h>
 
+#include "src/models/qwen/hip/ops/token.hpp"
+
 namespace gufo::hip {
 
 /// Immutable GPU-visible MTP layer weights. Current GGUF K-quant matrices are
@@ -163,6 +165,11 @@ public:
   /// The draft token of a step that ran without logits: the single-row LM
   /// head pass a step with logits ends with.
   [[nodiscard]] tokenization::TokenId ScoreLast();
+  /// Projects the last hidden state through the LM head and selects the exact
+  /// top `min(k, ScoredVocab())` (token_id, logit) pairs on the GPU without
+  /// downloading the full vocabulary logits or running argmax.
+  void ScoreLastTopK(std::size_t k, std::vector<tokenization::TokenId>* ids,
+                     std::vector<float>* logits);
   /// Most heads one shared pass scores.
   static constexpr std::size_t kMaxSharedScoreRows =
       detail::kMtpMaxSharedScoreRows;
@@ -176,6 +183,15 @@ public:
   /// `keep_logits`, CopyLastLogits() of every head returns its row.
   [[nodiscard]] static std::vector<tokenization::TokenId> ScoreTogether(
       std::span<QwenMtpGpuExecutor* const> heads, bool keep_logits);
+  /// Batched shared LM-head pass plus device top-k selection for all `heads`,
+  /// transferring only `heads.size() * min(k, ScoredVocab())` candidates to
+  /// pinned host memory. When `compute_argmax` is true (mixed greedy/sampled
+  /// cohorts), `argmax_out` also receives each head's finite-only argmax token.
+  static void ScoreTogetherTopK(
+      std::span<QwenMtpGpuExecutor* const> heads, std::size_t k,
+      std::vector<std::vector<tokenization::TokenId>>* batch_ids,
+      std::vector<std::vector<float>>* batch_logits, bool compute_argmax,
+      std::vector<tokenization::TokenId>* argmax_out);
   /// Whether this head holds the rows of a shared score it led: every buffer
   /// of the set, which stays allocated until the head is destroyed.
   [[nodiscard]] bool HoldsSharedScoreWorkspace() const noexcept;
@@ -242,7 +258,9 @@ private:
   float* d_kv_cache_{nullptr};
   void* d_kv_cache_f16_{nullptr};
   float* d_split_k_scratch_{nullptr};
+  std::size_t split_k_scratch_elements_{0};
   std::uint32_t* d_out_token_{nullptr};
+  MtpTopKCandidate* h_topk_pinned_{nullptr};
   // Rows of a shared score, owned by the head that leads it: allocated as
   // one set by EnsureSharedScoreWorkspace.
   void EnsureSharedScoreWorkspace();
@@ -371,11 +389,13 @@ private:
   /// vocabulary its rows score.
   void BeginProposal(std::span<const tokenization::TokenId> prompt_tokens,
                      std::uint32_t count);
-  /// The token of one proposal row from the head's argmax: the argmax itself,
-  /// or a draw from the row's distribution, which is appended to `proposal`.
-  [[nodiscard]] tokenization::TokenId ChooseDraftToken(
-      tokenization::TokenId argmax, float temperature, std::uint64_t* rng_state,
-      speculative::DraftProposal& proposal);
+  /// Draws a sampled draft token from GPU-selected top-k `(ids, logits)` using
+  /// double-precision softmax, appends the distribution to `proposal`, and
+  /// returns the drawn token.
+  [[nodiscard]] tokenization::TokenId ChooseSampledDraftToken(
+      std::span<const tokenization::TokenId> row_ids,
+      std::span<const float> row_logits, float temperature,
+      std::uint64_t* rng_state, speculative::DraftProposal& proposal);
   /// Returns an empty proposal for a target-only step (the runner then
   /// appends the committed token, advancing the MTP cache).
   [[nodiscard]] speculative::DraftProposal SkipDraft(

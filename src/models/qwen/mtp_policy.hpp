@@ -17,6 +17,25 @@ namespace gufo::speculative {
 // wider row only brings the draft closer to the target's top-k distribution.
 inline constexpr std::size_t kMtpSampledTopK = 32;
 
+// Renormalized double-precision softmax at `temperature` over the `k` highest
+// logits (descending, as returned by MtpTopKDistribution or LaunchMtpRowTopK).
+inline void MtpTopKSoftmax(std::span<const float> best_logits,
+                           float temperature, std::vector<float>* probs) {
+  const std::size_t k = best_logits.size();
+  probs->resize(k);
+  if (k == 0)
+    return;
+  const double top = best_logits[0];
+  std::vector<double> weights(k);
+  double sum = 0.0;
+  for (std::size_t i = 0; i < k; ++i) {
+    weights[i] = std::exp((best_logits[i] - top) / temperature);
+    sum += weights[i];
+  }
+  for (std::size_t i = 0; i < k; ++i)
+    (*probs)[i] = static_cast<float>(weights[i] / sum);
+}
+
 // The k highest logits (descending) and their softmax at `temperature`,
 // renormalized over the kept ids in double precision.
 inline void MtpTopKDistribution(std::span<const float> logits,
@@ -25,38 +44,31 @@ inline void MtpTopKDistribution(std::span<const float> logits,
                                 std::vector<float>* probs) {
   k = std::min(k, logits.size());
   // One pass with the k best so far, kept in descending order (ties: the
-  // lower id first). Almost every logit fails the single comparison against
-  // the current k-th value, so a row of the full vocabulary costs one scan
-  // rather than a sort of its ids. Equal logits keep the earlier id, as ids
-  // are visited in ascending order.
+  // lower id first; NaN sorts below -inf). Almost every logit fails the single
+  // comparison against the current k-th value, so a row of the full vocabulary
+  // costs one scan rather than a sort of its ids. Equal logits keep the earlier
+  // id, as ids are visited in ascending order.
   ids->resize(k);
   std::vector<float>& best = *probs;
   best.resize(k);
+  const auto beats = [](float candidate, float current) {
+    return !std::isnan(candidate) &&
+           (std::isnan(current) || candidate > current);
+  };
   std::size_t kept = 0;
   for (std::size_t id = 0; id < logits.size() && k != 0; ++id) {
     const float value = logits[id];
-    if (kept == k && !(value > best[k - 1]))
+    if (kept == k && !beats(value, best[k - 1]))
       continue;
     std::size_t slot = kept < k ? kept++ : k - 1;
-    for (; slot != 0 && value > best[slot - 1]; --slot) {
+    for (; slot != 0 && beats(value, best[slot - 1]); --slot) {
       best[slot] = best[slot - 1];
       (*ids)[slot] = (*ids)[slot - 1];
     }
     best[slot] = value;
     (*ids)[slot] = static_cast<tokenization::TokenId>(id);
   }
-  probs->resize(k);
-  if (k == 0)
-    return;
-  const double top = best[0];
-  std::vector<double> weights(k);
-  double sum = 0.0;
-  for (std::size_t i = 0; i < k; ++i) {
-    weights[i] = std::exp((best[i] - top) / temperature);
-    sum += weights[i];
-  }
-  for (std::size_t i = 0; i < k; ++i)
-    (*probs)[i] = static_cast<float>(weights[i] / sum);
+  MtpTopKSoftmax(std::span<const float>(best).first(k), temperature, probs);
 }
 
 // Inverse-CDF draw from one candidate row; never returns a zero-probability id.

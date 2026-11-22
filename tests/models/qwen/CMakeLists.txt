@@ -225,6 +225,13 @@ if (ENGINE_ENABLE_HIP)
     tests/models/qwen/hip/sampled_verify_ops_test.cpp
     "hip;gpu;kernels;qwen;sampling;speculative")
 
+  # GPU top-k draft distribution helper (LaunchMtpRowTopK + MtpTopKSoftmax)
+  # matches CPU MtpTopKDistribution bit for bit across edge cases and HIP graph
+  # replay.
+  add_qwen_hip_test(qwen_mtp_topk_ops_test
+    tests/models/qwen/hip/mtp_topk_ops_test.cpp
+    "hip;gpu;kernels;qwen;mtp;sampling;speculative")
+
   # Sampled MTP speculation as one chain on real weights: the reported draft
   # row, its token ids, the device verifier and the committed history against
   # ordinary decoding and an independent reference. Skipped without the model.

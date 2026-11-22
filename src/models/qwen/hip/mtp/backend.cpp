@@ -195,24 +195,15 @@ void QwenMtpGpuDraftBackend::BeginProposal(
                                       prompt_tokens, draft_vocab.listed));
 }
 
-tokenization::TokenId QwenMtpGpuDraftBackend::ChooseDraftToken(
-    tokenization::TokenId argmax, float temperature, std::uint64_t* rng_state,
-    speculative::DraftProposal& proposal) {
-  if (!(temperature > 0.0F)) {
-    return argmax;
-  }
+tokenization::TokenId QwenMtpGpuDraftBackend::ChooseSampledDraftToken(
+    std::span<const tokenization::TokenId> row_ids,
+    std::span<const float> row_logits, float temperature,
+    std::uint64_t* rng_state, speculative::DraftProposal& proposal) {
   // Each sampled row is the distribution actually drawn from, conditional on
   // the earlier sampled tokens fed back into the MTP layer.
-  proposal.candidates_per_token = std::min<std::size_t>(
-      speculative::kMtpSampledTopK, executor_->ScoredVocab());
-  std::vector<tokenization::TokenId> row_ids;
+  proposal.candidates_per_token = row_ids.size();
   std::vector<float> row_probs;
-  const auto logits = executor_->CopyLastLogits();
-  speculative::MtpTopKDistribution(
-      logits, temperature, proposal.candidates_per_token, &row_ids, &row_probs);
-  for (auto& id : row_ids) {
-    id = executor_->ScoredTokenId(static_cast<std::size_t>(id));
-  }
+  speculative::MtpTopKSoftmax(row_logits, temperature, &row_probs);
   proposal.candidate_ids.insert(proposal.candidate_ids.end(), row_ids.begin(),
                                 row_ids.end());
   proposal.candidate_probabilities.insert(
@@ -235,16 +226,34 @@ speculative::DraftProposal QwenMtpGpuDraftBackend::ProposeImpl(
     return proposal;
   }
   BeginProposal(prompt_tokens, count);
-  auto token = ChooseDraftToken(
-      executor_->ForwardTargetHidden(proposal_input_, target_hidden_,
-                                     proposal_checkpoint_, true),
-      temperature, rng_state, proposal);
-  proposed_tokens_.push_back(token);
-  for (std::uint32_t index = 1; index < count; ++index) {
-    token = ChooseDraftToken(
-        executor_->ForwardFeedback(token, proposal_checkpoint_ + index, true),
-        temperature, rng_state, proposal);
+  if (!(temperature > 0.0F)) {
+    auto token = executor_->ForwardTargetHidden(proposal_input_, target_hidden_,
+                                                proposal_checkpoint_, true);
     proposed_tokens_.push_back(token);
+    for (std::uint32_t index = 1; index < count; ++index) {
+      token =
+          executor_->ForwardFeedback(token, proposal_checkpoint_ + index, true);
+      proposed_tokens_.push_back(token);
+    }
+  } else {
+    std::vector<tokenization::TokenId> row_ids;
+    std::vector<float> row_logits;
+    (void)executor_->ForwardTargetHidden(proposal_input_, target_hidden_,
+                                         proposal_checkpoint_, false);
+    executor_->ScoreLastTopK(speculative::kMtpSampledTopK, &row_ids,
+                             &row_logits);
+    auto token = ChooseSampledDraftToken(row_ids, row_logits, temperature,
+                                         rng_state, proposal);
+    proposed_tokens_.push_back(token);
+    for (std::uint32_t index = 1; index < count; ++index) {
+      (void)executor_->ForwardFeedback(token, proposal_checkpoint_ + index,
+                                       false);
+      executor_->ScoreLastTopK(speculative::kMtpSampledTopK, &row_ids,
+                               &row_logits);
+      token = ChooseSampledDraftToken(row_ids, row_logits, temperature,
+                                      rng_state, proposal);
+      proposed_tokens_.push_back(token);
+    }
   }
   proposal.tokens = proposed_tokens_;
   proposal_active_ = true;
@@ -319,13 +328,16 @@ std::vector<speculative::DraftProposal> QwenMtpGpuDraftBackend::ProposeBatch(
   }
   std::vector<bool> scored(requests.size(), false);
   std::vector<tokenization::TokenId> argmax(requests.size());
+  std::vector<std::vector<tokenization::TokenId>> topk_ids(requests.size());
+  std::vector<std::vector<float>> topk_logits(requests.size());
   for (std::size_t first = 0; first < requests.size(); ++first) {
     if (scored[first])
       continue;
     // The sessions that score the vocabulary of `first`.
     std::vector<std::size_t> members;
     std::vector<QwenMtpGpuExecutor*> heads;
-    bool keep_logits = false;
+    bool any_sampled = false;
+    bool any_greedy = false;
     const std::size_t vocabulary = backends[first]->executor_->ScoredVocab();
     for (std::size_t index = first; index < requests.size(); ++index) {
       if (scored[index] ||
@@ -334,21 +346,50 @@ std::vector<speculative::DraftProposal> QwenMtpGpuDraftBackend::ProposeBatch(
       scored[index] = true;
       members.push_back(index);
       heads.push_back(backends[index]->executor_.get());
-      keep_logits = keep_logits || requests[index].temperature > 0.0F;
+      if (requests[index].temperature > 0.0F) {
+        any_sampled = true;
+      } else {
+        any_greedy = true;
+      }
     }
     if (members.size() == 1) {
-      argmax[first] = heads.front()->ScoreLast();
+      if (any_sampled) {
+        heads.front()->ScoreLastTopK(speculative::kMtpSampledTopK,
+                                     &topk_ids[first], &topk_logits[first]);
+      } else {
+        argmax[first] = heads.front()->ScoreLast();
+      }
       continue;
     }
-    const auto tokens = QwenMtpGpuExecutor::ScoreTogether(heads, keep_logits);
-    for (std::size_t member = 0; member < members.size(); ++member)
-      argmax[members[member]] = tokens[member];
+    if (!any_sampled) {
+      const auto tokens = QwenMtpGpuExecutor::ScoreTogether(heads, false);
+      for (std::size_t member = 0; member < members.size(); ++member)
+        argmax[members[member]] = tokens[member];
+      continue;
+    }
+    std::vector<std::vector<tokenization::TokenId>> group_ids;
+    std::vector<std::vector<float>> group_logits;
+    std::vector<tokenization::TokenId> group_argmax;
+    QwenMtpGpuExecutor::ScoreTogetherTopK(heads, speculative::kMtpSampledTopK,
+                                          &group_ids, &group_logits, any_greedy,
+                                          any_greedy ? &group_argmax : nullptr);
+    for (std::size_t member = 0; member < members.size(); ++member) {
+      const std::size_t slot = members[member];
+      topk_ids[slot] = std::move(group_ids[member]);
+      topk_logits[slot] = std::move(group_logits[member]);
+      if (any_greedy) {
+        argmax[slot] = group_argmax[member];
+      }
+    }
   }
   for (std::size_t index = 0; index < requests.size(); ++index) {
     auto& backend = *backends[index];
-    const auto token =
-        backend.ChooseDraftToken(argmax[index], requests[index].temperature,
-                                 requests[index].rng_state, proposals[index]);
+    const auto token = requests[index].temperature > 0.0F
+                           ? backend.ChooseSampledDraftToken(
+                                 topk_ids[index], topk_logits[index],
+                                 requests[index].temperature,
+                                 requests[index].rng_state, proposals[index])
+                           : argmax[index];
     backend.proposed_tokens_.push_back(token);
     proposals[index].tokens = backend.proposed_tokens_;
     backend.proposal_active_ = true;

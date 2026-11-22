@@ -157,6 +157,26 @@ void LaunchBatchedGPUArgmax(const float* logits, std::uint32_t* out_tokens,
                             std::span<float> scratch,
                             hipStream_t stream = nullptr);
 
+/// One (scored_index, logit) pair selected by LaunchMtpRowTopK.
+struct MtpTopKCandidate {
+  std::uint32_t id;
+  float logit;
+};
+static_assert(sizeof(MtpTopKCandidate) == 8);
+
+inline constexpr std::size_t kMaxMtpRowTopK = 32;
+
+/// Selects the exact top `min(k, vocab_size)` entries per row of a
+/// `[batch_size, vocab_size]` logits matrix in descending order (ties,
+/// including -0.0F and +0.0F, resolve toward the lower index; NaN sorts below
+/// -inf), matching `speculative::MtpTopKDistribution` bit for bit.
+/// `out` holds `batch_size * min(k, vocab_size)` candidates. `scratch` is
+/// caller-owned reusable device memory (no allocations; HIP-graph safe).
+void LaunchMtpRowTopK(const float* logits, MtpTopKCandidate* out,
+                      std::size_t batch_size, std::size_t vocab_size,
+                      std::size_t k, std::span<float> scratch,
+                      hipStream_t stream = nullptr);
+
 /// Batched Embedding lookup for B tokens
 void LaunchBatchedEmbeddingLookup(const void* table, core::GgmlType type,
                                   const std::uint32_t* token_ids,

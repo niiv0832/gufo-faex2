@@ -133,10 +133,17 @@ void QwenMtpGpuExecutor::Allocate() {
     AllocateBuffer(d_kv_cache_, 2 * total_kv);
   d_kv_cache_f16_ =
       detail::AllocateDevice(2 * total_kv * sizeof(std::uint16_t));
-  AllocateBuffer(d_split_k_scratch_,
-                 detail::DecodeAttentionScratchElements(
-                     config.num_attention_heads, config.head_dim));
+  split_k_scratch_elements_ = detail::DecodeAttentionScratchElements(
+      config.num_attention_heads, config.head_dim);
+  AllocateBuffer(d_split_k_scratch_, split_k_scratch_elements_);
   AllocateBuffer(d_out_token_, 1);
+  const auto pinned_error =
+      hipHostMalloc(&h_topk_pinned_, kMaxSharedScoreRows * kMaxMtpRowTopK *
+                                         sizeof(MtpTopKCandidate));
+  if (pinned_error != hipSuccess) {
+    throw std::runtime_error(std::string("MTP top-k host buffer failed: ") +
+                             hipGetErrorString(pinned_error));
+  }
 }
 
 void QwenMtpGpuExecutor::Free() noexcept {
@@ -171,6 +178,11 @@ void QwenMtpGpuExecutor::Free() noexcept {
   free_buffer(d_prime_tokens_);
   free_buffer(d_prime_buffer_);
   free_buffer(d_prime_bf16_);
+  if (h_topk_pinned_ != nullptr) {
+    (void)hipHostFree(h_topk_pinned_);
+    h_topk_pinned_ = nullptr;
+  }
+  split_k_scratch_elements_ = 0;
   if (stream_ != nullptr) {
     (void)hipStreamDestroy(stream_);
     stream_ = nullptr;
@@ -350,6 +362,53 @@ tokenization::TokenId QwenMtpGpuExecutor::ScoreLast() {
   return ScoredTokenId(CheckedSampleToken(result, scored));
 }
 
+void QwenMtpGpuExecutor::ScoreLastTopK(std::size_t k,
+                                       std::vector<tokenization::TokenId>* ids,
+                                       std::vector<float>* logits) {
+  if (ids == nullptr || logits == nullptr) {
+    throw std::invalid_argument("MTP top-k output vectors are required");
+  }
+  const auto& weights = model_->GetWeights();
+  const auto& config = weights.config;
+  const std::size_t hidden = config.hidden_size;
+  const std::size_t scored = ScoredVocab();
+  const auto& head = scored == config.vocab_size
+                         ? weights.output
+                         : model_->GetDraftVocab().output;
+  host_logits_ready_ = false;
+  LaunchGEMV(head.data, head.type, d_feedback_hidden_, d_logits_, scored,
+             hidden, stream_, models::qwen::QwenGemmMode::kHipMtp);
+  const std::size_t out_k = std::min({k, scored, kMaxMtpRowTopK});
+  if (out_k == 0) {
+    ids->clear();
+    logits->clear();
+    HIP_CHECK(hipStreamSynchronize(stream_));
+    return;
+  }
+  const std::size_t out_floats = out_k * 2;
+  if (split_k_scratch_elements_ < out_floats) {
+    throw std::logic_error("MTP split-k scratch is smaller than top-k output");
+  }
+  // Attention scratch is dead after the MTP layer finishes; reuse it for the
+  // compact top-k output and Wave32 partial keys with zero extra allocations.
+  auto* const d_out = reinterpret_cast<MtpTopKCandidate*>(d_split_k_scratch_);
+  const std::span<float> scratch(d_split_k_scratch_ + out_floats,
+                                 split_k_scratch_elements_ - out_floats);
+  LaunchMtpRowTopK(d_logits_, d_out, 1, scored, out_k, scratch, stream_);
+  const auto copy_error =
+      hipMemcpyAsync(h_topk_pinned_, d_out, out_k * sizeof(MtpTopKCandidate),
+                     hipMemcpyDeviceToHost, stream_);
+  if (copy_error != hipSuccess || hipStreamSynchronize(stream_) != hipSuccess) {
+    throw std::runtime_error("MTP GPU top-k synchronization failed");
+  }
+  ids->resize(out_k);
+  logits->resize(out_k);
+  for (std::size_t i = 0; i < out_k; ++i) {
+    (*ids)[i] = ScoredTokenId(h_topk_pinned_[i].id);
+    (*logits)[i] = h_topk_pinned_[i].logit;
+  }
+}
+
 void QwenMtpGpuExecutor::FinishStep() {
   HIP_CHECK(hipStreamSynchronize(stream_));
 }
@@ -412,6 +471,95 @@ std::vector<tokenization::TokenId> QwenMtpGpuExecutor::ScoreTogether(
     tokens[row] = lead.ScoredTokenId(CheckedSampleToken(raw[row], scored));
   }
   return tokens;
+}
+
+void QwenMtpGpuExecutor::ScoreTogetherTopK(
+    std::span<QwenMtpGpuExecutor* const> heads, std::size_t k,
+    std::vector<std::vector<tokenization::TokenId>>* batch_ids,
+    std::vector<std::vector<float>>* batch_logits, bool compute_argmax,
+    std::vector<tokenization::TokenId>* argmax_out) {
+  if (heads.size() < 2 || heads.size() > kMaxSharedScoreRows) {
+    throw std::invalid_argument("MTP shared score takes two to eight heads");
+  }
+  if (batch_ids == nullptr || batch_logits == nullptr ||
+      (compute_argmax && argmax_out == nullptr)) {
+    throw std::invalid_argument("MTP shared top-k outputs are required");
+  }
+  QwenMtpGpuExecutor& lead = *heads.front();
+  const auto& weights = lead.model_->GetWeights();
+  const auto& config = weights.config;
+  const std::size_t hidden = config.hidden_size;
+  const std::size_t scored = lead.ScoredVocab();
+  for (QwenMtpGpuExecutor* const head : heads) {
+    if (head->model_ != lead.model_ || head->ScoredVocab() != scored ||
+        !head->SupportsSharedScore()) {
+      throw std::invalid_argument("MTP shared score mixes head configurations");
+    }
+  }
+  lead.EnsureSharedScoreWorkspace();
+  for (std::size_t row = 0; row < heads.size(); ++row) {
+    HIP_CHECK(hipMemcpyAsync(
+        lead.d_shared_hidden_ + (row * hidden), heads[row]->d_feedback_hidden_,
+        hidden * sizeof(float), hipMemcpyDeviceToDevice, lead.stream_));
+  }
+  const auto& output = scored == config.vocab_size
+                           ? weights.output
+                           : lead.model_->GetDraftVocab().output;
+  LaunchBatchedQuantGEMMFp32(output.type, output.data, lead.d_shared_hidden_,
+                             lead.d_shared_logits_, heads.size(), scored,
+                             hidden, lead.stream_);
+  const std::size_t out_k = std::min({k, scored, kMaxMtpRowTopK});
+  const std::size_t out_floats = heads.size() * out_k * 2;
+  if (out_k > 0) {
+    if (lead.split_k_scratch_elements_ < out_floats) {
+      throw std::logic_error(
+          "MTP split-k scratch is smaller than batched top-k output");
+    }
+    auto* const d_out =
+        reinterpret_cast<MtpTopKCandidate*>(lead.d_split_k_scratch_);
+    const std::span<float> scratch(lead.d_split_k_scratch_ + out_floats,
+                                   lead.split_k_scratch_elements_ - out_floats);
+    LaunchMtpRowTopK(lead.d_shared_logits_, d_out, heads.size(), scored, out_k,
+                     scratch, lead.stream_);
+    HIP_CHECK(hipMemcpyAsync(lead.h_topk_pinned_, d_out,
+                             heads.size() * out_k * sizeof(MtpTopKCandidate),
+                             hipMemcpyDeviceToHost, lead.stream_));
+  }
+  std::vector<std::uint32_t> raw;
+  if (compute_argmax) {
+    LaunchBatchedGPUArgmax(
+        lead.d_shared_logits_, lead.d_shared_tokens_, heads.size(), scored,
+        std::span<float>(lead.d_ffn_out_, hidden), lead.stream_);
+    raw.resize(heads.size());
+    HIP_CHECK(hipMemcpyAsync(raw.data(), lead.d_shared_tokens_,
+                             raw.size() * sizeof(std::uint32_t),
+                             hipMemcpyDeviceToHost, lead.stream_));
+  }
+  for (std::size_t row = 0; row < heads.size(); ++row) {
+    heads[row]->host_logits_ready_ = false;
+  }
+  HIP_CHECK(hipStreamSynchronize(lead.stream_));
+
+  batch_ids->resize(heads.size());
+  batch_logits->resize(heads.size());
+  for (std::size_t row = 0; row < heads.size(); ++row) {
+    auto& row_ids = (*batch_ids)[row];
+    auto& row_logits = (*batch_logits)[row];
+    row_ids.resize(out_k);
+    row_logits.resize(out_k);
+    const MtpTopKCandidate* const src = lead.h_topk_pinned_ + (row * out_k);
+    for (std::size_t i = 0; i < out_k; ++i) {
+      row_ids[i] = lead.ScoredTokenId(src[i].id);
+      row_logits[i] = src[i].logit;
+    }
+  }
+  if (compute_argmax) {
+    argmax_out->resize(heads.size());
+    for (std::size_t row = 0; row < heads.size(); ++row) {
+      (*argmax_out)[row] =
+          lead.ScoredTokenId(CheckedSampleToken(raw[row], scored));
+    }
+  }
 }
 
 bool QwenMtpGpuExecutor::HoldsSharedScoreWorkspace() const noexcept {
