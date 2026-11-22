@@ -33,6 +33,20 @@ void LaunchMoeRouterLogits(const void* router, core::GgmlType router_type,
                            std::size_t hidden, hipStream_t stream = nullptr,
                            std::size_t rows = 1);
 
+/// Fused router logits + softmax + top-k + renormalization + shared sigmoid in
+/// one launch per row chunk, bit-identical to LaunchMoeRouterLogits followed by
+/// LaunchMoeRouterTopK. `sync_counters` must point to `sync_capacity` (>= 1)
+/// zero-initialized device uint32s; the kernel self-resets each counter before
+/// returning, making it safe for repeated launches and HIP graph replay. Falls
+/// back to the two-kernel sequence for unsupported shapes or null counters.
+void LaunchMoeFusedRouterTopK(
+    const void* router, core::GgmlType router_type, const void* shared,
+    core::GgmlType shared_type, const float* x, float* router_logits,
+    float* shared_logit, std::int32_t* expert_ids, float* expert_weights,
+    float* shared_weight, std::uint32_t* sync_counters,
+    std::size_t sync_capacity, std::size_t experts, std::size_t used,
+    std::size_t hidden, std::size_t rows = 1, hipStream_t stream = nullptr);
+
 /// out[r] = [a[r], b[r]] for rows of `cols` floats.
 void LaunchConcatRows(const float* a, const float* b, float* out,
                       std::size_t rows, std::size_t cols,

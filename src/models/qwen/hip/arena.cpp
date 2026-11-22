@@ -855,6 +855,8 @@ QwenGpuArena::QwenGpuArena(const core::ModelConfig& config,
       moe.shared_up = take(kRows * shared_ff);
       moe.shared_act = take(kRows * shared_ff);
       moe.shared_out = take(kRows * hidden_size);
+      moe.router_sync = reinterpret_cast<std::uint32_t*>(take(8));
+      HIP_CHECK(hipMemset(moe.router_sync, 0, 8 * sizeof(std::uint32_t)));
 
       const std::size_t rows = batch;
       const std::size_t sff = shared_ff;

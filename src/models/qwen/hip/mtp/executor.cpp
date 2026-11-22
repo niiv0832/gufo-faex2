@@ -125,6 +125,8 @@ void QwenMtpGpuExecutor::Allocate() {
     moe_.shared_up = take(shared_ff);
     moe_.shared_act = take(shared_ff);
     moe_.shared_out = take(hidden);
+    moe_.router_sync = reinterpret_cast<std::uint32_t*>(take(8));
+    HIP_CHECK(hipMemset(moe_.router_sync, 0, 8 * sizeof(std::uint32_t)));
   }
   AllocateBuffer(d_ffn_out_, hidden);
   AllocateBuffer(d_feedback_hidden_, hidden);

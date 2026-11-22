@@ -114,16 +114,13 @@ void LaunchMoeFfnRows(const models::QwenLayerWeights& layer,
   const int hidden = static_cast<int>(config.hidden_size);
   const std::size_t shared_ff = config.shared_expert_ff;
   hipStream_t stream = arena.stream;
-  // The same GEMV kernel as single-token decode, one grid row per input row,
-  // so a row routes exactly as it would alone.
-  LaunchMoeRouterLogits(layer.ffn_gate_inp.data, layer.ffn_gate_inp.type,
-                        layer.ffn_gate_inp_shexp.data,
-                        layer.ffn_gate_inp_shexp.type, x, s.router_logits,
-                        s.shared_logit, experts, hidden, stream, rows);
-  LaunchMoeRouterTopK(s.router_logits, s.shared_logit, s.ids, s.weights,
-                      s.shared_weight, static_cast<std::uint32_t>(experts),
-                      static_cast<std::uint32_t>(used),
-                      static_cast<std::uint32_t>(rows), stream);
+  // Fused router GEMV + top-k keeps each row bit-identical to single-token
+  // decode while sharing router weight reads across rows.
+  LaunchMoeFusedRouterTopK(
+      layer.ffn_gate_inp.data, layer.ffn_gate_inp.type,
+      layer.ffn_gate_inp_shexp.data, layer.ffn_gate_inp_shexp.type, x,
+      s.router_logits, s.shared_logit, s.ids, s.weights, s.shared_weight,
+      s.router_sync, 8, experts, used, hidden, rows, stream);
   if (s.skew != nullptr) {
     LaunchMoeSkewRecord(*s.skew, layer_index, rows, s.ids, s.weights, stream);
   }

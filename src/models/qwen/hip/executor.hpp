@@ -332,6 +332,10 @@ struct QwenMoeScratch {
   float* shared_up{nullptr};
   float* shared_act{nullptr};
   float* shared_out{nullptr};
+  /// Zero-initialized atomic completion counters (at least 8 u32s) carved from
+  /// the MoE buffer tail for single-launch fused router + top-k; each launch
+  /// self-resets its counters to zero before exiting.
+  std::uint32_t* router_sync{nullptr};
   /// GUFO_QWEN_MOE_SKEW=1 recording buffers; null (and never launched)
   /// when the diagnostic flag is unset (W0.4).
   const QwenMoeSkewDevice* skew{nullptr};

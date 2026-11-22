@@ -2,6 +2,7 @@
 #include <hip/hip_bfloat16.h>
 #include <hip/hip_runtime.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -200,7 +201,8 @@ __global__ void MoeCombineResidualAddRMSNormKernel(
   for (std::size_t i = tid; i < hidden; i += blockDim.x) {
     float sum = 0.0F;
     for (std::uint32_t s = 0; s < used; ++s) {
-      sum += slot_weight[s] * slot_out[static_cast<std::size_t>(s) * hidden + i];
+      sum +=
+          slot_weight[s] * slot_out[static_cast<std::size_t>(s) * hidden + i];
     }
     const float ffn = sum + shared_weight[0] * shared_out[i];
     const float val = a[i] + ffn;
@@ -304,6 +306,485 @@ __global__ void MoeRouterLogitsKernel(
   if (threadIdx.x == 0) {
     const float r = 0.0F;
     (is_shared ? shared_logit[0] : router_logits[m]) = sum + r;
+  }
+}
+
+template<int Offset = 16>
+__device__ __forceinline__ float ReduceWaveXor(float value) {
+  const int other = __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, value),
+                                                (Offset << 10) | 31);
+  const float sum = value + __builtin_bit_cast(float, other);
+  if constexpr (Offset > 1) {
+    return ReduceWaveXor<Offset / 2>(sum);
+  }
+  return sum;
+}
+
+template<int Offset = 16>
+__device__ __forceinline__ float ReduceWaveMax(float value) {
+  const int other = __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, value),
+                                                (Offset << 10) | 31);
+  const float peak = fmaxf(value, __builtin_bit_cast(float, other));
+  if constexpr (Offset > 1) {
+    return ReduceWaveMax<Offset / 2>(peak);
+  }
+  return peak;
+}
+
+template<int Offset = 16>
+__device__ __forceinline__ void ReduceWaveBest(float& best,
+                                               std::int32_t& best_e) {
+  const float other = __builtin_bit_cast(
+      float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, best),
+                                         (Offset << 10) | 31));
+  const std::int32_t other_e =
+      __builtin_amdgcn_ds_swizzle(best_e, (Offset << 10) | 31);
+  if (other > best || (other == best && other_e < best_e)) {
+    best = other;
+    best_e = other_e;
+  }
+  if constexpr (Offset > 1) {
+    ReduceWaveBest<Offset / 2>(best, best_e);
+  }
+}
+
+// Single-wave register softmax + top-k + renormalization + shared sigmoid for
+// num_experts <= 256 and num_used <= MaxUsed. Each lane holds 8 experts
+// (e = 32 * w + lane), reproducing MoeRouterTopKKernel's exact per-warp
+// reduction and sequential w = 0..7 combine order bit for bit with zero LDS.
+template<int MaxUsed = 8>
+__device__ __forceinline__ void Wave32TopK256(
+    const float* __restrict__ row_logits, float shared_logit_val,
+    std::int32_t* __restrict__ expert_ids, float* __restrict__ expert_weights,
+    float* __restrict__ shared_weight, std::uint32_t num_experts,
+    std::uint32_t num_used) {
+  const std::uint32_t lane = threadIdx.x & 31U;
+  float p[8];
+  float peak = -INFINITY;
+#pragma unroll
+  for (int w = 0; w < 8; ++w) {
+    const std::uint32_t e = (static_cast<std::uint32_t>(w) << 5) + lane;
+    const float v = e < num_experts
+                        ? __hip_atomic_load(&row_logits[e], __ATOMIC_RELAXED,
+                                            __HIP_MEMORY_SCOPE_AGENT)
+                        : -INFINITY;
+    p[w] = v;
+    const float wm = ReduceWaveMax<16>(v);
+    peak = (w == 0) ? wm : fmaxf(peak, wm);
+  }
+
+  float total = 0.0F;
+#pragma unroll
+  for (int w = 0; w < 8; ++w) {
+    const std::uint32_t e = (static_cast<std::uint32_t>(w) << 5) + lane;
+    float v = 0.0F;
+    if (e < num_experts) {
+      v = expf(p[w] - peak);
+      p[w] = v;
+    } else {
+      p[w] = -1.0F;
+    }
+    total += ReduceWaveXor<16>(v);
+  }
+
+#pragma unroll
+  for (int w = 0; w < 8; ++w) {
+    const std::uint32_t e = (static_cast<std::uint32_t>(w) << 5) + lane;
+    if (e < num_experts) {
+      p[w] /= total;
+    }
+  }
+
+  float pick_v[MaxUsed];
+  std::int32_t pick_e[MaxUsed];
+  const std::uint32_t cap = num_used < static_cast<std::uint32_t>(MaxUsed)
+                                ? num_used
+                                : static_cast<std::uint32_t>(MaxUsed);
+  for (std::uint32_t k = 0; k < cap; ++k) {
+    float best = -1.0F;
+    std::int32_t best_e = 0x7fffffff;
+#pragma unroll
+    for (int w = 0; w < 8; ++w) {
+      const std::uint32_t e = (static_cast<std::uint32_t>(w) << 5) + lane;
+      if (e < num_experts) {
+        const float v = p[w];
+        if (v > best || (v == best && static_cast<std::int32_t>(e) < best_e)) {
+          best = v;
+          best_e = static_cast<std::int32_t>(e);
+        }
+      }
+    }
+    ReduceWaveBest<16>(best, best_e);
+    pick_v[k] = best;
+    pick_e[k] = best_e;
+    if (best_e >= 0 && (static_cast<std::uint32_t>(best_e) & 31U) == lane) {
+      const int win_w =
+          static_cast<int>(static_cast<std::uint32_t>(best_e) >> 5);
+#pragma unroll
+      for (int w = 0; w < 8; ++w) {
+        if (w == win_w) {
+          p[w] = -1.0F;
+        }
+      }
+    }
+  }
+
+  if (lane == 0) {
+    float selected_sum = 0.0F;
+    for (std::uint32_t k = 0; k < cap; ++k) {
+      selected_sum += pick_v[k];
+    }
+    const float inv = selected_sum > 0.0F ? 1.0F / selected_sum : 0.0F;
+    for (std::uint32_t k = 0; k < cap; ++k) {
+      expert_ids[k] = pick_e[k];
+      expert_weights[k] = pick_v[k] * inv;
+    }
+    shared_weight[0] = 1.0F / (1.0F + expf(-shared_logit_val));
+  }
+}
+
+template<int B, bool IsBf16>
+__device__ __forceinline__ void AccumulateSingleRow(const void* A,
+                                                    const float* bx,
+                                                    std::size_t K,
+                                                    std::uint32_t tid,
+                                                    float (&out_dot)[B]) {
+  if constexpr (IsBf16) {
+    const auto* row = static_cast<const hip_bfloat16*>(A);
+    const std::size_t k_vec = K / 8;
+    const auto* row_vec = reinterpret_cast<const uint4*>(row);
+    for (std::size_t vi = tid; vi < k_vec; vi += 256U) {
+      const uint4 v = row_vec[vi];
+      const auto* vals = reinterpret_cast<const hip_bfloat16*>(&v);
+      const std::size_t k = vi * 8;
+#pragma unroll
+      for (int r = 0; r < B; ++r) {
+        const float* xr = bx + (static_cast<std::size_t>(r) * K) + k;
+        const float4 x0 = *reinterpret_cast<const float4*>(xr);
+        const float4 x1 = *reinterpret_cast<const float4*>(xr + 4);
+        out_dot[r] += (static_cast<float>(vals[0]) * x0.x) +
+                      (static_cast<float>(vals[1]) * x0.y) +
+                      (static_cast<float>(vals[2]) * x0.z) +
+                      (static_cast<float>(vals[3]) * x0.w) +
+                      (static_cast<float>(vals[4]) * x1.x) +
+                      (static_cast<float>(vals[5]) * x1.y) +
+                      (static_cast<float>(vals[6]) * x1.z) +
+                      (static_cast<float>(vals[7]) * x1.w);
+      }
+    }
+    for (std::size_t k = (k_vec * 8) + tid; k < K; k += 256U) {
+      const float w = static_cast<float>(row[k]);
+#pragma unroll
+      for (int r = 0; r < B; ++r) {
+        out_dot[r] += w * bx[(static_cast<std::size_t>(r) * K) + k];
+      }
+    }
+  } else {
+    const auto* row = static_cast<const float*>(A);
+    const std::size_t k_vec = K / 4;
+    const auto* row_vec = reinterpret_cast<const float4*>(row);
+    for (std::size_t vi = tid; vi < k_vec; vi += 256U) {
+      const float4 v = row_vec[vi];
+      const std::size_t k = vi * 4;
+#pragma unroll
+      for (int r = 0; r < B; ++r) {
+        const float4 xv = *reinterpret_cast<const float4*>(
+            &bx[(static_cast<std::size_t>(r) * K) + k]);
+        out_dot[r] += (v.x * xv.x) + (v.y * xv.y) + (v.z * xv.z) + (v.w * xv.w);
+      }
+    }
+    for (std::size_t k = (k_vec * 4) + tid; k < K; k += 256U) {
+      const float w = row[k];
+#pragma unroll
+      for (int r = 0; r < B; ++r) {
+        out_dot[r] += w * bx[(static_cast<std::size_t>(r) * K) + k];
+      }
+    }
+  }
+}
+
+// Multi-block fused router GEMV + softmax + top-k + shared sigmoid.
+// Each 256-thread block evaluates E consecutive weight rows across B input
+// rows (reusing every weight load across all B rows and preserving the exact
+// 256-thread RouterRowDot accumulation tree), writes the logits with plain
+// global stores, and atomically increments sync_counters[blockIdx.y] with
+// agent-release semantics. Only the last finishing block acquires and runs
+// Wave32TopK256 in parallel across its B waves after self-resetting its counter
+// to zero.
+template<int B, int E, bool RouterBf16>
+__global__ void MoeFusedRouterTopKKernel(
+    const void* __restrict__ router, const void* __restrict__ shared,
+    bool shared_bf16, const float* __restrict__ rows_x,
+    float* __restrict__ rows_router_logits,
+    float* __restrict__ rows_shared_logit,
+    std::int32_t* __restrict__ expert_ids, float* __restrict__ expert_weights,
+    float* __restrict__ shared_weight,
+    std::uint32_t* __restrict__ sync_counters, std::uint32_t experts,
+    std::uint32_t used, std::size_t K) {
+  __shared__ float s_warp_sums[E * B * 8];
+  __shared__ int s_is_last;
+
+  const std::uint32_t tid = threadIdx.x;
+  const std::uint32_t lane = tid & 31U;
+  const std::uint32_t warp = tid >> 5;
+  const std::uint32_t group = blockIdx.y;
+  const std::uint32_t row_base = group * static_cast<std::uint32_t>(B);
+  const float* const bx = rows_x + (static_cast<std::size_t>(row_base) * K);
+  const std::uint32_t m_base = blockIdx.x * static_cast<std::uint32_t>(E);
+
+  float dot[E][B];
+#pragma unroll
+  for (int e = 0; e < E; ++e) {
+#pragma unroll
+    for (int r = 0; r < B; ++r) {
+      dot[e][r] = 0.0F;
+    }
+  }
+
+  const bool same_type = (shared_bf16 == RouterBf16);
+  const std::uint32_t main_limit = same_type ? (experts + 1U) : experts;
+
+  if constexpr (RouterBf16) {
+    const auto* router_bf16 = static_cast<const hip_bfloat16*>(router);
+    const auto* shared_ptr = static_cast<const hip_bfloat16*>(shared);
+    const std::size_t k_vec = K / 8;
+    for (std::size_t vi = tid; vi < k_vec; vi += 256U) {
+      const std::size_t k = vi * 8;
+      float4 x0[B];
+      float4 x1[B];
+#pragma unroll
+      for (int r = 0; r < B; ++r) {
+        const float* xr = bx + (static_cast<std::size_t>(r) * K) + k;
+        x0[r] = *reinterpret_cast<const float4*>(xr);
+        x1[r] = *reinterpret_cast<const float4*>(xr + 4);
+      }
+#pragma unroll
+      for (int e = 0; e < E; ++e) {
+        const std::uint32_t m = m_base + static_cast<std::uint32_t>(e);
+        if (m < main_limit) {
+          const hip_bfloat16* row =
+              (m == experts) ? shared_ptr
+                             : (router_bf16 + static_cast<std::size_t>(m) * K);
+          const uint4 v = reinterpret_cast<const uint4*>(row)[vi];
+          const auto* vals = reinterpret_cast<const hip_bfloat16*>(&v);
+#pragma unroll
+          for (int r = 0; r < B; ++r) {
+            dot[e][r] += (static_cast<float>(vals[0]) * x0[r].x) +
+                         (static_cast<float>(vals[1]) * x0[r].y) +
+                         (static_cast<float>(vals[2]) * x0[r].z) +
+                         (static_cast<float>(vals[3]) * x0[r].w) +
+                         (static_cast<float>(vals[4]) * x1[r].x) +
+                         (static_cast<float>(vals[5]) * x1[r].y) +
+                         (static_cast<float>(vals[6]) * x1[r].z) +
+                         (static_cast<float>(vals[7]) * x1[r].w);
+          }
+        }
+      }
+    }
+    for (std::size_t k = (k_vec * 8) + tid; k < K; k += 256U) {
+      float xs[B];
+#pragma unroll
+      for (int r = 0; r < B; ++r) {
+        xs[r] = bx[(static_cast<std::size_t>(r) * K) + k];
+      }
+#pragma unroll
+      for (int e = 0; e < E; ++e) {
+        const std::uint32_t m = m_base + static_cast<std::uint32_t>(e);
+        if (m < main_limit) {
+          const hip_bfloat16* row =
+              (m == experts) ? shared_ptr
+                             : (router_bf16 + static_cast<std::size_t>(m) * K);
+          const float w = static_cast<float>(row[k]);
+#pragma unroll
+          for (int r = 0; r < B; ++r) {
+            dot[e][r] += w * xs[r];
+          }
+        }
+      }
+    }
+  } else {
+    const auto* router_f32 = static_cast<const float*>(router);
+    const auto* shared_ptr = static_cast<const float*>(shared);
+    const std::size_t k_vec = K / 4;
+    for (std::size_t vi = tid; vi < k_vec; vi += 256U) {
+      const std::size_t k = vi * 4;
+      float4 xv[B];
+#pragma unroll
+      for (int r = 0; r < B; ++r) {
+        xv[r] = *reinterpret_cast<const float4*>(
+            &bx[(static_cast<std::size_t>(r) * K) + k]);
+      }
+#pragma unroll
+      for (int e = 0; e < E; ++e) {
+        const std::uint32_t m = m_base + static_cast<std::uint32_t>(e);
+        if (m < main_limit) {
+          const float* row =
+              (m == experts) ? shared_ptr
+                             : (router_f32 + static_cast<std::size_t>(m) * K);
+          const float4 v = reinterpret_cast<const float4*>(row)[vi];
+#pragma unroll
+          for (int r = 0; r < B; ++r) {
+            dot[e][r] += (v.x * xv[r].x) + (v.y * xv[r].y) + (v.z * xv[r].z) +
+                         (v.w * xv[r].w);
+          }
+        }
+      }
+    }
+    for (std::size_t k = (k_vec * 4) + tid; k < K; k += 256U) {
+      float xs[B];
+#pragma unroll
+      for (int r = 0; r < B; ++r) {
+        xs[r] = bx[(static_cast<std::size_t>(r) * K) + k];
+      }
+#pragma unroll
+      for (int e = 0; e < E; ++e) {
+        const std::uint32_t m = m_base + static_cast<std::uint32_t>(e);
+        if (m < main_limit) {
+          const float* row =
+              (m == experts) ? shared_ptr
+                             : (router_f32 + static_cast<std::size_t>(m) * K);
+          const float w = row[k];
+#pragma unroll
+          for (int r = 0; r < B; ++r) {
+            dot[e][r] += w * xs[r];
+          }
+        }
+      }
+    }
+  }
+
+  if (!same_type && m_base <= experts &&
+      experts < m_base + static_cast<std::uint32_t>(E)) {
+#pragma unroll
+    for (int e = 0; e < E; ++e) {
+      if (m_base + static_cast<std::uint32_t>(e) == experts) {
+        AccumulateSingleRow<B, !RouterBf16>(shared, bx, K, tid, dot[e]);
+      }
+    }
+  }
+
+#pragma unroll
+  for (int e = 0; e < E; ++e) {
+#pragma unroll
+    for (int r = 0; r < B; ++r) {
+      const float wd = ReduceWaveXor<16>(dot[e][r]);
+      if (lane == 0) {
+        s_warp_sums[(e * B + r) * 8 + warp] = wd;
+      }
+    }
+  }
+  __syncthreads();
+
+  const int total_slots = E * B;
+  for (int s = static_cast<int>(warp); s < total_slots; s += 8) {
+    const int e = s / B;
+    const int r = s % B;
+    const std::uint32_t m = m_base + static_cast<std::uint32_t>(e);
+    if (m <= experts) {
+      float bsum = (lane < 8) ? s_warp_sums[s * 8 + lane] : 0.0F;
+      bsum = ReduceWaveXor<4>(bsum);
+      if (lane == 0) {
+        if (m == experts) {
+          rows_shared_logit[row_base + static_cast<std::uint32_t>(r)] =
+              bsum + 0.0F;
+        } else {
+          rows_router_logits[static_cast<std::size_t>(
+                                 row_base + static_cast<std::uint32_t>(r)) *
+                                 experts +
+                             m] = bsum + 0.0F;
+        }
+      }
+    }
+  }
+
+  __syncthreads();
+  if (tid == 0) {
+    const std::uint32_t done =
+        __hip_atomic_fetch_add(&sync_counters[group], 1U, __ATOMIC_RELEASE,
+                               __HIP_MEMORY_SCOPE_AGENT) +
+        1U;
+    const int last = (done == gridDim.x) ? 1 : 0;
+    if (last != 0) {
+      __scoped_atomic_thread_fence(__ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT);
+      __hip_atomic_store(&sync_counters[group], 0U, __ATOMIC_RELEASE,
+                         __HIP_MEMORY_SCOPE_AGENT);
+    }
+    s_is_last = last;
+  }
+  __syncthreads();
+  if (s_is_last == 0) {
+    return;
+  }
+
+  if (warp < static_cast<std::uint32_t>(B)) {
+    const std::uint32_t row = row_base + warp;
+    const float slogit = __hip_atomic_load(
+        &rows_shared_logit[row], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    Wave32TopK256<8>(
+        rows_router_logits + (static_cast<std::size_t>(row) * experts), slogit,
+        expert_ids + (static_cast<std::size_t>(row) * used),
+        expert_weights + (static_cast<std::size_t>(row) * used),
+        shared_weight + row, experts, used);
+  }
+}
+
+template<bool RouterBf16>
+void DispatchFusedRouterGroup(
+    const void* router, const void* shared, bool shared_bf16, const float* x,
+    float* router_logits, float* shared_logit, std::int32_t* expert_ids,
+    float* expert_weights, float* shared_weight, std::uint32_t* sync_counters,
+    std::uint32_t experts, std::uint32_t used, std::size_t hidden,
+    std::size_t group_rows, std::size_t num_groups, hipStream_t stream) {
+  const auto launch = [&](auto b_tag, auto e_tag) {
+    constexpr int kB = decltype(b_tag)::value;
+    constexpr int kE = decltype(e_tag)::value;
+    const unsigned gx = static_cast<unsigned>(((experts + 1U) + kE - 1U) / kE);
+    const unsigned gy = static_cast<unsigned>(num_groups);
+    MoeFusedRouterTopKKernel<kB, kE, RouterBf16>
+        <<<dim3(gx, gy), 256, 0, stream>>>(
+            router, shared, shared_bf16, x, router_logits, shared_logit,
+            expert_ids, expert_weights, shared_weight, sync_counters, experts,
+            used, hidden);
+  };
+  if (group_rows == 8 && num_groups >= 2) {
+    launch(std::integral_constant<int, 8>{}, std::integral_constant<int, 4>{});
+    return;
+  }
+  switch (group_rows) {
+    case 1:
+      launch(std::integral_constant<int, 1>{},
+             std::integral_constant<int, 2>{});
+      break;
+    case 2:
+      launch(std::integral_constant<int, 2>{},
+             std::integral_constant<int, 2>{});
+      break;
+    case 3:
+      launch(std::integral_constant<int, 3>{},
+             std::integral_constant<int, 2>{});
+      break;
+    case 4:
+      launch(std::integral_constant<int, 4>{},
+             std::integral_constant<int, 2>{});
+      break;
+    case 5:
+      launch(std::integral_constant<int, 5>{},
+             std::integral_constant<int, 2>{});
+      break;
+    case 6:
+      launch(std::integral_constant<int, 6>{},
+             std::integral_constant<int, 2>{});
+      break;
+    case 7:
+      launch(std::integral_constant<int, 7>{},
+             std::integral_constant<int, 2>{});
+      break;
+    case 8:
+      launch(std::integral_constant<int, 8>{},
+             std::integral_constant<int, 2>{});
+      break;
+    default:
+      break;
   }
 }
 
@@ -530,9 +1011,81 @@ void LaunchMoeRouterLogits(const void* router, core::GgmlType router_type,
                            std::size_t rows) {
   MoeRouterLogitsKernel<<<dim3(static_cast<unsigned>(experts + 1),
                                static_cast<unsigned>(rows)),
-                          256, 0, stream>>>(
-      router, router_type, shared, shared_type, x, router_logits, shared_logit,
-      experts, hidden);
+                          256, 0, stream>>>(router, router_type, shared,
+                                            shared_type, x, router_logits,
+                                            shared_logit, experts, hidden);
+}
+
+void LaunchMoeFusedRouterTopK(const void* router, core::GgmlType router_type,
+                              const void* shared, core::GgmlType shared_type,
+                              const float* x, float* router_logits,
+                              float* shared_logit, std::int32_t* expert_ids,
+                              float* expert_weights, float* shared_weight,
+                              std::uint32_t* sync_counters,
+                              std::size_t sync_capacity, std::size_t experts,
+                              std::size_t used, std::size_t hidden,
+                              std::size_t rows, hipStream_t stream) {
+  if (rows == 0) {
+    return;
+  }
+  const bool router_bf16 = router_type == core::GgmlType::kBF16;
+  const bool shared_bf16 = shared_type == core::GgmlType::kBF16;
+  const bool supported_types =
+      (router_type == core::GgmlType::kF32 || router_bf16) &&
+      (shared_type == core::GgmlType::kF32 || shared_bf16);
+  // BF16 vector loads require 4-byte aligned rows (even hidden); F32 rows are
+  // always 4-byte aligned.
+  const bool aligned_bf16 = !(router_bf16 || shared_bf16) || (hidden % 2 == 0);
+  if (!supported_types || !aligned_bf16 || sync_counters == nullptr ||
+      sync_capacity == 0 || experts == 0 || experts > 256 || used == 0 ||
+      used > 8) {
+    LaunchMoeRouterLogits(router, router_type, shared, shared_type, x,
+                          router_logits, shared_logit, experts, hidden, stream,
+                          rows);
+    LaunchMoeRouterTopK(router_logits, shared_logit, expert_ids, expert_weights,
+                        shared_weight, static_cast<std::uint32_t>(experts),
+                        static_cast<std::uint32_t>(used),
+                        static_cast<std::uint32_t>(rows), stream);
+    return;
+  }
+
+  const auto dispatch_chunk = [&](std::size_t offset, std::size_t group_rows,
+                                  std::size_t num_groups) {
+    const float* chunk_x = x + (offset * hidden);
+    float* chunk_logits = router_logits + (offset * experts);
+    float* chunk_shared_logit = shared_logit + offset;
+    std::int32_t* chunk_ids = expert_ids + (offset * used);
+    float* chunk_weights = expert_weights + (offset * used);
+    float* chunk_shared_weight = shared_weight + offset;
+    if (router_bf16) {
+      DispatchFusedRouterGroup<true>(
+          router, shared, shared_bf16, chunk_x, chunk_logits,
+          chunk_shared_logit, chunk_ids, chunk_weights, chunk_shared_weight,
+          sync_counters, static_cast<std::uint32_t>(experts),
+          static_cast<std::uint32_t>(used), hidden, group_rows, num_groups,
+          stream);
+    } else {
+      DispatchFusedRouterGroup<false>(
+          router, shared, shared_bf16, chunk_x, chunk_logits,
+          chunk_shared_logit, chunk_ids, chunk_weights, chunk_shared_weight,
+          sync_counters, static_cast<std::uint32_t>(experts),
+          static_cast<std::uint32_t>(used), hidden, group_rows, num_groups,
+          stream);
+    }
+  };
+
+  const std::size_t max_chunk = sync_capacity * 8;
+  for (std::size_t base = 0; base < rows; base += max_chunk) {
+    const std::size_t chunk = std::min(max_chunk, rows - base);
+    const std::size_t full_groups = chunk / 8;
+    const std::size_t rem = chunk % 8;
+    if (full_groups > 0) {
+      dispatch_chunk(base, 8, full_groups);
+    }
+    if (rem > 0) {
+      dispatch_chunk(base + (full_groups * 8), rem, 1);
+    }
+  }
 }
 
 __global__ void ConcatRowsKernel(const float* __restrict__ a,
@@ -591,8 +1144,8 @@ void LaunchMoeSkewRecord(const QwenMoeSkewDevice& skew,
                          hipStream_t stream) {
   MoeSkewRecordKernel<<<1, 128, 0, stream>>>(
       skew, ids, weights, layer_index,
-      static_cast<std::uint32_t>(
-          rows < kMoeSkewMaxRows ? rows : kMoeSkewMaxRows));
+      static_cast<std::uint32_t>(rows < kMoeSkewMaxRows ? rows
+                                                        : kMoeSkewMaxRows));
 }
 
 void LaunchMoeCombineResidualAddRMSNorm(
@@ -600,8 +1153,8 @@ void LaunchMoeCombineResidualAddRMSNorm(
     const float* shared_out, const float* shared_weight, const float* weight,
     float* out, std::uint32_t used, std::uint32_t hidden, float eps,
     std::uint32_t rows, hipStream_t stream) {
-  MoeCombineResidualAddRMSNormKernel<<<rows, StagedNormBlockThreads(hidden),
-                                       0, stream>>>(
+  MoeCombineResidualAddRMSNormKernel<<<rows, StagedNormBlockThreads(hidden), 0,
+                                       stream>>>(
       hidden_rows, slot_out, slot_weight, shared_out, shared_weight, weight,
       out, used, hidden, eps);
 }
